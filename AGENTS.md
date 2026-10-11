@@ -33,6 +33,12 @@ local checkout, no network) — see "Modifying xezim-core" in
 designs, so most wrong-result bugs live in `xezim`'s VM — a change here only helps
 when the symptom is parse/elaboration/formatting.
 
+**One version for all three crates.** `xezim-core` (`Cargo.toml`), `sv-parser`
+(`xezim-parser/Cargo.toml`) and `xezim` (`../xezim/Cargo.toml`) always carry the
+same `version`. A release bumps all three in step: commit and push core first,
+then repin xezim to that core commit. `sv-parser` is not a separately versioned
+crate; never leave it behind.
+
 ## Repository map
 
 ```
