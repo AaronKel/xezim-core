@@ -1387,6 +1387,12 @@ pub struct ClassExtends {
     pub name: Identifier,
     pub args: Vec<ParamValue>,
     pub span: Span,
+    /// §8.13: the `::` scope prefix of a scoped base (`extends pkg::Base`
+    /// keeps [`pkg`]), outermost first; empty for an unqualified base.
+    /// `name` stays the final segment. Kept so a base named in two
+    /// packages resolves to the one the prefix names (§26.3).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub scopes: Vec<Identifier>,
 }
 
 /// Items that can appear inside a class body.

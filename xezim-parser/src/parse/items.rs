@@ -4617,12 +4617,15 @@ impl Parser {
             let ext_start = self.current().span.start;
             // §8.13: the base class may be package/class-scoped —
             // `extends pkg::Base` or `extends A::B::C`. Keep the final
-            // segment as the base-class name; the scope prefix is consumed.
+            // segment as the base-class name; the scope prefix is kept in
+            // `ClassExtends::scopes`.
             let mut base_name = self.parse_identifier();
             let mut scoped = false;
+            let mut base_scopes: Vec<Identifier> = Vec::new();
             while self.at(TokenKind::DoubleColon) {
                 self.bump();
                 scoped = true;
+                base_scopes.push(base_name);
                 base_name = self.parse_identifier();
             }
             if !scoped {
@@ -4664,6 +4667,7 @@ impl Parser {
                 name: base_name,
                 args,
                 span: self.span_from(ext_start),
+                scopes: base_scopes,
             })
         } else {
             None

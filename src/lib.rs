@@ -71,6 +71,7 @@ pub(crate) fn elab_phase(label: &str, since: &mut std::time::Instant) {
 pub mod bits2;
 pub mod elaborate;
 pub mod packed_value;
+pub mod pkg_scope;
 pub mod sdf;
 pub mod stdout_sink;
 pub mod upf;
@@ -158,7 +159,9 @@ pub use value::Value;
 /// zstd-compressed varint bincode body (\x02 = uncompressed varint,
 /// \x01 = uncompressed fixint).
 /// \x21 = \x20 + chained TypeName scopes and per-scope type arguments.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x21";
+/// \x22 = \x21 + ClassExtends.scopes, and package type names declared in
+/// more than one place renamed to `pkg::name` (§26.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x22";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -1563,7 +1566,7 @@ fn module_declared_names(m: &ast::module::ModuleDeclaration) -> std::collections
 }
 
 fn parse_and_elaborate(
-    all_descriptions: Vec<ast::Description>,
+    mut all_descriptions: Vec<ast::Description>,
     top_module_name: Option<&str>,
     include_dirs: &[String],
     lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
@@ -1585,6 +1588,10 @@ fn parse_and_elaborate(
     // directive > named --module-timescale > global --module-timescale >
     // 1 ns / 1 ns default. The command-line forms never override an explicit
     // source-level timescale (a local decl OR an active directive).
+    // §26.3: a type name declared by two packages (or a package and $unit / a
+    // module) gets its package-qualified spelling before anything keys the
+    // flat per-design type tables by it (#300).
+    pkg_scope::qualify_colliding_package_types(&mut all_descriptions)?;
     let cli = module_timescale_cli();
     // `-override_timescale`: one timescale for everything, in seconds.
     let forced_secs: Option<(f64, f64)> = cli

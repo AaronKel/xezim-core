@@ -4565,7 +4565,10 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                 // name with the same value is harmless (e.g. a package enum
                 // imported into several scopes).
                 if let Some(prev) = elab.parameters.get(&nm) {
-                    if prev.to_u64() != Some(val) {
+                    // §26.3: a member two packages declare is read through
+                    // its package-qualified spelling (`pkg_scope`), so the
+                    // overwrite here is not the value those references see.
+                    if prev.to_u64() != Some(val) && !crate::pkg_scope::member_is_qualified(&nm) {
                         let prev_s = prev
                             .to_u64()
                             .map(|x| x.to_string())
