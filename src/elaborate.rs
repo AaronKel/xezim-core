@@ -17516,6 +17516,17 @@ pub fn is_type_two_state_resolved(
             None => true,
         };
     }
+    // §7.2.1 / §7.3.1: a packed struct or union whose members are all 2-state
+    // is 2-state (it starts at 0); one 4-state member makes it 4-state.
+    // Members are reached through typedefs here.
+    if let DataType::Struct(su) = resolved {
+        return su.packed
+            && !su.members.is_empty()
+            && su
+                .members
+                .iter()
+                .all(|m| is_type_two_state_resolved(&m.data_type, typedef_types));
+    }
     is_type_two_state(resolved)
 }
 
@@ -17539,6 +17550,13 @@ pub fn is_type_two_state(dt: &DataType) -> bool {
             .as_deref()
             .map(is_type_two_state)
             .unwrap_or(true),
+        // §7.2.1 / §7.3.1: a packed struct or union is 2-state when every
+        // member is (a typedef'd member is not resolved here: 4-state).
+        DataType::Struct(su) => {
+            su.packed
+                && !su.members.is_empty()
+                && su.members.iter().all(|m| is_type_two_state(&m.data_type))
+        }
         _ => false,
     }
 }
