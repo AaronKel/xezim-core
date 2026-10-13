@@ -36398,7 +36398,165 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
     }
 }
 
+/// The constant bit span `(net, lo, hi)` a continuous assign drives: the whole
+/// net for a bare name, or the physical bits of a constant bit/part select
+/// (`w[3]`, `w[7:2]`, `w[2 +: 4]`). `None` for anything else (a variable
+/// index, a multi-dimensional packed net, a concatenation lvalue).
+fn cont_assign_net_span(lhs: &Expression, elab: &ElaboratedModule) -> Option<(String, u32, u32)> {
+    let net_width = |n: &str| -> Option<u32> {
+        if !elab.nets.contains(n) {
+            return None;
+        }
+        elab.signals.get(n).map(|s| s.width).filter(|&w| w > 0)
+    };
+    if let Some(n) = ident_flat_name(lhs) {
+        let w = net_width(&n)?;
+        return Some((n, 0, w - 1));
+    }
+    let (base, l, r) = match &lhs.kind {
+        ExprKind::Index { expr, index } => {
+            let i = const_eval_i64_with_params(index, Some(&elab.parameters))?;
+            (expr, i, i)
+        }
+        ExprKind::RangeSelect {
+            expr,
+            kind,
+            left,
+            right,
+        } => {
+            let a = const_eval_i64_with_params(left, Some(&elab.parameters))?;
+            let b = const_eval_i64_with_params(right, Some(&elab.parameters))?;
+            match kind {
+                RangeKind::Constant => (expr, a, b),
+                RangeKind::IndexedUp if b > 0 => (expr, a + b - 1, a),
+                RangeKind::IndexedDown if b > 0 => (expr, a, a - b + 1),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let n = ident_flat_name(base)?;
+    let w = net_width(&n)? as i64;
+    // Label → physical bit (§7.4.1). A single non-normalized dimension is
+    // recorded in `packed_full_dims`/`ascending_packed`; absence means [w-1:0].
+    let phys = |p: i64| -> Option<i64> {
+        if let Some(&(_, hi)) = elab.ascending_packed.get(&n) {
+            return Some(hi - p);
+        }
+        match elab.packed_full_dims.get(&n).map(|d| d.as_slice()) {
+            None => Some(p),
+            Some([(dl, dr)]) if dl >= dr => Some(p - dr),
+            Some([(_, dr)]) => Some(dr - p),
+            Some(_) => None,
+        }
+    };
+    let (a, b) = (phys(l)?, phys(r)?);
+    let (lo, hi) = (a.min(b), a.max(b));
+    if lo < 0 || hi >= w {
+        return None;
+    }
+    Some((n, lo as u32, hi as u32))
+}
+
+/// IEEE 1800-2017 §6.6.1/§11.5.1: a bit or part select driver of a net is a
+/// driver of those bits only, and every bit resolves ALL of its drivers.
+/// Select drivers that overlap another driver of the same net (`assign w =
+/// {4{a}}; assign w[3] = b;`) used to be applied one after the other, so the
+/// last assign won the shared bits, and an edge on such a bit was counted from
+/// the wrong value. Widen each select driver of such a net to a whole-net
+/// driver that leaves the other bits at z (`{'z, 1'(b), 'z}`), so the
+/// whole-net fold below resolves the shared bits and passes the rest through.
+/// Nets whose select drivers are disjoint keep their per-select assigns.
+fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
+    let spans: Vec<Option<(String, u32, u32)>> = elab
+        .continuous_assigns
+        .iter()
+        .map(|ca| {
+            if matches!(
+                ca.lhs.kind,
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+            ) || ident_flat_name(&ca.lhs).is_some_and(|n| elab.nets.contains(&n))
+            {
+                cont_assign_net_span(&ca.lhs, elab)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut by_net: HashMap<&str, Vec<(u32, u32, bool)>> = HashMap::default();
+    for (s, ca) in spans.iter().zip(&elab.continuous_assigns) {
+        if let Some((n, lo, hi)) = s {
+            let is_select = !matches!(
+                ca.lhs.kind,
+                ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
+            );
+            by_net
+                .entry(n.as_str())
+                .or_default()
+                .push((*lo, *hi, is_select));
+        }
+    }
+    let widen: HashSet<String> = by_net
+        .into_iter()
+        .filter(|(_, v)| {
+            v.iter().any(|s| s.2)
+                && v.iter()
+                    .enumerate()
+                    .any(|(i, a)| v[i + 1..].iter().any(|b| a.0 <= b.1 && b.0 <= a.1))
+        })
+        .map(|(n, _)| n.to_string())
+        .collect();
+    if widen.is_empty() {
+        return;
+    }
+    let z_fill = |k: u32, span: Span| {
+        Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: Some(k),
+                signed: false,
+                base: NumberBase::Binary,
+                value: "z".repeat(k as usize),
+                cached_val: std::cell::Cell::new(None),
+            }),
+            span,
+        )
+    };
+    for (ca, s) in elab.continuous_assigns.iter_mut().zip(spans) {
+        let Some((n, lo, hi)) = s else { continue };
+        if !widen.contains(&n) || ident_flat_name(&ca.lhs).is_some() {
+            continue;
+        }
+        let w = elab.signals.get(&n).map(|s| s.width).unwrap_or(0);
+        let span = ca.rhs.span;
+        let rhs = std::mem::replace(&mut ca.rhs, Expression::new(ExprKind::Empty, span));
+        let sized = make_syscall(
+            "$__xz_size_cast",
+            vec![
+                const_value_literal(&Value::from_u64(u64::from(hi - lo + 1), 32), span)
+                    .expect("width literal"),
+                rhs,
+            ],
+            span,
+        );
+        let mut parts = Vec::with_capacity(3);
+        if hi + 1 < w {
+            parts.push(z_fill(w - 1 - hi, span));
+        }
+        parts.push(sized);
+        if lo > 0 {
+            parts.push(z_fill(lo, span));
+        }
+        ca.rhs = if parts.len() == 1 {
+            parts.pop().unwrap()
+        } else {
+            Expression::new(ExprKind::Concatenation(parts), span)
+        };
+        ca.lhs = make_ident_expr(&n);
+    }
+}
+
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
+    widen_overlapping_select_drivers(elab);
     // A user-written HIERARCHICAL continuous assign onto an instance PORT
     // (`assign dut.u_mid.u_leaf.clk_i = tb_clk;` — a multi-segment path)
     // drives the port's whole alias chain: the simulator fans it out across
