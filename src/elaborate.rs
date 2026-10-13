@@ -12480,7 +12480,9 @@ fn collect_stmt_write_spans(
 /// (the longest static prefix), so writers of disjoint constant selects
 /// (`v[0]` and `v[1]`) do not conflict.
 ///
-/// Matches the reference simulator's verdicts: two `always_ff` blocks
+/// Each conflict is an error unless `--relax-driver-conflicts` downgrades it
+/// to a warning (every shape here is one the LRM forbids but tools commonly
+/// let users accept). Matches the reference simulator's verdicts: two `always_ff` blocks
 /// writing one variable are accepted (it does not enforce §9.2.2.4 between
 /// them), a write made inside a called function is not attributed to the
 /// caller, and a variable driven through an output port is not checked here.
@@ -12581,11 +12583,58 @@ fn validate_driver_conflicts(elab: &ElaboratedModule) -> Result<(), String> {
                     ),
                     _ => continue,
                 };
-                return Err(msg);
+                if relax_driver_conflicts() {
+                    // One warning per conflicting variable and module, however
+                    // many times the module is elaborated.
+                    static SEEN: std::sync::Mutex<Option<HashSet<String>>> =
+                        std::sync::Mutex::new(None);
+                    let line = format!(
+                        "[xezim][warning] {msg} in module '{}'; accepted because \
+                         --relax-driver-conflicts is in effect",
+                        elab.name
+                    );
+                    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                    if seen
+                        .get_or_insert_with(HashSet::default)
+                        .insert(line.clone())
+                    {
+                        crate::log_eprintln(&line);
+                    }
+                    break;
+                }
+                return Err(format!(
+                    "{msg}\n  or accept it with a warning: --relax-driver-conflicts \
+                     (env XEZIM_RELAX_DRIVER_CONFLICTS=1)"
+                ));
             }
         }
     }
     Ok(())
+}
+
+/// Escape hatch for `validate_driver_conflicts`: report a conflicting
+/// variable driver (§6.5, §9.2.2.2, §9.2.2.4) as a warning instead of an
+/// error, so an existing design that, say, initializes an `always_ff`
+/// variable from an `initial` block still runs. Set by
+/// `--relax-driver-conflicts` or `XEZIM_RELAX_DRIVER_CONFLICTS=1`.
+static RELAX_DRIVER_CONFLICTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_relax_driver_conflicts(on: bool) {
+    RELAX_DRIVER_CONFLICTS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn relax_driver_conflicts() -> bool {
+    if RELAX_DRIVER_CONFLICTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| {
+        std::env::var("XEZIM_RELAX_DRIVER_CONFLICTS")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
 }
 
 /// Names bound by a §12.6 pattern's `.v` sub-patterns.
