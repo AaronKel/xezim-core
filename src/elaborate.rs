@@ -9774,15 +9774,9 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                     }
-                    let mut rhs_final = if ca
-                        .strength
-                        .as_deref()
-                        .map(strength_is_weak)
-                        .unwrap_or(false)
-                    {
-                        make_syscall("$__pull", vec![rhs.clone()], rhs.span)
-                    } else {
-                        rhs.clone()
+                    let mut rhs_final = match ca.strength.as_deref().and_then(strength_marker) {
+                        Some(marker) => make_syscall(marker, vec![rhs.clone()], rhs.span),
+                        None => rhs.clone(),
                     };
                     root_mark_hier_ca_rhs(lhs, &mut rhs_final);
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, &mut elab) {
@@ -14823,15 +14817,9 @@ fn elaborate_items_numbered(
                             }
                         }
                     }
-                    let mut rhs_final = if ca
-                        .strength
-                        .as_deref()
-                        .map(strength_is_weak)
-                        .unwrap_or(false)
-                    {
-                        make_syscall("$__pull", vec![rhs.clone()], rhs.span)
-                    } else {
-                        rhs.clone()
+                    let mut rhs_final = match ca.strength.as_deref().and_then(strength_marker) {
+                        Some(marker) => make_syscall(marker, vec![rhs.clone()], rhs.span),
+                        None => rhs.clone(),
                     };
                     root_mark_hier_ca_rhs(lhs, &mut rhs_final);
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, elab) {
@@ -34380,6 +34368,9 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
                 if inst.terminals.len() >= 3 =>
             {
                 let ctl = inst.terminals[2].clone();
+                // §28.4 Table 28-5: a bufif with a `z` data input drives `x`
+                // (the gate is a buffer, not a switch). `d ^ '0` maps z to x
+                // and passes 0, 1 and x unchanged; notif's `~d` already does.
                 let data = if matches!(gi.gate_type, GateType::Notif0 | GateType::Notif1) {
                     Expression::new(
                         ExprKind::Unary {
@@ -34389,7 +34380,14 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
                         sp,
                     )
                 } else {
-                    in1
+                    Expression::new(
+                        ExprKind::Binary {
+                            op: BinaryOp::BitXor,
+                            left: Box::new(in1),
+                            right: Box::new(make_fill_expr(false, sp)),
+                        },
+                        sp,
+                    )
                 };
                 let active_high = matches!(gi.gate_type, GateType::Bufif1 | GateType::Notif1);
                 let cond = if active_high {
@@ -34642,6 +34640,30 @@ fn ident_flat_name(e: &Expression) -> Option<String> {
 /// highz on both the 1 and 0 sides) — such a driver behaves like a pullup/
 /// pulldown and loses to any strong driver. A mixed strength (e.g. strong1,
 /// pull0) is not treated as weak (approximated as strong).
+/// The resolution marker for a continuous assign's drive strength (§28.12):
+/// `$__supply` when both sides are supply, `$__weak` when both are weak,
+/// `$__pull` for any other all-weak (pull/weak/highz) pair, and `None` for a
+/// strong driver. A mixed strong/weak pair (`strong0, weak1`) is approximated
+/// as strong, as before.
+fn strength_marker(s: &str) -> Option<&'static str> {
+    let toks: Vec<&str> = s
+        .split(',')
+        .map(|t| t.trim().trim_end_matches(['0', '1']))
+        .filter(|t| !t.is_empty())
+        .collect();
+    if toks.is_empty() {
+        None
+    } else if toks.iter().all(|t| *t == "supply") {
+        Some("$__supply")
+    } else if toks.iter().all(|t| *t == "weak") {
+        Some("$__weak")
+    } else if strength_is_weak(s) {
+        Some("$__pull")
+    } else {
+        None
+    }
+}
+
 fn strength_is_weak(s: &str) -> bool {
     let toks: Vec<&str> = s
         .split(',')
@@ -36611,6 +36633,44 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
     }
 }
 
+/// A driver a tristate PRIMITIVE produced (`bufif*`/`notif*`, the MOS
+/// switches): elaboration lowers each to `ctl ? data : 'z` and marks it as
+/// synthesized (no `origin`). Returns `(ctl, data)`. A user-written `assign
+/// w = en ? d : 'z` has an origin and keeps the ordinary `?:` semantics.
+fn gate_tristate_parts(ca: &ContinuousAssignment) -> Option<(&Expression, &Expression)> {
+    if ca.origin.is_some() {
+        return None;
+    }
+    match &ca.rhs.kind {
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } if matches!(
+            else_expr.kind,
+            ExprKind::Number(NumberLiteral::UnbasedUnsized('z'))
+        ) =>
+        {
+            Some((condition, then_expr))
+        }
+        _ => None,
+    }
+}
+
+/// A `k`-bit all-z literal.
+fn make_z_fill(k: u32, span: Span) -> Expression {
+    Expression::new(
+        ExprKind::Number(NumberLiteral::Integer {
+            size: Some(k),
+            signed: false,
+            base: NumberBase::Binary,
+            value: "z".repeat(k as usize),
+            cached_val: std::cell::Cell::new(None),
+        }),
+        span,
+    )
+}
+
 /// The constant bit span `(net, lo, hi)` a continuous assign drives: the whole
 /// net for a bare name, or the physical bits of a constant bit/part select
 /// (`w[3]`, `w[7:2]`, `w[2 +: 4]`). `None` for anything else (a variable
@@ -36722,18 +36782,7 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     if widen.is_empty() {
         return;
     }
-    let z_fill = |k: u32, span: Span| {
-        Expression::new(
-            ExprKind::Number(NumberLiteral::Integer {
-                size: Some(k),
-                signed: false,
-                base: NumberBase::Binary,
-                value: "z".repeat(k as usize),
-                cached_val: std::cell::Cell::new(None),
-            }),
-            span,
-        )
-    };
+    let z_fill = make_z_fill;
     for (ca, s) in elab.continuous_assigns.iter_mut().zip(spans) {
         let Some((n, lo, hi)) = s else { continue };
         if !widen.contains(&n) || ident_flat_name(&ca.lhs).is_some() {
@@ -36741,7 +36790,15 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
         }
         let w = elab.signals.get(&n).map(|s| s.width).unwrap_or(0);
         let span = ca.rhs.span;
+        // A tristate primitive keeps its `ctl ? data : 'z` shape (the
+        // resolution below treats an unknown control specially); only the
+        // data is widened.
+        let gate_ctl = gate_tristate_parts(ca).map(|(c, _)| c.clone());
         let rhs = std::mem::replace(&mut ca.rhs, Expression::new(ExprKind::Empty, span));
+        let rhs = match (gate_ctl.is_some(), rhs.kind) {
+            (true, ExprKind::Conditional { then_expr, .. }) => *then_expr,
+            (_, kind) => Expression::new(kind, span),
+        };
         let sized = make_syscall(
             "$__xz_size_cast",
             vec![
@@ -36759,10 +36816,14 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
         if lo > 0 {
             parts.push(z_fill(lo, span));
         }
-        ca.rhs = if parts.len() == 1 {
+        let widened = if parts.len() == 1 {
             parts.pop().unwrap()
         } else {
             Expression::new(ExprKind::Concatenation(parts), span)
+        };
+        ca.rhs = match gate_ctl {
+            Some(ctl) => make_tristate(ctl, widened, span),
+            None => widened,
         };
         ca.lhs = make_ident_expr(&n);
     }
@@ -36901,14 +36962,26 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         delay: u64,
         delay_fall: Option<u64>,
         delay_off: Option<u64>,
+        /// §28.12 drive-strength levels, strongest first: supply, strong
+        /// (the default), pull (`weak` below, which also holds a tri0/tri1
+        /// net's implicit pull and a trireg's charge), weak.
+        supply: Option<Expression>,
         strong: Option<Expression>,
         weak: Option<Expression>,
+        weakest: Option<Expression>,
+        /// Tristate-primitive drivers `(ctl, data)`, resolved together with
+        /// the strong chain by one `$__wres_tri`.
+        tri: Vec<(Expression, Expression)>,
     }
     let mut folded: HashMap<String, Acc> = HashMap::default();
     let mut order: Vec<String> = Vec::new();
-    let is_pull = |e: &Expression| {
-        matches!(&e.kind,
-        ExprKind::SystemCall { name, .. } if name == "$__pull")
+    // The strength level a driver's marker gives it: 0 supply, 1 strong
+    // (unmarked), 2 pull, 3 weak.
+    let marker_level = |e: &Expression| match &e.kind {
+        ExprKind::SystemCall { name, .. } if name == "$__supply" => Some(0u8),
+        ExprKind::SystemCall { name, .. } if name == "$__pull" => Some(2),
+        ExprKind::SystemCall { name, .. } if name == "$__weak" => Some(3),
+        _ => None,
     };
     for (ca, hier) in all.into_iter().zip(hier_port_drive) {
         let name = ident_flat_name(&ca.lhs).filter(|n| !hier && multi.contains(n));
@@ -36939,17 +37012,6 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             ca.delay_off = None;
         }
         let span = ca.rhs.span;
-        // Unwrap a $__pull marker into the raw value for the weak chain.
-        let (rhs, weak) = if is_pull(&ca.rhs) {
-            let inner = if let ExprKind::SystemCall { args, .. } = ca.rhs.kind {
-                args.into_iter().next().unwrap_or_else(|| make_z_expr(span))
-            } else {
-                make_z_expr(span)
-            };
-            (inner, true)
-        } else {
-            (ca.rhs, false)
-        };
         let slot = folded.entry(name.clone()).or_insert_with(|| {
             order.push(name.clone());
             let split = split_delays.contains(&name);
@@ -36958,10 +37020,40 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 delay: if split { 0 } else { ca.delay },
                 delay_fall: if split { None } else { ca.delay_fall },
                 delay_off: if split { None } else { ca.delay_off },
+                supply: None,
                 strong: None,
                 weak: None,
+                weakest: None,
+                tri: Vec::new(),
             }
         });
+        // §28.4/§28.7: a tristate primitive with an unknown control drives
+        // `L`/`H` (its value or z), so it is resolved against the net's
+        // other drivers last, by `$__wres_tri` — on a plain wire only.
+        if !matches!(
+            elab.resolved_net_kinds.get(&name),
+            Some(ResolvedNetKind::Wand)
+                | Some(ResolvedNetKind::Wor)
+                | Some(ResolvedNetKind::RealSum)
+        ) {
+            if let Some((ctl, data)) = gate_tristate_parts(&ca) {
+                slot.tri.push((ctl.clone(), data.clone()));
+                continue;
+            }
+        }
+        // Unwrap a strength marker into the raw value for its level's chain.
+        let level = marker_level(&ca.rhs).unwrap_or(1);
+        let rhs = if level != 1 {
+            if let ExprKind::SystemCall { args, .. } = ca.rhs.kind {
+                args.into_iter().next().unwrap_or_else(|| make_z_expr(span))
+            } else {
+                make_z_expr(span)
+            }
+        } else {
+            ca.rhs
+        };
+        let weak = level != 1;
+        let slot = folded.get_mut(&name).expect("slot created above");
         // §6.6.2: a wand/triand net ANDs its drivers and a wor/trior net ORs
         // them, instead of the wire rule (z yields, equal passes, conflict ->
         // x). Plain wires and the weak pull chain keep `$__wres`.
@@ -36970,10 +37062,11 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             Some(ResolvedNetKind::Wor) if !weak => "$__wor",
             _ => "$__wres",
         };
-        let chain = if weak {
-            &mut slot.weak
-        } else {
-            &mut slot.strong
+        let chain = match level {
+            0 => &mut slot.supply,
+            1 => &mut slot.strong,
+            2 => &mut slot.weak,
+            _ => &mut slot.weakest,
         };
         let sums = matches!(
             elab.resolved_net_kinds.get(&name),
@@ -37023,15 +37116,25 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         }
     }
     for name in order {
-        if let Some(acc) = folded.remove(&name) {
+        if let Some(mut acc) = folded.remove(&name) {
             let span = acc.lhs.span;
-            let rhs = match (acc.strong, acc.weak) {
-                // Strong wins; pull fills only the bits where strong is z.
-                (Some(st), Some(wk)) => make_syscall("$__wres_pull", vec![st, wk], span),
-                (Some(st), None) => st,
-                (None, Some(wk)) => wk,
-                (None, None) => make_z_expr(span),
+            if !acc.tri.is_empty() {
+                let w = elab.signals.get(&name).map(|s| s.width).unwrap_or(1).max(1);
+                let mut args = vec![acc.strong.take().unwrap_or_else(|| make_z_fill(w, span))];
+                for (ctl, data) in std::mem::take(&mut acc.tri) {
+                    args.push(ctl);
+                    args.push(data);
+                }
+                acc.strong = Some(make_syscall("$__wres_tri", args, span));
+            }
+            // §28.12: a stronger level wins on every bit it drives; a weaker
+            // one fills only the bits the stronger levels leave at z.
+            let over = |hi: Option<Expression>, lo: Option<Expression>| match (hi, lo) {
+                (Some(h), Some(l)) => Some(make_syscall("$__wres_pull", vec![h, l], span)),
+                (h, l) => h.or(l),
             };
+            let rhs = over(acc.supply, over(acc.strong, over(acc.weak, acc.weakest)))
+                .unwrap_or_else(|| make_z_expr(span));
             elab.continuous_assigns.push(ContinuousAssignment {
                 origin: None,
                 lhs: acc.lhs,
