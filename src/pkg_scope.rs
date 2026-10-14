@@ -103,6 +103,30 @@ struct Info {
 struct ClassInfo {
     types: HashSet<String>,
     base: Option<String>,
+    /// Every typedef the class declares (class-naming ones included).
+    typedefs: HashSet<String>,
+    /// The header parameters in declaration order.
+    params: Vec<HeaderParam>,
+    /// The base specialization's arguments (`extends B #(args)`).
+    ext_args: Vec<ParamValue>,
+    /// §8.25/§6.18: typedefs whose type depends on a TYPE parameter of the
+    /// class (`typedef T payload_t;`), by name, with earlier such typedefs
+    /// expanded, and the unpacked dimensions it declares (`typedef T
+    /// ua_t[3];`). Every reference is replaced by this type (see
+    /// `inline_type`, `splice_unpacked`).
+    inline: HashMap<String, (DataType, Vec<UnpackedDimension>)>,
+}
+
+/// One `#(...)` header parameter of a class.
+struct HeaderParam {
+    name: String,
+    /// A type parameter, with its default type; else a value parameter.
+    kind: HeaderParamKind,
+}
+
+enum HeaderParamKind {
+    Type(Option<DataType>),
+    Value(Option<Expression>),
 }
 
 /// A class typedef this pass may rename: a real declaration of a data
@@ -167,8 +191,14 @@ fn record_class(
 ) {
     let mut ci = ClassInfo {
         base: c.extends.as_ref().map(|e| e.name.name.clone()),
+        ext_args: c
+            .extends
+            .as_ref()
+            .map(|e| e.args.clone())
+            .unwrap_or_default(),
         ..ClassInfo::default()
     };
+    class_param_typedefs(c, class_names, &mut ci);
     for it in &c.items {
         match it {
             ClassItem::Typedef(td) if class_typedef_renamable(td, class_names) => {
@@ -191,6 +221,376 @@ fn record_class(
         .or_default()
         .push(named.clone());
     classes.insert(named, ci);
+}
+
+/// §8.25/§6.18: record class `c`'s header parameters and the typedefs whose
+/// type depends on one of its TYPE parameters. The design keeps one flat
+/// typedef table, where such a typedef is sized once, by the parameter
+/// defaults; every reference is instead replaced by the typedef's type (see
+/// `Rw::inline_type`), which the simulator already resolves against each
+/// specialization's own bindings, like a member declared `T d;`.
+fn class_param_typedefs(c: &ClassDeclaration, class_names: &HashSet<String>, ci: &mut ClassInfo) {
+    for pd in &c.params {
+        match &pd.kind {
+            ParameterKind::Type { assignments } => {
+                for a in assignments {
+                    ci.params.push(HeaderParam {
+                        name: a.name.name.clone(),
+                        kind: HeaderParamKind::Type(a.init.clone()),
+                    });
+                }
+            }
+            ParameterKind::Data { assignments, .. } => {
+                for a in assignments {
+                    ci.params.push(HeaderParam {
+                        name: a.name.name.clone(),
+                        kind: HeaderParamKind::Value(a.init.clone()),
+                    });
+                }
+            }
+        }
+    }
+    let type_params: HashSet<String> = ci
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, HeaderParamKind::Type(_)))
+        .map(|p| p.name.clone())
+        .collect();
+    for it in &c.items {
+        let ClassItem::Typedef(td) = it else { continue };
+        ci.typedefs.insert(td.name.name.clone());
+        // A typedef naming a class (`typedef C#(T) this_type;`) stays: the
+        // simulator resolves class handles in their class context.
+        if type_params.is_empty()
+            || !class_typedef_renamable(td, class_names)
+            || type_has_args(&td.data_type)
+        {
+            continue;
+        }
+        // Earlier packed ones expand in place; an unpacked one cannot be
+        // used as the element type of another typedef here.
+        let tmap: HashMap<String, Option<DataType>> = ci
+            .inline
+            .iter()
+            .map(|(n, (t, u))| (n.clone(), u.is_empty().then(|| t.clone())))
+            .collect();
+        let Some(dt) = subst_type(&td.data_type, &tmap, &HashMap::default()) else {
+            continue;
+        };
+        if type_mentions(&dt, &type_params) {
+            ci.inline
+                .insert(td.name.name.clone(), (dt, td.dimensions.clone()));
+        }
+    }
+}
+
+/// Whether a type reference in `dt` carries a parameter list or a scope
+/// (`C#(T)`, `pkg::t`): such a typedef is left to the simulator.
+fn type_has_args(dt: &DataType) -> bool {
+    match dt {
+        DataType::TypeReference {
+            name, type_args, ..
+        } => !type_args.is_empty() || !name.scopes.is_empty(),
+        DataType::Struct(su) => su.members.iter().any(|m| type_has_args(&m.data_type)),
+        DataType::Enum(et) => et.base_type.as_deref().is_some_and(type_has_args),
+        DataType::Interface { .. } => true,
+        _ => false,
+    }
+}
+
+/// Whether `dt` names one of `names` as a (bare) type.
+fn type_mentions(dt: &DataType, names: &HashSet<String>) -> bool {
+    match dt {
+        DataType::TypeReference { name, .. } => {
+            name.scopes.is_empty() && names.contains(&name.name.name)
+        }
+        DataType::Struct(su) => su
+            .members
+            .iter()
+            .any(|m| type_mentions(&m.data_type, names)),
+        DataType::Enum(et) => et
+            .base_type
+            .as_deref()
+            .is_some_and(|b| type_mentions(b, names)),
+        _ => false,
+    }
+}
+
+/// `dt` with every bare type name in `tmap` replaced by its type (packed
+/// dimensions of the reference outermost), and every bare value name in
+/// `vmap` replaced in its dimension expressions. `None` when a name maps to
+/// nothing usable or the dimensions cannot be merged.
+fn subst_type(
+    dt: &DataType,
+    tmap: &HashMap<String, Option<DataType>>,
+    vmap: &HashMap<String, Expression>,
+) -> Option<DataType> {
+    let mut out = dt.clone();
+    match &mut out {
+        DataType::TypeReference {
+            name, dimensions, ..
+        } => {
+            subst_dims(dimensions, vmap);
+            if name.scopes.is_empty() {
+                if let Some(rep) = tmap.get(&name.name.name) {
+                    return merge_packed(rep.clone()?, std::mem::take(dimensions));
+                }
+            }
+        }
+        DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+            subst_dims(dimensions, vmap)
+        }
+        DataType::Struct(su) => {
+            for m in &mut su.members {
+                m.data_type = subst_type(&m.data_type, tmap, vmap)?;
+            }
+            subst_dims(&mut su.dimensions, vmap);
+        }
+        DataType::Enum(et) => {
+            if let Some(b) = &mut et.base_type {
+                **b = subst_type(b, tmap, vmap)?;
+            }
+            subst_dims(&mut et.dimensions, vmap);
+        }
+        _ => {}
+    }
+    Some(out)
+}
+
+/// `rep` used with the packed dimensions `outer` (`payload_t [3:0] x`):
+/// the outer dimensions come first.
+fn merge_packed(mut rep: DataType, mut outer: Vec<PackedDimension>) -> Option<DataType> {
+    if outer.is_empty() {
+        return Some(rep);
+    }
+    let inner = match &mut rep {
+        DataType::IntegerVector { dimensions, .. }
+        | DataType::Implicit { dimensions, .. }
+        | DataType::TypeReference { dimensions, .. } => dimensions,
+        DataType::Struct(su) if su.packed => &mut su.dimensions,
+        DataType::Enum(et) => &mut et.dimensions,
+        // §7.4.1: a packed array of an integer atom (`byte [2:0]` through a
+        // typedef) is a packed array of the atom's bit vector.
+        DataType::IntegerAtom { kind, span, .. } => {
+            let (vk, w) = match kind {
+                IntegerAtomType::Byte => (IntegerVectorType::Bit, 8),
+                IntegerAtomType::ShortInt => (IntegerVectorType::Bit, 16),
+                IntegerAtomType::Int => (IntegerVectorType::Bit, 32),
+                IntegerAtomType::LongInt => (IntegerVectorType::Bit, 64),
+                IntegerAtomType::Integer => (IntegerVectorType::Logic, 32),
+                IntegerAtomType::Time => (IntegerVectorType::Logic, 64),
+            };
+            let span = *span;
+            let num = |v: u32| {
+                Box::new(Expression::new(
+                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                        size: None,
+                        signed: false,
+                        base: crate::ast::expr::NumberBase::Decimal,
+                        value: v.to_string(),
+                        cached_val: std::cell::Cell::new(None),
+                    }),
+                    span,
+                ))
+            };
+            outer.push(PackedDimension::Range {
+                left: num(w - 1),
+                right: num(0),
+                span,
+            });
+            return Some(DataType::IntegerVector {
+                kind: vk,
+                signing: None,
+                dimensions: outer,
+                span,
+            });
+        }
+        _ => return None,
+    };
+    outer.append(inner);
+    *inner = outer;
+    Some(rep)
+}
+
+fn subst_dims(dims: &mut [PackedDimension], vmap: &HashMap<String, Expression>) {
+    if vmap.is_empty() {
+        return;
+    }
+    for d in dims {
+        if let PackedDimension::Range { left, right, .. } = d {
+            subst_expr(left, vmap);
+            subst_expr(right, vmap);
+        }
+    }
+}
+
+fn subst_udims(dims: &mut [UnpackedDimension], vmap: &HashMap<String, Expression>) {
+    if vmap.is_empty() {
+        return;
+    }
+    for d in dims {
+        match d {
+            UnpackedDimension::Range { left, right, .. } => {
+                subst_expr(left, vmap);
+                subst_expr(right, vmap);
+            }
+            UnpackedDimension::Expression { expr, .. } => subst_expr(expr, vmap),
+            _ => {}
+        }
+    }
+}
+
+/// Replace bare value names in a constant expression.
+fn subst_expr(e: &mut Expression, vmap: &HashMap<String, Expression>) {
+    match &mut e.kind {
+        ExprKind::Ident(_) => {
+            if let Some(r) = plain_ident(e).and_then(|n| vmap.get(n)) {
+                let span = e.span;
+                *e = Expression::new(ExprKind::Paren(Box::new(r.clone())), span);
+            }
+        }
+        ExprKind::Unary { operand, .. } => subst_expr(operand, vmap),
+        ExprKind::Binary { left, right, .. } => {
+            subst_expr(left, vmap);
+            subst_expr(right, vmap);
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            subst_expr(condition, vmap);
+            subst_expr(then_expr, vmap);
+            subst_expr(else_expr, vmap);
+        }
+        ExprKind::Paren(x) => subst_expr(x, vmap),
+        ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
+            args.iter_mut().for_each(|a| subst_expr(a, vmap))
+        }
+        _ => {}
+    }
+}
+
+/// A type argument as a data type: `byte`, `T`, `logic [7:0]`.
+fn arg_type(e: &Expression) -> Option<DataType> {
+    match &e.kind {
+        ExprKind::TypeLiteral(dt) => Some((**dt).clone()),
+        ExprKind::Paren(x) => arg_type(x),
+        _ => plain_ident(e).map(|n| {
+            keyword_type(n, e.span).unwrap_or_else(|| DataType::TypeReference {
+                name: TypeName {
+                    scopes: Vec::new(),
+                    name: crate::ast::Identifier {
+                        name: n.to_string(),
+                        span: e.span,
+                    },
+                    span: e.span,
+                },
+                dimensions: Vec::new(),
+                type_args: Vec::new(),
+                span: e.span,
+            })
+        }),
+    }
+}
+
+/// The built-in type a type-argument keyword names (`#(byte)` reaches the
+/// AST as the identifier `byte`).
+fn keyword_type(n: &str, span: crate::ast::Span) -> Option<DataType> {
+    let atom = |kind| DataType::IntegerAtom {
+        kind,
+        signing: None,
+        span,
+    };
+    let vector = |kind| DataType::IntegerVector {
+        kind,
+        signing: None,
+        dimensions: Vec::new(),
+        span,
+    };
+    Some(match n {
+        "byte" => atom(IntegerAtomType::Byte),
+        "shortint" => atom(IntegerAtomType::ShortInt),
+        "int" => atom(IntegerAtomType::Int),
+        "longint" => atom(IntegerAtomType::LongInt),
+        "integer" => atom(IntegerAtomType::Integer),
+        "time" => atom(IntegerAtomType::Time),
+        "bit" => vector(IntegerVectorType::Bit),
+        "logic" => vector(IntegerVectorType::Logic),
+        "reg" => vector(IntegerVectorType::Reg),
+        "real" => DataType::Real {
+            kind: RealType::Real,
+            span,
+        },
+        "shortreal" => DataType::Real {
+            kind: RealType::ShortReal,
+            span,
+        },
+        "realtime" => DataType::Real {
+            kind: RealType::RealTime,
+            span,
+        },
+        "string" => DataType::Simple {
+            kind: SimpleType::String,
+            span,
+        },
+        _ => return None,
+    })
+}
+
+/// Bind the header parameters `params` of a class to a specialization's
+/// arguments (positional or named, §8.25), defaults filling the rest.
+fn bind_params(
+    params: &[HeaderParam],
+    args: &[ParamValue],
+) -> (
+    HashMap<String, Option<DataType>>,
+    HashMap<String, Expression>,
+) {
+    let mut given: HashMap<String, &ParamValue> = HashMap::default();
+    let mut named: Vec<(String, ParamValue)> = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if let ParamValue::Expr(Expression {
+            kind: ExprKind::NamedArg { name, expr },
+            ..
+        }) = a
+        {
+            if let Some(x) = expr {
+                named.push((name.name.clone(), ParamValue::Expr((**x).clone())));
+            }
+        } else if let Some(p) = params.get(i) {
+            given.insert(p.name.clone(), a);
+        }
+    }
+    for (n, v) in &named {
+        given.insert(n.clone(), v);
+    }
+    let mut tmap: HashMap<String, Option<DataType>> = HashMap::default();
+    let mut vmap: HashMap<String, Expression> = HashMap::default();
+    for p in params {
+        match (&p.kind, given.get(&p.name)) {
+            (HeaderParamKind::Type(_), Some(ParamValue::Type(t))) => {
+                tmap.insert(p.name.clone(), Some(t.clone()));
+            }
+            (HeaderParamKind::Type(_), Some(ParamValue::Expr(x))) => {
+                tmap.insert(p.name.clone(), arg_type(x));
+            }
+            (HeaderParamKind::Type(d), None) => {
+                // A default may name an earlier parameter (`type RSP = REQ`).
+                let d = d.as_ref().and_then(|d| subst_type(d, &tmap, &vmap));
+                tmap.insert(p.name.clone(), d);
+            }
+            (HeaderParamKind::Value(_), Some(ParamValue::Expr(x))) => {
+                vmap.insert(p.name.clone(), x.clone());
+            }
+            (HeaderParamKind::Value(d), _) => {
+                if let Some(d) = d {
+                    vmap.insert(p.name.clone(), d.clone());
+                }
+            }
+        }
+    }
+    (tmap, vmap)
 }
 
 /// Every class declaration of the design with the package (if any) it is
@@ -356,6 +756,16 @@ struct Rw<'a> {
     /// condition): enum member references stay bare there, since they are
     /// evaluated while the elaborator is still registering the packages.
     in_const: u32,
+    /// Nesting of `inline_type` replacements being walked (a guard).
+    inline_depth: u32,
+}
+
+/// A name looked up in a class and its bases.
+enum ClassLookup {
+    /// Declared there: its inlined type and unpacked dimensions, if it is
+    /// one `inline_lookup` replaces.
+    Found(Option<(DataType, Vec<UnpackedDimension>)>),
+    Missing,
 }
 
 /// Rename colliding package type names to `pkg::name` and rewrite their
@@ -377,6 +787,7 @@ pub fn qualify_colliding_package_types(descs: &mut [Description]) -> Result<(), 
         frames: Vec::new(),
         errors: Vec::new(),
         in_const: 0,
+        inline_depth: 0,
     };
     let unit = unit_frame(descs);
     rw.frames.push(unit);
@@ -489,13 +900,6 @@ fn collect(descs: &[Description]) -> Option<Info> {
         })
         .map(|(n, _)| n.clone())
         .collect();
-    if colliding.is_empty()
-        && colliding_members.is_empty()
-        && colliding_values.is_empty()
-        && class_colliding.is_empty()
-    {
-        return None;
-    }
     let mut classes: HashMap<String, ClassInfo> = HashMap::default();
     let mut class_by_bare: HashMap<String, Vec<String>> = HashMap::default();
     for (pkg, c) in &all_classes {
@@ -511,6 +915,14 @@ fn collect(descs: &[Description]) -> Option<Info> {
             &mut classes,
             &mut class_by_bare,
         );
+    }
+    if colliding.is_empty()
+        && colliding_members.is_empty()
+        && colliding_values.is_empty()
+        && class_colliding.is_empty()
+        && classes.values().all(|ci| ci.inline.is_empty())
+    {
+        return None;
     }
     Some(Info {
         pkgs,
@@ -925,6 +1337,111 @@ impl Rw<'_> {
             .then(|| mangle(&c, name))
     }
 
+    /// §8.25/§6.18: the type a bare type name `n` stands for when it is a
+    /// class typedef depending on a type parameter (`typedef T payload_t;`),
+    /// seen from the current scope: declared by an enclosing class, or
+    /// inherited from a base, its type with the base's parameters bound to
+    /// the `extends` arguments (`extends G#(shortint)` -> `shortint`).
+    fn inline_type(&self, n: &str) -> Option<DataType> {
+        self.inline_lookup(n)
+            .and_then(|(t, u)| u.is_empty().then_some(t))
+    }
+
+    /// `inline_type` for a typedef that declares unpacked dimensions
+    /// (`typedef T ua_t[3];`): its element type and those dimensions.
+    fn inline_unpacked(&self, n: &str) -> Option<(DataType, Vec<UnpackedDimension>)> {
+        self.inline_lookup(n).filter(|(_, u)| !u.is_empty())
+    }
+
+    fn inline_lookup(&self, n: &str) -> Option<(DataType, Vec<UnpackedDimension>)> {
+        if self.inline_depth > 8 {
+            return None;
+        }
+        for f in self.frames.iter().rev() {
+            if let Some(c) = &f.cls {
+                // Only the innermost class: a nested class (`class N` inside
+                // `G#(T)`) does not carry its outer class's bindings, so it
+                // keeps the typedef's elaborated (default) type.
+                return match self.class_chain_type(c, n) {
+                    ClassLookup::Found(t) => t,
+                    ClassLookup::Missing => None,
+                };
+            }
+            if f.types.contains(n) {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn class_chain_type(&self, c: &str, n: &str) -> ClassLookup {
+        let mut cur = c.to_string();
+        let mut maps = Vec::new();
+        for _ in 0..64 {
+            let Some(ci) = self.info.classes.get(&cur) else {
+                return ClassLookup::Missing;
+            };
+            if let Some((dt, ud)) = ci.inline.get(n) {
+                let mut dt = Some(dt.clone());
+                let mut ud = ud.clone();
+                for (t, v) in maps.iter().rev() {
+                    dt = dt.and_then(|d| subst_type(&d, t, v));
+                    subst_udims(&mut ud, v);
+                }
+                return ClassLookup::Found(dt.map(|d| (d, ud)));
+            }
+            if ci.typedefs.contains(n)
+                || ci.types.contains(n)
+                || ci.params.iter().any(|p| p.name == n)
+            {
+                return ClassLookup::Found(None);
+            }
+            let Some(b) = ci.base.as_ref().and_then(|b| self.class_named(b)) else {
+                return ClassLookup::Missing;
+            };
+            let Some(bci) = self.info.classes.get(&b) else {
+                return ClassLookup::Missing;
+            };
+            maps.push(bind_params(&bci.params, &ci.ext_args));
+            cur = b;
+        }
+        ClassLookup::Missing
+    }
+
+    /// The replacement for a type reference: a bare name `inline_type`
+    /// knows, or `C#(args)::name` naming such a typedef of class C.
+    fn inline_ref(&self, dt: &DataType) -> Option<DataType> {
+        let DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = dt
+        else {
+            return None;
+        };
+        if !type_args.is_empty() {
+            return None;
+        }
+        let rep = match name.scopes.as_slice() {
+            [] => self.inline_type(&name.name.name)?,
+            [s] if !s.type_args.is_empty() => {
+                let c = self.class_named(&s.name.name)?;
+                let ci = self.info.classes.get(&c)?;
+                let (dt, ud) = ci.inline.get(&name.name.name)?;
+                if !ud.is_empty() {
+                    return None;
+                }
+                let args: Vec<ParamValue> =
+                    s.type_args.iter().cloned().map(ParamValue::Expr).collect();
+                let (t, v) = bind_params(&ci.params, &args);
+                subst_type(dt, &t, &v)?
+            }
+            _ => return None,
+        };
+        merge_packed(rep, dimensions.clone())
+    }
+
     fn value_shadowed(&self, n: &str) -> bool {
         self.frames.iter().any(|f| f.values.contains(n))
     }
@@ -1009,6 +1526,13 @@ impl Rw<'_> {
     }
 
     fn dtype_inner(&mut self, dt: &mut DataType) {
+        if let Some(rep) = self.inline_ref(dt) {
+            *dt = rep;
+            self.inline_depth += 1;
+            self.dtype_inner(dt);
+            self.inline_depth -= 1;
+            return;
+        }
         match dt {
             DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
                 self.packed(dimensions)
@@ -1152,6 +1676,34 @@ impl Rw<'_> {
             ExprKind::Ident(h) => {
                 if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() {
                     let n = &h.path[0].name.name;
+                    // A typedef `inline_type` replaces, used as an operand
+                    // (`$bits(payload_t)`, `payload_t'(v)`).
+                    if !self.value_shadowed(n) {
+                        if let Some(rep) = self.inline_type(n) {
+                            match &rep {
+                                DataType::TypeReference {
+                                    name,
+                                    dimensions,
+                                    type_args,
+                                    ..
+                                } if name.scopes.is_empty()
+                                    && dimensions.is_empty()
+                                    && type_args.is_empty() =>
+                                {
+                                    h.path[0].name.name = name.name.name.clone();
+                                }
+                                _ => {
+                                    let span = e.span;
+                                    *e =
+                                        Expression::new(ExprKind::TypeLiteral(Box::new(rep)), span);
+                                    self.inline_depth += 1;
+                                    self.expr(e);
+                                    self.inline_depth -= 1;
+                                }
+                            }
+                            return;
+                        }
+                    }
                     if (self.info.colliding.contains(n) || self.info.class_colliding.contains(n))
                         && !self.value_shadowed(n)
                     {
@@ -1245,7 +1797,17 @@ impl Rw<'_> {
                     }
                 }
             }
-            ExprKind::SystemCall { args, .. } => args.iter_mut().for_each(|a| self.expr(a)),
+            ExprKind::SystemCall { name, args } => {
+                args.iter_mut().for_each(|a| self.expr(a));
+                // `payload_t'(v)` whose typedef was replaced by a type.
+                if name == "$__xz_named_cast"
+                    && args
+                        .first()
+                        .is_some_and(|a| matches!(a.kind, ExprKind::TypeLiteral(_)))
+                {
+                    *name = "$__xz_type_cast".to_string();
+                }
+            }
             ExprKind::NamedArg { expr, .. } => self.opt_box(expr),
             ExprKind::Inside { expr, ranges } => {
                 self.expr(expr);
@@ -1514,6 +2076,7 @@ impl Rw<'_> {
                 declarators,
                 ..
             } => {
+                self.splice_unpacked(data_type, declarators);
                 self.dtype(data_type);
                 self.declarators(declarators);
             }
@@ -1573,6 +2136,31 @@ impl Rw<'_> {
         if let Some(ee) = &mut a.inferred_clock {
             self.expr(&mut ee.expr);
             self.opt(&mut ee.iff);
+        }
+    }
+
+    /// A declaration whose type is a typedef `inline_unpacked` replaces
+    /// (`ua_t u;` with `typedef T ua_t[3];`) declares `T u[3]`: the
+    /// typedef's dimensions follow the declarator's own (§7.4.2).
+    fn splice_unpacked(&mut self, dt: &mut DataType, ds: &mut [VarDeclarator]) {
+        let DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = dt
+        else {
+            return;
+        };
+        if name.has_scope() || !dimensions.is_empty() || !type_args.is_empty() || ds.is_empty() {
+            return;
+        }
+        let Some((elem, ud)) = self.inline_unpacked(&name.name.name) else {
+            return;
+        };
+        *dt = elem;
+        for d in ds {
+            d.dimensions.extend(ud.iter().cloned());
         }
     }
 
@@ -1859,6 +2447,7 @@ impl Rw<'_> {
         for it in &mut c.items {
             match it {
                 ClassItem::Property(p) => {
+                    self.splice_unpacked(&mut p.data_type, &mut p.declarators);
                     self.dtype(&mut p.data_type);
                     self.declarators(&mut p.declarators);
                 }
