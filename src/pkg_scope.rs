@@ -1359,13 +1359,14 @@ impl Rw<'_> {
         }
         for f in self.frames.iter().rev() {
             if let Some(c) = &f.cls {
-                // Only the innermost class: a nested class (`class N` inside
-                // `G#(T)`) does not carry its outer class's bindings, so it
-                // keeps the typedef's elaborated (default) type.
-                return match self.class_chain_type(c, n) {
-                    ClassLookup::Found(t) => t,
-                    ClassLookup::Missing => None,
-                };
+                // §8.23: a name a nested class does not declare is looked
+                // up in its enclosing class, whose parameters the nested
+                // class carries per specialization (see the elaborator's
+                // `with_enclosing_params`).
+                match self.class_chain_type(c, n) {
+                    ClassLookup::Found(t) => return t,
+                    ClassLookup::Missing => continue,
+                }
             }
             if f.types.contains(n) {
                 return None;
