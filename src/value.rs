@@ -3228,6 +3228,15 @@ impl Value {
             }
             return Value::new(1);
         }
+        // §11.4.5: an operand wider than 64 bits is compared in full —
+        // `to_u64` reads only the low word, so two wide values differing
+        // above bit 63 compared equal.
+        if self.width > 64 || other.width > 64 {
+            return Value::from_u64(
+                (self.wide_cmp(other) == std::cmp::Ordering::Equal) as u64,
+                1,
+            );
+        }
         // §11.6.1/§11.8.2: the expression is signed only when BOTH operands
         // are signed. Sign-extending whenever EITHER was signed made a signed
         // narrow operand compare as negative against a wider unsigned one
