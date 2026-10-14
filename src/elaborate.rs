@@ -24859,6 +24859,7 @@ fn validate_inlined_bodies(
     for p in &elab.pending_always {
         let mut locals = HashSet::default();
         collect_stmt_declared_names(&p.source, &mut locals);
+        add_construct_bound_names(&p.source, &mut locals);
         let src = &p.source;
         check_body(
             std::rc::Rc::as_ptr(src) as usize,
@@ -24870,6 +24871,7 @@ fn validate_inlined_bodies(
     for p in &elab.pending_initial {
         let mut locals = HashSet::default();
         collect_stmt_declared_names(&p.source, &mut locals);
+        add_construct_bound_names(&p.source, &mut locals);
         let src = &p.source;
         check_body(
             std::rc::Rc::as_ptr(src) as usize,
@@ -24893,6 +24895,43 @@ fn validate_inlined_bodies(
         return Err(format!("Undeclared identifier '{}'{}", name, loc));
     }
     validate_subroutine_bodies(elab, definitions, &known, &outside_classes)
+}
+
+/// Names a statement's constructs bind themselves, for the undeclared-name
+/// checks: the §7.12 array-method iterator (`item`, or `x` in
+/// `arr.find(x) with (x > 0)`) and the §18.11 `obj.randomize(v, w)` operands,
+/// which name members of `obj`.
+fn add_construct_bound_names(s: &Statement, locals: &mut HashSet<String>) {
+    locals.insert("item".to_string());
+    for_each_stmt_expr(s, &mut |e| {
+        for_each_sub_expr(e, &mut |x| {
+            let args = match &x.kind {
+                ExprKind::WithClause { expr, .. } => match &expr.kind {
+                    ExprKind::Call { args, .. } => args,
+                    _ => return,
+                },
+                // §18.11: `obj.randomize(v, w)` names members of `obj`.
+                ExprKind::Call { func, args } => match &func.kind {
+                    ExprKind::MemberAccess { member, .. } if member.name == "randomize" => args,
+                    ExprKind::Ident(h)
+                        if h.path.len() > 1
+                            && h.path.last().is_some_and(|s| s.name.name == "randomize") =>
+                    {
+                        args
+                    }
+                    _ => return,
+                },
+                _ => return,
+            };
+            for a in args {
+                if let ExprKind::Ident(h) = &a.kind {
+                    if h.path.len() == 1 {
+                        locals.insert(h.path[0].name.name.clone());
+                    }
+                }
+            }
+        })
+    });
 }
 
 /// One task/function body to check.
@@ -25174,38 +25213,8 @@ fn first_undeclared_in_subroutine(
     for s in body.items {
         collect_stmt_declared_names(s, &mut locals);
     }
-    // §7.12: `arr.find(x) with (x > 0)` binds `x` (default `item`).
-    locals.insert("item".to_string());
     for s in body.items {
-        for_each_stmt_expr(s, &mut |e| {
-            for_each_sub_expr(e, &mut |x| {
-                let args = match &x.kind {
-                    ExprKind::WithClause { expr, .. } => match &expr.kind {
-                        ExprKind::Call { args, .. } => args,
-                        _ => return,
-                    },
-                    // §18.11: `obj.randomize(v, w)` names members of `obj`.
-                    ExprKind::Call { func, args } => match &func.kind {
-                        ExprKind::MemberAccess { member, .. } if member.name == "randomize" => args,
-                        ExprKind::Ident(h)
-                            if h.path.len() > 1
-                                && h.path.last().is_some_and(|s| s.name.name == "randomize") =>
-                        {
-                            args
-                        }
-                        _ => return,
-                    },
-                    _ => return,
-                };
-                for a in args {
-                    if let ExprKind::Ident(h) = &a.kind {
-                        if h.path.len() == 1 {
-                            locals.insert(h.path[0].name.name.clone());
-                        }
-                    }
-                }
-            })
-        });
+        add_construct_bound_names(s, &mut locals);
     }
     let mut first: Option<(String, Span)> = None;
     for s in body.items {
@@ -38489,9 +38498,350 @@ fn rewrite_expr_impl(
                 ))
             }),
         },
+        // §7.12 / §18.7 / §18.12: an array method's `with (expr)` clause and
+        // a `randomize(...) with { ... }` call name the instance's own objects
+        // like any other operand, so they take the instance prefix (see
+        // `rescope_expr`). Cloning them verbatim left their operands as bare
+        // leaf names: in a child instance `std::randomize(arr) with {...}`
+        // solved the top module's same-named `arr`, or no array at all, and
+        // the constraints and `arr.sum() with (...)` read the wrong storage.
+        ExprKind::WithClause { .. } => {
+            return rescope_expr(expr, prefix, port_map, local_names, interface_map);
+        }
+        ExprKind::RandomizeWith { call, constraints } => ExprKind::RandomizeWith {
+            call: Box::new(rescope_expr(
+                call,
+                prefix,
+                port_map,
+                local_names,
+                interface_map,
+            )),
+            constraints: constraints
+                .iter()
+                .map(|c| rewrite_constraint_item(c, prefix, port_map, local_names, interface_map))
+                .collect(),
+        },
+        // §12.6: `expr matches pattern` names the instance's objects too.
+        ExprKind::Matches { expr: e, pattern } => ExprKind::Matches {
+            expr: Box::new(rewrite_expr_impl(
+                e,
+                prefix,
+                port_map,
+                local_names,
+                interface_map,
+            )),
+            pattern: Box::new(rewrite_pattern(
+                pattern,
+                prefix,
+                port_map,
+                local_names,
+                interface_map,
+            )),
+        },
         other => other.clone(),
     };
     Expression::new(new_kind, expr.span)
+}
+
+/// Instance rewrite of an operand of a `with` clause or an inline-constraint
+/// block that keeps the expression's SHAPE: only identifiers are renamed (by
+/// `rewrite_expr_impl`), and every other node is rebuilt around its rewritten
+/// children. The generic rewrite flattens `a.m` into the dotted identifier
+/// `a.m`; the randomize call (`std::randomize`, `obj.randomize`), the
+/// constraint solver (`arr.size()`, `arr.sum()`) and the `with` evaluation
+/// recognize these constructs by their member-access form.
+fn rescope_expr(
+    e: &Expression,
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> Expression {
+    let rx = |x: &Expression| rescope_expr(x, prefix, port_map, local_names, interface_map);
+    let bx = |x: &Expression| Box::new(rx(x));
+    let kind = match &e.kind {
+        ExprKind::Ident(h) => {
+            let mut h = h.clone();
+            // The selects held on the path name instance objects too; a
+            // port-mapped head is substituted whole below instead, which
+            // rewrites its selects itself.
+            let mapped = h.root.is_none()
+                && h.path
+                    .first()
+                    .is_some_and(|s| port_map.contains_key(&s.name.name));
+            if !mapped {
+                for seg in &mut h.path {
+                    for sel in &mut seg.selects {
+                        *sel = rx(sel);
+                    }
+                }
+            }
+            // §18.7.1 `local::name` binds in the scope of the randomize()
+            // call: the instance's own object when the instance declares it.
+            if h.root.as_deref() == Some(LOCAL_SCOPE_ROOT) {
+                if let Some(seg) = h.path.first_mut() {
+                    if local_names.contains(seg.name.name.as_str()) {
+                        seg.name.name = cat2(prefix, &seg.name.name);
+                    }
+                }
+                return Expression::new(ExprKind::Ident(h), e.span);
+            }
+            let renamed = Expression::new(ExprKind::Ident(h), e.span);
+            return rewrite_expr_impl(&renamed, prefix, port_map, local_names, interface_map);
+        }
+        ExprKind::MemberAccess { expr: base, member } => ExprKind::MemberAccess {
+            expr: bx(base),
+            member: member.clone(),
+        },
+        ExprKind::WithClause { expr: base, filter } => {
+            // The iterator (`item`, or the method's single identifier
+            // argument) is a declaration bound by the clause: it is left as
+            // written and shadows a same-named instance object in the filter.
+            let iter_arg = match &base.kind {
+                ExprKind::Call { args, .. } => match args.as_slice() {
+                    [a] => match &a.kind {
+                        ExprKind::Ident(h)
+                            if h.root.is_none()
+                                && h.path.len() == 1
+                                && h.path[0].selects.is_empty() =>
+                        {
+                            Some(h.path[0].name.name.clone())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+            let base_out = match (&base.kind, &iter_arg) {
+                (ExprKind::Call { func, args }, Some(_)) => Expression::new(
+                    ExprKind::Call {
+                        func: bx(func),
+                        args: args.clone(),
+                    },
+                    base.span,
+                ),
+                _ => rx(base),
+            };
+            let iter = iter_arg.unwrap_or_else(|| "item".to_string());
+            let filter_out = with_shadowed(&[iter.as_str()], port_map, local_names, |pm, ln| {
+                rescope_expr(filter, prefix, pm, ln, interface_map)
+            });
+            ExprKind::WithClause {
+                expr: Box::new(base_out),
+                filter: Box::new(filter_out),
+            }
+        }
+        ExprKind::Call { func, args } => ExprKind::Call {
+            func: bx(func),
+            args: args.iter().map(rx).collect(),
+        },
+        ExprKind::Unary { op, operand } => ExprKind::Unary {
+            op: *op,
+            operand: bx(operand),
+        },
+        ExprKind::Binary { op, left, right } => ExprKind::Binary {
+            op: *op,
+            left: bx(left),
+            right: bx(right),
+        },
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => ExprKind::Conditional {
+            condition: bx(condition),
+            then_expr: bx(then_expr),
+            else_expr: bx(else_expr),
+        },
+        ExprKind::Concatenation(parts) => ExprKind::Concatenation(parts.iter().map(rx).collect()),
+        ExprKind::Replication { count, exprs } => ExprKind::Replication {
+            count: bx(count),
+            exprs: exprs.iter().map(rx).collect(),
+        },
+        ExprKind::Inside { expr: x, ranges } => ExprKind::Inside {
+            expr: bx(x),
+            ranges: ranges.iter().map(rx).collect(),
+        },
+        ExprKind::Range(lo, hi) => ExprKind::Range(bx(lo), bx(hi)),
+        ExprKind::Index { expr: x, index } => ExprKind::Index {
+            expr: bx(x),
+            index: bx(index),
+        },
+        ExprKind::RangeSelect {
+            expr: x,
+            kind,
+            left,
+            right,
+        } => ExprKind::RangeSelect {
+            expr: bx(x),
+            kind: *kind,
+            left: bx(left),
+            right: bx(right),
+        },
+        ExprKind::Paren(x) => ExprKind::Paren(bx(x)),
+        ExprKind::SystemCall { name, args } if bits_of_bound_type_param(name, args).is_none() => {
+            ExprKind::SystemCall {
+                name: name.clone(),
+                args: args.iter().map(rx).collect(),
+            }
+        }
+        _ => return rewrite_expr_impl(e, prefix, port_map, local_names, interface_map),
+    };
+    Expression::new(kind, e.span)
+}
+
+/// Run `f` with `bound` names removed from the instance's local names and
+/// port map: names a construct binds itself (a `with` iterator, a constraint
+/// `foreach` loop variable) shadow the instance's same-named objects. The
+/// sets are only cloned when a bound name actually collides.
+fn with_shadowed<R>(
+    bound: &[&str],
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    f: impl FnOnce(&HashMap<String, Expression>, &std::collections::HashSet<String>) -> R,
+) -> R {
+    let ln = without_declared(local_names, bound.iter().copied());
+    let pm = if bound.iter().any(|b| port_map.contains_key(*b)) {
+        let mut m = port_map.clone();
+        for b in bound {
+            m.remove(*b);
+        }
+        Some(m)
+    } else {
+        None
+    };
+    f(
+        pm.as_ref().unwrap_or(port_map),
+        ln.as_ref().unwrap_or(local_names),
+    )
+}
+
+/// Rewrite one inline-constraint item (§18.5) of a `randomize() with` for the
+/// instance: every operand takes the instance prefix, and a `foreach` loop
+/// variable shadows a same-named instance object inside its body.
+fn rewrite_constraint_item(
+    c: &ConstraintItem,
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> ConstraintItem {
+    let rx = |e: &Expression| rescope_expr(e, prefix, port_map, local_names, interface_map);
+    let ri = |i: &ConstraintItem| {
+        Box::new(rewrite_constraint_item(
+            i,
+            prefix,
+            port_map,
+            local_names,
+            interface_map,
+        ))
+    };
+    match c {
+        ConstraintItem::Expr(e) => ConstraintItem::Expr(rx(e)),
+        ConstraintItem::Inside {
+            expr,
+            range,
+            is_dist,
+            dist_weights,
+            span,
+        } => ConstraintItem::Inside {
+            expr: rx(expr),
+            range: range
+                .iter()
+                .map(|r| match r {
+                    ConstraintRange::Value(v) => ConstraintRange::Value(rx(v)),
+                    ConstraintRange::Range { lo, hi } => ConstraintRange::Range {
+                        lo: rx(lo),
+                        hi: rx(hi),
+                    },
+                })
+                .collect(),
+            is_dist: *is_dist,
+            dist_weights: dist_weights
+                .iter()
+                .map(|w| {
+                    w.as_ref().map(|w| match w {
+                        DistWeight::Each(e) => DistWeight::Each(rx(e)),
+                        DistWeight::Total(e) => DistWeight::Total(rx(e)),
+                    })
+                })
+                .collect(),
+            span: *span,
+        },
+        ConstraintItem::Implication {
+            condition,
+            constraint,
+            span,
+        } => ConstraintItem::Implication {
+            condition: rx(condition),
+            constraint: ri(constraint),
+            span: *span,
+        },
+        ConstraintItem::IfElse {
+            condition,
+            then_item,
+            else_item,
+            span,
+        } => ConstraintItem::IfElse {
+            condition: rx(condition),
+            then_item: ri(then_item),
+            else_item: else_item.as_ref().map(|e| ri(e)),
+            span: *span,
+        },
+        ConstraintItem::Foreach {
+            array,
+            vars,
+            item,
+            span,
+        } => {
+            let bound: Vec<&str> = vars.iter().flatten().map(|v| v.name.as_str()).collect();
+            let body = with_shadowed(&bound, port_map, local_names, |pm, ln| {
+                rewrite_constraint_item(item, prefix, pm, ln, interface_map)
+            });
+            ConstraintItem::Foreach {
+                array: rx(array),
+                vars: vars.clone(),
+                item: Box::new(body),
+                span: *span,
+            }
+        }
+        ConstraintItem::Solve {
+            before,
+            after,
+            before_paths,
+            after_paths,
+            span,
+        } => {
+            // §18.5.10: the operands name random variables — for a
+            // `std::randomize` call, the instance's own objects.
+            let rid = |id: &Identifier| {
+                let mut id = id.clone();
+                if local_names.contains(id.name.as_str()) && !port_map.contains_key(&id.name) {
+                    id.name = cat2(prefix, &id.name);
+                }
+                id
+            };
+            ConstraintItem::Solve {
+                before: before.iter().map(rid).collect(),
+                after: after.iter().map(rid).collect(),
+                before_paths: before_paths.iter().map(rx).collect(),
+                after_paths: after_paths.iter().map(rx).collect(),
+                span: *span,
+            }
+        }
+        ConstraintItem::Soft(inner) => ConstraintItem::Soft(ri(inner)),
+        ConstraintItem::Block(items) => ConstraintItem::Block(
+            items
+                .iter()
+                .map(|i| rewrite_constraint_item(i, prefix, port_map, local_names, interface_map))
+                .collect(),
+        ),
+        ConstraintItem::Unique { exprs, span } => ConstraintItem::Unique {
+            exprs: exprs.iter().map(rx).collect(),
+            span: *span,
+        },
+    }
 }
 
 /// Rewrite the constant-expression leaves of a §12.6 pattern for an instance.
