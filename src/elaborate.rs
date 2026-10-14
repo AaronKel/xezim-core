@@ -354,6 +354,21 @@ pub struct Signal {
     pub type_name: Option<String>,
 }
 
+/// §28.12: one driver of a net whose drivers carry drive strengths, kept so
+/// `%v` (§21.2.1.5) can report the strength the net resolves to.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StrengthDriver {
+    /// The driven value.
+    pub value: Expression,
+    /// A tristate primitive's control (`ctl ? value : 'z`); `None` when the
+    /// driver is always on.
+    pub ctl: Option<Expression>,
+    /// Strength level, 0 (highz) to 7 (supply), of a driven 0 and of a
+    /// driven 1.
+    pub s0: u8,
+    pub s1: u8,
+}
+
 /// A continuous assignment: assign lhs = rhs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ContinuousAssignment {
@@ -2519,6 +2534,15 @@ pub struct ElaboratedModule {
     /// Consumed by `%v` (§21.2.1.5); absent nets display as strong.
     #[serde(default)]
     pub net_strengths: HashMap<String, (String, String)>,
+    /// §28.12: every driver, with its strengths, of each net that several
+    /// drivers resolve and some driver of which carries a drive strength, is
+    /// a tristate primitive or a pull (and of each tri0/tri1/trireg net).
+    /// Only `%v` reads it; the net's value comes from its folded assign.
+    #[serde(default)]
+    pub strength_drivers: HashMap<String, Vec<StrengthDriver>>,
+    /// `supply0` / `supply1` nets (supply strength, §6.6.6).
+    #[serde(default)]
+    pub supply_nets: HashSet<String>,
     /// Arrays declared with descending range (e.g. [7:0])
     pub descending_arrays: HashSet<String>,
     /// DECLARED (left, right) bounds per unpacked dimension, outermost first
@@ -3081,6 +3105,8 @@ impl ElaboratedModule {
             assoc_defaults: HashMap::default(),
             dynamic_arrays: HashSet::default(),
             net_strengths: HashMap::default(),
+            strength_drivers: HashMap::default(),
+            supply_nets: HashSet::default(),
             descending_arrays: HashSet::default(),
             unpacked_decl_dims: HashMap::default(),
             ascending_packed: HashMap::default(),
@@ -9822,7 +9848,11 @@ pub fn elaborate_module_with_defs(
                         }
                     }
                     let mut rhs_final = match ca.strength.as_deref().and_then(strength_marker) {
-                        Some(marker) => make_syscall(marker, vec![rhs.clone()], rhs.span),
+                        Some((marker, code)) => make_syscall(
+                            marker,
+                            vec![rhs.clone(), strength_code_literal(code, rhs.span)],
+                            rhs.span,
+                        ),
                         None => rhs.clone(),
                     };
                     root_mark_hier_ca_rhs(lhs, &mut rhs_final);
@@ -15021,7 +15051,11 @@ fn elaborate_items_numbered(
                         }
                     }
                     let mut rhs_final = match ca.strength.as_deref().and_then(strength_marker) {
-                        Some(marker) => make_syscall(marker, vec![rhs.clone()], rhs.span),
+                        Some((marker, code)) => make_syscall(
+                            marker,
+                            vec![rhs.clone(), strength_code_literal(code, rhs.span)],
+                            rhs.span,
+                        ),
                         None => rhs.clone(),
                     };
                     root_mark_hier_ca_rhs(lhs, &mut rhs_final);
@@ -17833,6 +17867,9 @@ fn port_decl_net_type(pd: &PortDeclaration) -> Option<NetType> {
 /// while forgetting the metadata needed after a driver changes or releases.
 fn register_net_type(elab: &mut ElaboratedModule, name: &str, net_type: NetType) {
     elab.nets.insert(name.to_string());
+    if matches!(net_type, NetType::Supply0 | NetType::Supply1) {
+        elab.supply_nets.insert(name.to_string());
+    }
     if let Some(kind) = ResolvedNetKind::from_net_type(net_type) {
         elab.resolved_net_kinds.insert(name.to_string(), kind);
     }
@@ -17843,6 +17880,7 @@ fn register_net_type(elab: &mut ElaboratedModule, name: &str, net_type: NetType)
 
 fn unregister_net_type(elab: &mut ElaboratedModule, name: &str) {
     elab.nets.remove(name);
+    elab.supply_nets.remove(name);
     elab.resolved_net_kinds.remove(name);
     elab.interconnect_nets.remove(name);
 }
@@ -34571,7 +34609,8 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
                     // and only falls back to the pull where the net is otherwise
                     // z. A lone pull driver evaluates to its value ($__pull is
                     // identity in the simulator).
-                    let weak = make_syscall("$__pull", vec![lit], net.span);
+                    let code = strength_code_literal(5 * 8 + 5, net.span);
+                    let weak = make_syscall("$__pull", vec![lit, code], net.span);
                     pairs.push((net.clone(), weak));
                 }
                 continue;
@@ -34867,23 +34906,63 @@ fn ident_flat_name(e: &Expression) -> Option<String> {
 /// `$__pull` for any other all-weak (pull/weak/highz) pair, and `None` for a
 /// strong driver. A mixed strong/weak pair (`strong0, weak1`) is approximated
 /// as strong, as before.
-fn strength_marker(s: &str) -> Option<&'static str> {
+///
+/// Every marker carries the exact pair as a second argument (see
+/// `strength_code`) for `%v`; a pair with a strong or supply side that is not
+/// all-supply gets `$__drive`, which resolves like an unmarked (strong)
+/// driver.
+fn strength_marker(s: &str) -> Option<(&'static str, u8)> {
     let toks: Vec<&str> = s
         .split(',')
         .map(|t| t.trim().trim_end_matches(['0', '1']))
         .filter(|t| !t.is_empty())
         .collect();
+    let code = strength_code(s);
     if toks.is_empty() {
         None
     } else if toks.iter().all(|t| *t == "supply") {
-        Some("$__supply")
+        Some(("$__supply", code))
     } else if toks.iter().all(|t| *t == "weak") {
-        Some("$__weak")
+        Some(("$__weak", code))
     } else if strength_is_weak(s) {
-        Some("$__pull")
+        Some(("$__pull", code))
     } else {
-        None
+        Some(("$__drive", code))
     }
+}
+
+/// §28.12 strength level of one strength keyword: 7 supply, 6 strong,
+/// 5 pull, 4 large, 3 weak, 2 medium, 1 small, 0 highz.
+fn strength_level(tok: &str) -> u8 {
+    match tok.trim().trim_end_matches(['0', '1']) {
+        "supply" => 7,
+        "strong" => 6,
+        "pull" => 5,
+        "large" => 4,
+        "weak" => 3,
+        "medium" => 2,
+        "small" => 1,
+        "highz" => 0,
+        _ => 6,
+    }
+}
+
+/// A drive-strength pair `(s0, s1)` packed as `s0 * 8 + s1`; a side the
+/// spec leaves out is strong.
+fn strength_code(s: &str) -> u8 {
+    let (mut s0, mut s1) = (6u8, 6u8);
+    for tok in s.split(',').map(str::trim) {
+        if tok.ends_with('0') {
+            s0 = strength_level(tok);
+        } else if tok.ends_with('1') {
+            s1 = strength_level(tok);
+        }
+    }
+    s0 * 8 + s1
+}
+
+fn strength_code_literal(code: u8, span: Span) -> Expression {
+    const_value_literal(&Value::from_u64(u64::from(code), 8), span).expect("strength literal")
 }
 
 fn strength_is_weak(s: &str) -> bool {
@@ -37076,6 +37155,50 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
 
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     widen_overlapping_select_drivers(elab);
+    // §28.12 / §21.2.1.5: a net with ONE driver that carries a strength or
+    // is a tristate primitive keeps that driver for `%v`; a net several
+    // drivers resolve replaces it below.
+    let mut single: Vec<(String, StrengthDriver)> = Vec::new();
+    for ca in &elab.continuous_assigns {
+        let Some(n) = ident_flat_name(&ca.lhs).filter(|n| elab.nets.contains(n)) else {
+            continue;
+        };
+        if let Some((ctl, data)) = gate_tristate_parts(ca) {
+            single.push((
+                n,
+                StrengthDriver {
+                    value: data.clone(),
+                    ctl: Some(ctl.clone()),
+                    s0: 6,
+                    s1: 6,
+                },
+            ));
+        } else if let ExprKind::SystemCall { name, args } = &ca.rhs.kind
+            && matches!(
+                name.as_str(),
+                "$__supply" | "$__drive" | "$__pull" | "$__weak"
+            )
+            && let (Some(v), Some(code)) = (
+                args.first(),
+                args.get(1)
+                    .and_then(|c| const_eval_i64_with_params(c, None)),
+            )
+        {
+            let code = code as u8;
+            single.push((
+                n,
+                StrengthDriver {
+                    value: v.clone(),
+                    ctl: None,
+                    s0: code / 8,
+                    s1: code % 8,
+                },
+            ));
+        }
+    }
+    for (n, d) in single {
+        elab.strength_drivers.insert(n, vec![d]);
+    }
     // A user-written HIERARCHICAL continuous assign onto an instance PORT
     // (`assign dut.u_mid.u_leaf.clk_i = tb_clk;` — a multi-segment path)
     // drives the port's whole alias chain: the simulator fans it out across
@@ -37157,8 +37280,29 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             multi.insert(n.to_string());
         }
     }
+    // §6.6.4: a trireg's charge starts unknown once something drives it,
+    // but a trireg no driver reaches at all is high-impedance (as the
+    // reference simulator reads it).
+    let undriven_trireg: Vec<String> = elab
+        .resolved_net_kinds
+        .iter()
+        .filter(|(n, k)| {
+            matches!(k, ResolvedNetKind::ChargeStorage) && !counts.contains_key(n.as_str())
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
     drop(counts);
+    let set_undriven_z = |elab: &mut ElaboratedModule| {
+        for n in &undriven_trireg {
+            if let Some(sig) = elab.signals.get_mut(n)
+                && !sig.is_real
+            {
+                sig.value = Value::all_z(sig.width.max(1));
+            }
+        }
+    };
     if multi.is_empty() {
+        set_undriven_z(elab);
         return;
     }
     if pending_lhs
@@ -37224,10 +37368,25 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // (unmarked), 2 pull, 3 weak.
     let marker_level = |e: &Expression| match &e.kind {
         ExprKind::SystemCall { name, .. } if name == "$__supply" => Some(0u8),
+        ExprKind::SystemCall { name, .. } if name == "$__drive" => Some(1),
         ExprKind::SystemCall { name, .. } if name == "$__pull" => Some(2),
         ExprKind::SystemCall { name, .. } if name == "$__weak" => Some(3),
         _ => None,
     };
+    // §28.12 strength pair of a marked driver (see `strength_code`); an
+    // unmarked one is strong.
+    let marker_code = |e: &Expression| -> Option<u8> {
+        match &e.kind {
+            ExprKind::SystemCall { args, .. } if marker_level(e).is_some() => args
+                .get(1)
+                .and_then(|c| const_eval_i64_with_params(c, None))
+                .map(|c| c as u8),
+            _ => None,
+        }
+    };
+    // Per folded net: its drivers with their strengths, and whether any
+    // of them makes the strengths worth keeping for `%v`.
+    let mut strength: HashMap<String, (Vec<StrengthDriver>, bool)> = HashMap::default();
     for (ca, hier) in all.into_iter().zip(hier_port_drive) {
         let name = ident_flat_name(&ca.lhs).filter(|n| !hier && multi.contains(n));
         let Some(name) = name else {
@@ -37250,8 +37409,22 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             let rhs = make_ident_expr(&drv);
             let mut delayed = ca.clone();
             delayed.lhs = make_ident_expr(&drv);
+            // A strength marker stays on the folded driver (its level and
+            // §28.12 pair); the delayed driver net carries the bare value.
+            let marked = match &ca.rhs.kind {
+                ExprKind::SystemCall { name: m, args } if marker_level(&ca.rhs).is_some() => {
+                    delayed.rhs = args
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| make_z_expr(ca.rhs.span));
+                    let mut margs = vec![Expression::new(rhs.kind.clone(), ca.rhs.span)];
+                    margs.extend(args.iter().skip(1).cloned());
+                    Some(make_syscall(m, margs, ca.rhs.span))
+                }
+                _ => None,
+            };
             elab.continuous_assigns.push(delayed);
-            ca.rhs = Expression::new(rhs.kind, ca.rhs.span);
+            ca.rhs = marked.unwrap_or_else(|| Expression::new(rhs.kind, ca.rhs.span));
             ca.delay = 0;
             ca.delay_fall = None;
             ca.delay_off = None;
@@ -37283,12 +37456,22 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         ) {
             if let Some((ctl, data)) = gate_tristate_parts(&ca) {
                 slot.tri.push((ctl.clone(), data.clone()));
+                let e = strength.entry(name.clone()).or_default();
+                e.0.push(StrengthDriver {
+                    value: data.clone(),
+                    ctl: Some(ctl.clone()),
+                    s0: 6,
+                    s1: 6,
+                });
+                e.1 = true;
                 continue;
             }
         }
         // Unwrap a strength marker into the raw value for its level's chain.
-        let level = marker_level(&ca.rhs).unwrap_or(1);
-        let rhs = if level != 1 {
+        let marked = marker_level(&ca.rhs);
+        let level = marked.unwrap_or(1);
+        let code = marker_code(&ca.rhs).unwrap_or(6 * 8 + 6);
+        let rhs = if marked.is_some() {
             if let ExprKind::SystemCall { args, .. } = ca.rhs.kind {
                 args.into_iter().next().unwrap_or_else(|| make_z_expr(span))
             } else {
@@ -37297,6 +37480,14 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         } else {
             ca.rhs
         };
+        let e = strength.entry(name.clone()).or_default();
+        e.0.push(StrengthDriver {
+            value: rhs.clone(),
+            ctl: None,
+            s0: code / 8,
+            s1: code % 8,
+        });
+        e.1 |= marked.is_some();
         let weak = level != 1;
         let slot = folded.get_mut(&name).expect("slot created above");
         // §6.6.2: a wand/triand net ANDs its drivers and a wor/trior net ORs
@@ -37348,6 +37539,17 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 let span = acc.lhs.span;
                 acc.weak = Some(make_fill_expr(one, span));
             }
+            let w = elab.signals.get(name).map(|s| s.width).unwrap_or(1).max(1);
+            let fill = if one { Value::ones(w) } else { Value::zero(w) };
+            let e = strength.entry(name.clone()).or_default();
+            e.0.push(StrengthDriver {
+                value: const_value_literal(&fill, acc.lhs.span)
+                    .unwrap_or_else(|| make_fill_expr(one, acc.lhs.span)),
+                ctl: None,
+                s0: 5,
+                s1: 5,
+            });
+            e.1 = true;
         }
         // §6.6.4 trireg: undriven bits HOLD the previous value — the implicit
         // weak driver is the net's own current value. The self-reference is a
@@ -37358,6 +37560,27 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         ) && acc.weak.is_none()
         {
             acc.weak = Some(make_ident_expr(name));
+            // §28.12: the held charge is of medium strength.
+            let e = strength.entry(name.clone()).or_default();
+            e.0.push(StrengthDriver {
+                value: make_ident_expr(name),
+                ctl: None,
+                s0: 2,
+                s1: 2,
+            });
+            e.1 = true;
+        }
+    }
+    for (name, (drivers, keep)) in strength {
+        // Wired AND/OR and summed nets do not resolve by strength alone.
+        let wired = matches!(
+            elab.resolved_net_kinds.get(&name),
+            Some(ResolvedNetKind::Wand)
+                | Some(ResolvedNetKind::Wor)
+                | Some(ResolvedNetKind::RealSum)
+        );
+        if keep && !wired {
+            elab.strength_drivers.insert(name, drivers);
         }
     }
     for name in order {
@@ -37380,6 +37603,27 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             };
             let rhs = over(acc.supply, over(acc.strong, over(acc.weak, acc.weakest)))
                 .unwrap_or_else(|| make_z_expr(span));
+            // §28.12: a net whose drivers carry strengths resolves them by
+            // strength — `$__sres(width, pair, ctl, value, ...)`, the
+            // resolution `%v` reports. The level chains above only order
+            // whole strength classes, so a tristate's `H` beside a pull or an
+            // asymmetric pair (`strong0, weak1`) came out wrong.
+            let rhs = match elab.strength_drivers.get(&name) {
+                Some(drivers) => {
+                    let w = elab.signals.get(&name).map(|s| s.width).unwrap_or(1).max(1);
+                    let mut args = vec![
+                        const_value_literal(&Value::from_u64(u64::from(w), 32), span)
+                            .expect("width literal"),
+                    ];
+                    for d in drivers {
+                        args.push(strength_code_literal(d.s0 * 8 + d.s1, span));
+                        args.push(d.ctl.clone().unwrap_or_else(|| make_fill_expr(true, span)));
+                        args.push(d.value.clone());
+                    }
+                    make_syscall("$__sres", args, span)
+                }
+                None => rhs,
+            };
             elab.continuous_assigns.push(ContinuousAssignment {
                 origin: None,
                 lhs: acc.lhs,
@@ -37391,6 +37635,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             });
         }
     }
+    set_undriven_z(elab);
 }
 
 pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
