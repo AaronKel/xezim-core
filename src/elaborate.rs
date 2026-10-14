@@ -36910,6 +36910,21 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
         // data is widened.
         let gate_ctl = gate_tristate_parts(ca).map(|(c, _)| c.clone());
         let rhs = std::mem::replace(&mut ca.rhs, Expression::new(ExprKind::Empty, span));
+        // §28.12: a drive-strength marker (`$__weak(v, pair)`, a pullup's
+        // `$__pull`) stays outermost so the fold still sees the driver's
+        // strength; only its value is widened.
+        let (marker, rhs) = match rhs.kind {
+            ExprKind::SystemCall { name, mut args }
+                if matches!(
+                    name.as_str(),
+                    "$__supply" | "$__drive" | "$__pull" | "$__weak"
+                ) && !args.is_empty() =>
+            {
+                let inner = args.remove(0);
+                (Some((name, args)), inner)
+            }
+            kind => (None, Expression::new(kind, span)),
+        };
         let rhs = match (gate_ctl.is_some(), rhs.kind) {
             (true, ExprKind::Conditional { then_expr, .. }) => *then_expr,
             (_, kind) => Expression::new(kind, span),
@@ -36940,6 +36955,14 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
             Some(ctl) => make_tristate(ctl, widened, span),
             None => widened,
         };
+        if let Some((name, rest)) = marker {
+            let mut args = vec![std::mem::replace(
+                &mut ca.rhs,
+                Expression::new(ExprKind::Empty, span),
+            )];
+            args.extend(rest);
+            ca.rhs = make_syscall(&name, args, span);
+        }
         ca.lhs = make_ident_expr(&n);
     }
 }
