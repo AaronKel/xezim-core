@@ -2450,6 +2450,15 @@ pub struct ElaboratedModule {
     pub class_decl_pkg: HashMap<String, String>,
     /// DPI imports by SV-visible symbol name.
     pub dpi_imports: HashMap<String, DpiImportSpec>,
+    /// §35.5.3: the package an import is declared in, by SV name (the
+    /// first one), so a context import called from anywhere runs in it.
+    #[serde(default)]
+    pub dpi_import_pkg: HashMap<String, String>,
+    /// SV names of imports declared in a module, interface, program,
+    /// generate block or the compilation unit: such an import runs in the
+    /// instance scope it is called from.
+    #[serde(default)]
+    pub dpi_import_in_design: HashSet<String>,
     /// §35.5.4 exported SV functions/tasks (`export "DPI-C" function f;`), in
     /// declaration order. The index is a stable id the C-callable trampoline
     /// passes back to identify which subroutine to run.
@@ -3055,6 +3064,8 @@ impl ElaboratedModule {
             func_decl_scope: HashMap::default(),
             class_decl_pkg: HashMap::default(),
             dpi_imports: HashMap::default(),
+            dpi_import_pkg: HashMap::default(),
+            dpi_import_in_design: HashSet::default(),
             dpi_exports: Vec::new(),
             dpi_export_c_names: Vec::new(),
             clocking_blocks: HashMap::default(),
@@ -3415,8 +3426,23 @@ fn register_instance_dpi_export(
     elab.dpi_export_c_names.push(c_name);
 }
 
-fn register_dpi_import(di: &DPIImport, elab: &mut ElaboratedModule) -> Result<(), String> {
+/// `pkg`: the package the declaration is in, None for any other scope.
+fn register_dpi_import(
+    di: &DPIImport,
+    elab: &mut ElaboratedModule,
+    pkg: Option<&str>,
+) -> Result<(), String> {
     let sv_name = dpi_proto_sv_name(&di.proto);
+    match pkg {
+        Some(p) => {
+            elab.dpi_import_pkg
+                .entry(sv_name.clone())
+                .or_insert_with(|| p.to_string());
+        }
+        None => {
+            elab.dpi_import_in_design.insert(sv_name.clone());
+        }
+    }
     let c_name = di.c_name.clone().unwrap_or_else(|| sv_name.clone());
     // LRM §35.5.2: the same foreign function may be imported more than once,
     // as long as the declarations are consistent (same C binding and import
@@ -5728,7 +5754,7 @@ pub fn elaborate_module_with_defs(
                             // `uvm_re_compexecfree` etc. resolve via
                             // `exec_dpi_import_call`.
                             crate::ast::decl::PackageItem::DPIImport(di) => {
-                                register_dpi_import(di, &mut elab)?;
+                                register_dpi_import(di, &mut elab, Some(p.name.name.as_str()))?;
                             }
                             _ => {}
                         }
@@ -6366,7 +6392,7 @@ pub fn elaborate_module_with_defs(
                     elab.lets.insert(l.name.name.clone(), l.clone());
                 }
                 crate::ast::decl::PackageItem::DPIImport(di) => {
-                    register_dpi_import(di, &mut elab)?;
+                    register_dpi_import(di, &mut elab, Some(p.name.name.as_str()))?;
                 }
                 crate::ast::decl::PackageItem::DPIExport(e) => {
                     register_dpi_export(e, &mut elab);
@@ -10024,7 +10050,7 @@ pub fn elaborate_module_with_defs(
                 }
             }
             ModuleItem::DPIImport(di) => {
-                register_dpi_import(di, &mut elab)?;
+                register_dpi_import(di, &mut elab, None)?;
             }
             ModuleItem::DPIExport(e) => {
                 register_dpi_export(e, &mut elab);
@@ -15258,7 +15284,7 @@ fn elaborate_items_numbered(
                 }
             }
             ModuleItem::DPIImport(di) => {
-                register_dpi_import(di, elab)?;
+                register_dpi_import(di, elab, None)?;
             }
             _ => {}
         }
@@ -33842,7 +33868,7 @@ fn inline_module_items(
                     // register_dpi_import treats them as no-ops), so no
                     // instance prefix applies.
                     if let ModuleItem::DPIImport(di) = sub_item {
-                        register_dpi_import(di, elab)?;
+                        register_dpi_import(di, elab, None)?;
                     }
                     // §35.5.3, §35.11: an export declared in an INSTANTIATED
                     // module names THIS instance's copy of the subroutine.
@@ -40513,7 +40539,7 @@ fn process_import(
                             found = true;
                         }
                         PackageItem::DPIImport(di) if &dpi_proto_sv_name(&di.proto) == sym_name => {
-                            register_dpi_import(di, elab)?;
+                            register_dpi_import(di, elab, Some(pkg_name.as_str()))?;
                             found = true;
                         }
                         PackageItem::DPIExport(e) if &dpi_proto_sv_name(&e.proto) == sym_name => {
@@ -40842,7 +40868,7 @@ fn process_import(
                                 .insert(td.name.name.name.clone(), pkg_name.clone());
                         }
                         PackageItem::DPIImport(di) => {
-                            register_dpi_import(di, elab)?;
+                            register_dpi_import(di, elab, Some(pkg_name.as_str()))?;
                         }
                         PackageItem::DPIExport(e) => {
                             register_dpi_export(e, elab);
