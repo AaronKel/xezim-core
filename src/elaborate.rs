@@ -34238,11 +34238,21 @@ fn inline_module_items(
                                     inst_prefix
                                 );
                             }
-                            elab.pending_initial.push(PendingInitial {
+                            let pending = PendingInitial {
                                 source: std::rc::Rc::clone(stmt_rc),
                                 ctx: std::rc::Rc::clone(&pend_ctx),
                                 gen_scope: gen_scope.clone(),
-                            });
+                            };
+                            // §24.3: the initial blocks of an instantiated
+                            // program run in the reactive region, like those
+                            // of a top-level program.
+                            if matches!(sub_mod, Definition::Program(_))
+                                && matches!(sub_item, ModuleItem::InitialConstruct(_))
+                            {
+                                elab.program_initial_blocks.push(pending.materialize());
+                            } else {
+                                elab.pending_initial.push(pending);
+                            }
                         }
                     }
                     if let ModuleItem::FinalConstruct(fc) = sub_item {
