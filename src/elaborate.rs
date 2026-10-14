@@ -40847,6 +40847,12 @@ fn process_import(
                         PackageItem::DPIExport(e) => {
                             register_dpi_export(e, elab);
                         }
+                        // §26.3 / §11.13: a wildcard import makes a package
+                        // `let` visible by its bare name, as the explicit
+                        // import above does.
+                        PackageItem::Let(l) => {
+                            elab.lets.insert(l.name.name.clone(), l.clone());
+                        }
                         PackageItem::Class(c) => {
                             register_class_enum_members(c, elab);
                             register_class_scoped_typedef_aliases(c, Some(&pkg_name), elab);
