@@ -68,6 +68,9 @@ struct PkgInfo {
     types: HashSet<String>,
     /// Members of the package's own enum typedefs.
     members: HashSet<String>,
+    /// Value names declared directly in the package: functions, tasks,
+    /// parameters, variables and `let`s.
+    values: HashSet<String>,
     /// `import Q::name;` as (Q, name).
     explicit: Vec<(String, String)>,
     /// `import Q::*;`
@@ -82,6 +85,9 @@ struct Info {
     colliding: HashSet<String>,
     /// Enum member names declared by a package AND somewhere else.
     colliding_members: HashSet<String>,
+    /// Value names (subroutines, parameters, variables, `let`s) declared by
+    /// more than one package, or by a package and `$unit`.
+    colliding_values: HashSet<String>,
 }
 
 impl Info {
@@ -94,6 +100,11 @@ impl Info {
     /// `owner` for an enum member name.
     fn member_owner(&self, q: &str, name: &str, depth: u32) -> Option<String> {
         self.owner_in(q, name, depth, |pi| &pi.members)
+    }
+
+    /// `owner` for a value name (subroutine, parameter, variable, `let`).
+    fn value_owner(&self, q: &str, name: &str, depth: u32) -> Option<String> {
+        self.owner_in(q, name, depth, |pi| &pi.values)
     }
 
     fn owner_in(
@@ -157,6 +168,9 @@ struct Frame {
     explicit: HashMap<String, String>,
     /// `import Q::*;`
     wild: Vec<String>,
+    /// A class scope with a base class: names it inherits are not tracked
+    /// here, so value names are not resolved past it.
+    inherits: bool,
 }
 
 impl Frame {
@@ -194,9 +208,11 @@ struct Rw<'a> {
 /// ambiguous by two wildcard imports.
 pub fn qualify_colliding_package_types(descs: &mut [Description]) -> Result<(), String> {
     QUALIFIED_MEMBERS.with(|m| m.borrow_mut().clear());
+
     let Some(info) = collect(descs) else {
         return Ok(());
     };
+
     QUALIFIED_MEMBERS.with(|m| {
         m.borrow_mut()
             .extend(info.colliding_members.iter().cloned())
@@ -224,11 +240,13 @@ fn collect(descs: &[Description]) -> Option<Info> {
     let mut pkgs: HashMap<String, PkgInfo> = HashMap::default();
     let mut other: HashSet<String> = HashSet::default();
     let mut other_members: HashSet<String> = HashSet::default();
+    let mut other_values: HashSet<String> = HashSet::default();
     for d in descs {
         match d {
             Description::Package(p) => {
                 let pi = pkgs.entry(p.name.name.clone()).or_default();
                 for it in &p.items {
+                    package_item_values(it, &mut pi.values);
                     match it {
                         PackageItem::Typedef(td) => {
                             pi.types.insert(td.name.name.clone());
@@ -236,6 +254,10 @@ fn collect(descs: &[Description]) -> Option<Info> {
                         }
                         PackageItem::Class(c) => {
                             pi.types.insert(c.name.name.clone());
+                        }
+                        // §19.3: a covergroup declaration is a type.
+                        PackageItem::Covergroup(cg) => {
+                            pi.types.insert(cg.name.name.clone());
                         }
                         PackageItem::Import(imp) => {
                             for ii in &imp.items {
@@ -266,6 +288,10 @@ fn collect(descs: &[Description]) -> Option<Info> {
             Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
                 other.insert(c.name.name.clone());
             }
+            Description::PackageItem(PackageItem::Covergroup(cg)) => {
+                other.insert(cg.name.name.clone());
+            }
+            Description::PackageItem(pi) => package_item_values(pi, &mut other_values),
             Description::Module(m) => module_level_types(&m.items, &mut other, &mut other_members),
             Description::Interface(m) => {
                 module_level_types(&m.items, &mut other, &mut other_members)
@@ -289,13 +315,15 @@ fn collect(descs: &[Description]) -> Option<Info> {
     };
     let colliding = clash(|pi| &pi.types, &other);
     let colliding_members = clash(|pi| &pi.members, &other_members);
-    if colliding.is_empty() && colliding_members.is_empty() {
+    let colliding_values = clash(|pi| &pi.values, &other_values);
+    if colliding.is_empty() && colliding_members.is_empty() && colliding_values.is_empty() {
         return None;
     }
     Some(Info {
         pkgs,
         colliding,
         colliding_members,
+        colliding_values,
     })
 }
 
@@ -388,11 +416,16 @@ fn package_item_values(pi: &PackageItem, out: &mut HashSet<String>) {
     match pi {
         PackageItem::Parameter(pd) => param_names(pd, &mut sink, out),
         PackageItem::Data(dd) => out.extend(dd.declarators.iter().map(|v| v.name.name.clone())),
-        PackageItem::Function(f) => {
+        // An out-of-block class method (`function C::f`) is not a package
+        // value.
+        PackageItem::Function(f) if f.name.scopes.is_empty() => {
             out.insert(f.name.name.name.clone());
         }
-        PackageItem::Task(t) => {
+        PackageItem::Task(t) if t.name.scopes.is_empty() => {
             out.insert(t.name.name.name.clone());
+        }
+        PackageItem::Let(l) => {
+            out.insert(l.name.name.clone());
         }
         _ => {}
     }
@@ -517,6 +550,74 @@ impl Rw<'_> {
             }
         }
         None
+    }
+
+    /// The package whose subroutine, parameter, variable or `let` a bare `n`
+    /// denotes, by the §26.3 rules, when two packages (or a package and
+    /// `$unit`) declare it. All of them share one flat table keyed by the
+    /// bare name, where the last package registered wins, so the reference
+    /// is spelled `pkg::n`, the qualified lookup.
+    fn resolve_value(&self, n: &str) -> Option<String> {
+        if !self.info.colliding_values.contains(n) {
+            return None;
+        }
+        for f in self.frames.iter().rev() {
+            if let Some(p) = &f.pkg {
+                if self
+                    .info
+                    .pkgs
+                    .get(p)
+                    .is_some_and(|pi| pi.values.contains(n))
+                {
+                    // The package's own declaration: its subroutines and
+                    // initializers already read their own package's entry
+                    // (including constant evaluation while it registers),
+                    // so the reference stays as written.
+                    return None;
+                }
+            }
+            if f.values.contains(n) || f.inherits {
+                return None;
+            }
+            if let Some(q) = f.explicit.get(n) {
+                return self.info.value_owner(q, n, 0);
+            }
+            let cands: BTreeSet<String> = f
+                .wild
+                .iter()
+                .filter_map(|q| self.info.value_owner(q, n, 0))
+                .collect();
+            match cands.len() {
+                0 => {}
+                1 => return cands.into_iter().next(),
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// `n` (a bare identifier) rewritten to `pkg::n` when it names a
+    /// colliding package value (see `resolve_value`).
+    fn qualify_value(&self, e: &mut Expression) -> bool {
+        let Some(n) = plain_ident(e) else {
+            return false;
+        };
+        let Some(p) = self.resolve_value(n) else {
+            return false;
+        };
+        let span = e.span;
+        let ExprKind::Ident(h) = &e.kind else {
+            return false;
+        };
+        let member = h.path[0].name.clone();
+        *e = Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(ident_expr(p, span)),
+                member,
+            },
+            span,
+        );
+        true
     }
 
     fn value_shadowed(&self, n: &str) -> bool {
@@ -711,6 +812,16 @@ impl Rw<'_> {
                             return;
                         }
                     }
+                    // §26.6: a value Q re-exports is the one its owner holds.
+                    if self.info.colliding_values.contains(&member.name) && self.is_package(q) {
+                        if let Some(o) = self.info.value_owner(q, &member.name, 0) {
+                            if o != q {
+                                let span = expr.span;
+                                **expr = ident_expr(o, span);
+                            }
+                            return;
+                        }
+                    }
                 }
                 self.expr(expr);
             }
@@ -723,6 +834,19 @@ impl Rw<'_> {
                         // pass does not track.
                         if let Res::To(m) = self.resolve(n) {
                             h.path[0].name.name = m;
+                        }
+                    } else if self.info.colliding_values.contains(n) {
+                        if let Some(p) = self.resolve_value(n) {
+                            let span = e.span;
+                            let member = h.path[0].name.clone();
+                            *e = Expression::new(
+                                ExprKind::MemberAccess {
+                                    expr: Box::new(ident_expr(p, span)),
+                                    member,
+                                },
+                                span,
+                            );
+                            return;
                         }
                     } else if self.in_const == 0 {
                         // §26.3 / §6.19: an enum member of a package, named
@@ -753,6 +877,8 @@ impl Rw<'_> {
             ExprKind::Call { func, args } => {
                 if plain_ident(func).is_none() {
                     self.expr(func);
+                } else {
+                    self.qualify_value(func);
                 }
                 args.iter_mut().for_each(|a| self.expr(a));
             }
@@ -1180,6 +1306,14 @@ impl Rw<'_> {
     fn import_decl(&mut self, imp: &mut ImportDeclaration) {
         for ii in &mut imp.items {
             let Some(n) = &mut ii.item else { continue };
+            if self.info.colliding_values.contains(&n.name) {
+                // §26.6: `import Q::v;` of a value Q re-exports names the
+                // owner's declaration.
+                if let Some(o) = self.info.value_owner(&ii.package.name, &n.name, 0) {
+                    ii.package.name = o;
+                }
+                continue;
+            }
             if !self.info.colliding.contains(&n.name) {
                 continue;
             }
@@ -1221,19 +1355,31 @@ impl Rw<'_> {
     }
 
     fn function(&mut self, f: &mut FunctionDeclaration) {
+        let method = !f.name.scopes.is_empty();
         self.subroutine_name(&mut f.name);
         self.dtype(&mut f.return_type);
-        self.subroutine_body(&mut f.ports, &mut f.items);
+        self.subroutine_body(&mut f.ports, &mut f.items, method);
     }
 
     fn task(&mut self, t: &mut TaskDeclaration) {
+        let method = !t.name.scopes.is_empty();
         self.subroutine_name(&mut t.name);
-        self.subroutine_body(&mut t.ports, &mut t.items);
+        self.subroutine_body(&mut t.ports, &mut t.items, method);
     }
 
-    fn subroutine_body(&mut self, ports: &mut [FunctionPort], items: &mut [Statement]) {
+    /// `method`: the body of an out-of-block class method, which sees the
+    /// class's members (not tracked here) before any import.
+    fn subroutine_body(
+        &mut self,
+        ports: &mut [FunctionPort],
+        items: &mut [Statement],
+        method: bool,
+    ) {
         self.ports(ports);
-        let mut f = Frame::default();
+        let mut f = Frame {
+            inherits: method,
+            ..Frame::default()
+        };
         f.values.extend(ports.iter().map(|p| p.name.name.clone()));
         for s in items.iter() {
             stmt_locals(s, &mut f);
@@ -1276,7 +1422,10 @@ impl Rw<'_> {
         for i in &mut c.implements {
             self.type_ident(i);
         }
-        let mut f = Frame::default();
+        let mut f = Frame {
+            inherits: c.extends.is_some(),
+            ..Frame::default()
+        };
         for p in &c.params {
             param_names(p, &mut f.types, &mut f.values);
         }
@@ -1612,7 +1761,12 @@ impl Rw<'_> {
                 p.items.iter_mut().for_each(|s| self.stmt(s));
                 self.opt(&mut p.body);
             }
-            PackageItem::Covergroup(cg) => self.covergroup(cg),
+            PackageItem::Covergroup(cg) => {
+                if let Some(m) = renamed(&cg.name.name) {
+                    cg.name.name = m;
+                }
+                self.covergroup(cg)
+            }
             PackageItem::Null | PackageItem::TimeunitsDecl(_) => {}
         }
     }
@@ -1704,6 +1858,9 @@ fn module_item_names(items: &[ModuleItem], f: &mut Frame) {
             }
             ModuleItem::TaskDeclaration(td) => {
                 f.values.insert(td.name.name.name.clone());
+            }
+            ModuleItem::LetDeclaration(l) => {
+                f.values.insert(l.name.name.clone());
             }
             ModuleItem::ImportDeclaration(imp) => f.add_imports(imp),
             ModuleItem::GenerateRegion(g) => module_item_names(&g.items, f),
