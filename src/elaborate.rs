@@ -25882,6 +25882,24 @@ fn inline_instantiations_inner(
                                     // that deref'd null in uvm_create_random_seed).
                                     elab.var_decl_types
                                         .insert(decl.name.name.clone(), dd.data_type.clone());
+                                    // §6.8/§7.9.11: `int aa[string] = '{"x": 11}` —
+                                    // the initializer runs once before any initial
+                                    // block, as a whole-array assignment (the
+                                    // module-scope lowering), so keyed items,
+                                    // `default:` and struct elements all take the
+                                    // runtime pattern machinery. It was dropped.
+                                    if let Some(init_expr) = &decl.init {
+                                        elab.static_init_blocks.push(InitialBlock {
+                                            stmt: Statement::new(
+                                                StatementKind::BlockingAssign {
+                                                    lvalue: make_ident_expr(&decl.name.name),
+                                                    rvalue: init_expr.clone(),
+                                                },
+                                                Span::dummy(),
+                                            ),
+                                            scope: String::new(),
+                                        });
+                                    }
                                     continue;
                                 }
                                 // Element reads/writes go through `module.arrays`
@@ -25981,8 +25999,23 @@ fn inline_instantiations_inner(
                                                     Some(Definition::Class(_))
                                                 )
                                     );
+                                    // §6.8/§10.9.2: an UNPACKED struct has no
+                                    // single packed value — its members are
+                                    // separate cells, so a const-evaluated
+                                    // initializer (`plain_st_t s = '{x: 9, y: 11}`)
+                                    // landed in a container nobody reads and the
+                                    // members kept their defaults. Run it as a
+                                    // static assignment, which spreads it.
+                                    let unpacked_struct_typed = matches!(
+                                        resolve_typedef_chain(&dd.data_type, &elab.typedef_types),
+                                        DataType::Struct(su)
+                                            if !su.packed
+                                                && !(matches!(su.kind, StructUnionKind::Union)
+                                                    && !su.tagged)
+                                    );
                                     let init_has_call = decl.init.as_ref().is_some_and(|e| {
-                                        expr_has_call(e)
+                                        unpacked_struct_typed
+                                            || expr_has_call(e)
                                             || matches!(&e.kind, ExprKind::Ident(h)
                                                 if h.path.len() == 1
                                                     && h.path[0].name.name == "new")
