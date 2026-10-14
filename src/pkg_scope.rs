@@ -88,6 +88,157 @@ struct Info {
     /// Value names (subroutines, parameters, variables, `let`s) declared by
     /// more than one package, or by a package and `$unit`.
     colliding_values: HashSet<String>,
+    /// Type names (typedefs, nested classes) a class declares that are also
+    /// declared in another class or any other scope (§8.3, §6.18).
+    class_colliding: HashSet<String>,
+    /// Every class by the name it carries after this pass: its own type
+    /// names and the base class name as written.
+    classes: HashMap<String, ClassInfo>,
+    /// Bare class name -> the names it carries after this pass.
+    class_by_bare: HashMap<String, Vec<String>>,
+}
+
+/// A class's own type names (typedefs and nested classes) and its base.
+#[derive(Default)]
+struct ClassInfo {
+    types: HashSet<String>,
+    base: Option<String>,
+}
+
+/// A class typedef this pass may rename: a real declaration of a data
+/// type. A typedef naming a class (`typedef C#(T) this_type;`, every UVM
+/// `type_id`) only aliases a handle type, which the simulator already
+/// resolves in its class context.
+fn class_typedef_renamable(td: &TypedefDeclaration, class_names: &HashSet<String>) -> bool {
+    if td.forward {
+        return false;
+    }
+    match &td.data_type {
+        DataType::TypeReference {
+            name, type_args, ..
+        } => {
+            type_args.is_empty()
+                && name.scopes.iter().all(|s| s.type_args.is_empty())
+                && !class_names.contains(&name.name.name)
+        }
+        _ => true,
+    }
+}
+
+/// Every class name of the design, nested ones included.
+fn class_names_of(c: &ClassDeclaration, out: &mut HashSet<String>) {
+    out.insert(c.name.name.clone());
+    for it in &c.items {
+        if let ClassItem::Class(nc) = it {
+            class_names_of(nc, out);
+        }
+    }
+}
+
+/// Count the type names every class (nested ones included) declares.
+fn count_class_types(
+    c: &ClassDeclaration,
+    class_names: &HashSet<String>,
+    count: &mut HashMap<String, u32>,
+) {
+    for it in &c.items {
+        match it {
+            ClassItem::Typedef(td) if class_typedef_renamable(td, class_names) => {
+                *count.entry(td.name.name.clone()).or_default() += 1;
+            }
+            ClassItem::Class(nc) => {
+                *count.entry(nc.name.name.clone()).or_default() += 1;
+                count_class_types(nc, class_names, count);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Record class `c`, which carries the name `named` after this pass, and its
+/// nested classes (a colliding nested class becomes `Outer::Inner`).
+fn record_class(
+    c: &ClassDeclaration,
+    named: String,
+    cc: &HashSet<String>,
+    class_names: &HashSet<String>,
+    classes: &mut HashMap<String, ClassInfo>,
+    by_bare: &mut HashMap<String, Vec<String>>,
+) {
+    let mut ci = ClassInfo {
+        base: c.extends.as_ref().map(|e| e.name.name.clone()),
+        ..ClassInfo::default()
+    };
+    for it in &c.items {
+        match it {
+            ClassItem::Typedef(td) if class_typedef_renamable(td, class_names) => {
+                ci.types.insert(td.name.name.clone());
+            }
+            ClassItem::Class(nc) => {
+                ci.types.insert(nc.name.name.clone());
+                let m = if cc.contains(&nc.name.name) {
+                    mangle(&named, &nc.name.name)
+                } else {
+                    nc.name.name.clone()
+                };
+                record_class(nc, m, cc, class_names, classes, by_bare);
+            }
+            _ => {}
+        }
+    }
+    by_bare
+        .entry(c.name.name.clone())
+        .or_default()
+        .push(named.clone());
+    classes.insert(named, ci);
+}
+
+/// Every class declaration of the design with the package (if any) it is
+/// declared in.
+fn design_classes(descs: &[Description]) -> Vec<(Option<&str>, &ClassDeclaration)> {
+    fn module_classes<'a>(
+        items: &'a [ModuleItem],
+        out: &mut Vec<(Option<&'a str>, &'a ClassDeclaration)>,
+    ) {
+        for it in items {
+            match it {
+                ModuleItem::ClassDeclaration(c) => out.push((None, c)),
+                ModuleItem::GenerateRegion(g) => module_classes(&g.items, out),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, b) in &g.branches {
+                        module_classes(b, out);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => module_classes(&g.items, out),
+                ModuleItem::GenerateCase(g) => {
+                    for a in &g.arms {
+                        module_classes(&a.items, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for d in descs {
+        match d {
+            Description::Package(p) => {
+                for it in &p.items {
+                    if let PackageItem::Class(c) = it {
+                        out.push((Some(p.name.name.as_str()), c));
+                    }
+                }
+            }
+            Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
+                out.push((None, c))
+            }
+            Description::Module(m) => module_classes(&m.items, &mut out),
+            Description::Interface(m) => module_classes(&m.items, &mut out),
+            Description::Program(m) => module_classes(&m.items, &mut out),
+            _ => {}
+        }
+    }
+    out
 }
 
 impl Info {
@@ -171,6 +322,10 @@ struct Frame {
     /// A class scope with a base class: names it inherits are not tracked
     /// here, so value names are not resolved past it.
     inherits: bool,
+    /// Set on a class's own frame: the name the class carries after this
+    /// pass, and its base classes' (nearest first).
+    cls: Option<String>,
+    bases: Vec<String>,
 }
 
 impl Frame {
@@ -316,14 +471,55 @@ fn collect(descs: &[Description]) -> Option<Info> {
     let colliding = clash(|pi| &pi.types, &other);
     let colliding_members = clash(|pi| &pi.members, &other_members);
     let colliding_values = clash(|pi| &pi.values, &other_values);
-    if colliding.is_empty() && colliding_members.is_empty() && colliding_values.is_empty() {
+    // §8.3: a class is a scope of its own; a type name a class declares
+    // collides when it is declared anywhere else as well.
+    let all_classes = design_classes(descs);
+    let mut class_names: HashSet<String> = HashSet::default();
+    for (_, c) in &all_classes {
+        class_names_of(c, &mut class_names);
+    }
+    let mut class_count: HashMap<String, u32> = HashMap::default();
+    for (_, c) in &all_classes {
+        count_class_types(c, &class_names, &mut class_count);
+    }
+    let class_colliding: HashSet<String> = class_count
+        .iter()
+        .filter(|(n, c)| {
+            **c > 1 || other.contains(*n) || pkgs.values().any(|pi| pi.types.contains(*n))
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    if colliding.is_empty()
+        && colliding_members.is_empty()
+        && colliding_values.is_empty()
+        && class_colliding.is_empty()
+    {
         return None;
+    }
+    let mut classes: HashMap<String, ClassInfo> = HashMap::default();
+    let mut class_by_bare: HashMap<String, Vec<String>> = HashMap::default();
+    for (pkg, c) in &all_classes {
+        let named = match pkg {
+            Some(p) if colliding.contains(&c.name.name) => mangle(p, &c.name.name),
+            _ => c.name.name.clone(),
+        };
+        record_class(
+            c,
+            named,
+            &class_colliding,
+            &class_names,
+            &mut classes,
+            &mut class_by_bare,
+        );
     }
     Some(Info {
         pkgs,
         colliding,
         colliding_members,
         colliding_values,
+        class_colliding,
+        classes,
+        class_by_bare,
     })
 }
 
@@ -469,6 +665,21 @@ fn ident_expr(name: String, span: crate::ast::Span) -> Expression {
     )
 }
 
+/// The names of a `A::B` chain of plain identifiers.
+fn scope_chain(e: &Expression) -> Option<Vec<String>> {
+    match &e.kind {
+        ExprKind::Ident(h) if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) => {
+            Some(h.path.iter().map(|s| s.name.name.clone()).collect())
+        }
+        ExprKind::MemberAccess { expr, member } => {
+            let mut v = scope_chain(expr)?;
+            v.push(member.name.clone());
+            Some(v)
+        }
+        _ => None,
+    }
+}
+
 fn plain_ident(e: &Expression) -> Option<&str> {
     match &e.kind {
         ExprKind::Ident(h)
@@ -482,10 +693,35 @@ fn plain_ident(e: &Expression) -> Option<&str> {
 
 impl Rw<'_> {
     fn resolve(&self, n: &str) -> Res {
-        if !self.info.colliding.contains(n) {
+        let pkg_col = self.info.colliding.contains(n);
+        let cls_col = self.info.class_colliding.contains(n);
+        if !pkg_col && !cls_col {
             return Res::Keep;
         }
         for f in self.frames.iter().rev() {
+            // §8.3/§8.13: a class's own type names, then its base classes'.
+            if let Some(c) = &f.cls {
+                for k in std::iter::once(c).chain(f.bases.iter()) {
+                    if self
+                        .info
+                        .classes
+                        .get(k)
+                        .is_some_and(|ci| ci.types.contains(n))
+                    {
+                        return if cls_col {
+                            Res::To(mangle(k, n))
+                        } else {
+                            Res::Keep
+                        };
+                    }
+                }
+            }
+            if !pkg_col {
+                if f.types.contains(n) {
+                    return Res::Keep;
+                }
+                continue;
+            }
             if let Some(p) = &f.pkg {
                 if self.info.pkgs.get(p).is_some_and(|pi| pi.types.contains(n)) {
                     return Res::To(mangle(p, n));
@@ -620,6 +856,75 @@ impl Rw<'_> {
         true
     }
 
+    /// The name class `n` (as written in scope) carries after this pass.
+    fn class_named(&self, n: &str) -> Option<String> {
+        if let Res::To(m) = self.resolve(n) {
+            if self.info.classes.contains_key(&m) {
+                return Some(m);
+            }
+        }
+        if self.info.classes.contains_key(n) {
+            return Some(n.to_string());
+        }
+        match self.info.class_by_bare.get(n).map(|v| v.as_slice()) {
+            Some([one]) => Some(one.clone()),
+            _ => None,
+        }
+    }
+
+    /// `C` / `Outer::Inner` naming a class: the name it carries after this
+    /// pass. A segment that names a value (or a package) is not a class.
+    fn class_path(&self, segs: &[String]) -> Option<String> {
+        let (first, mut rest) = segs.split_first()?;
+        if self.value_shadowed(first) {
+            return None;
+        }
+        let mut cur = if self.info.pkgs.contains_key(first) {
+            // `pkg::C::...`: the class package `pkg` holds.
+            let (c, more) = rest.split_first()?;
+            rest = more;
+            let q = mangle(first, c);
+            if self.info.classes.contains_key(&q) {
+                q
+            } else if self.info.classes.contains_key(c) {
+                c.clone()
+            } else {
+                return None;
+            }
+        } else {
+            self.class_named(first)?
+        };
+        for s in rest {
+            let ci = self.info.classes.get(&cur)?;
+            if !ci.types.contains(s) {
+                return None;
+            }
+            cur = if self.info.class_colliding.contains(s) {
+                mangle(&cur, s)
+            } else {
+                s.clone()
+            };
+            if !self.info.classes.contains_key(&cur) {
+                return None;
+            }
+        }
+        Some(cur)
+    }
+
+    /// `C::name` (`Outer::Inner::name`) naming a type of class C that this
+    /// pass renamed: the new spelling.
+    fn class_scoped_type(&self, segs: &[String], name: &str) -> Option<String> {
+        if !self.info.class_colliding.contains(name) {
+            return None;
+        }
+        let c = self.class_path(segs)?;
+        self.info
+            .classes
+            .get(&c)
+            .is_some_and(|ci| ci.types.contains(name))
+            .then(|| mangle(&c, name))
+    }
+
     fn value_shadowed(&self, n: &str) -> bool {
         self.frames.iter().any(|f| f.values.contains(n))
     }
@@ -662,6 +967,15 @@ impl Rw<'_> {
         if tn.scopes.is_empty() {
             self.type_ident(&mut tn.name);
             return;
+        }
+        // `C::t` (`Outer::Inner::t`, `pkg::C::t`) naming a renamed class-scoped type.
+        if tn.scopes.iter().all(|s| s.type_args.is_empty()) {
+            let segs: Vec<String> = tn.scopes.iter().map(|s| s.name.name.clone()).collect();
+            if let Some(m) = self.class_scoped_type(&segs, &tn.name.name) {
+                tn.scopes.clear();
+                tn.name.name = m;
+                return;
+            }
         }
         let first = tn.scopes[0].name.name.clone();
         if self.is_package(&first) {
@@ -802,6 +1116,16 @@ impl Rw<'_> {
     fn expr(&mut self, e: &mut Expression) {
         match &mut e.kind {
             ExprKind::MemberAccess { expr, member } => {
+                // `C::t` / `Outer::Inner::t` naming a renamed class type.
+                if self.info.class_colliding.contains(&member.name) {
+                    if let Some(segs) = scope_chain(expr) {
+                        if let Some(m) = self.class_scoped_type(&segs, &member.name) {
+                            let span = e.span;
+                            *e = ident_expr(m, span);
+                            return;
+                        }
+                    }
+                }
                 // `Q::name` with Q a package: the declaration Q holds.
                 if let Some(q) = plain_ident(expr) {
                     if self.info.colliding.contains(&member.name) && self.is_package(q) {
@@ -828,7 +1152,9 @@ impl Rw<'_> {
             ExprKind::Ident(h) => {
                 if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() {
                     let n = &h.path[0].name.name;
-                    if self.info.colliding.contains(n) && !self.value_shadowed(n) {
+                    if (self.info.colliding.contains(n) || self.info.class_colliding.contains(n))
+                        && !self.value_shadowed(n)
+                    {
                         // Expression positions only rename; an ambiguous
                         // name may still be a value from somewhere this
                         // pass does not track.
@@ -1358,13 +1684,62 @@ impl Rw<'_> {
         let method = !f.name.scopes.is_empty();
         self.subroutine_name(&mut f.name);
         self.dtype(&mut f.return_type);
+        let pushed = self.push_method_class(&f.name);
         self.subroutine_body(&mut f.ports, &mut f.items, method);
+        if pushed {
+            self.frames.pop();
+        }
     }
 
     fn task(&mut self, t: &mut TaskDeclaration) {
         let method = !t.name.scopes.is_empty();
         self.subroutine_name(&mut t.name);
+        let pushed = self.push_method_class(&t.name);
         self.subroutine_body(&mut t.ports, &mut t.items, method);
+        if pushed {
+            self.frames.pop();
+        }
+    }
+
+    /// §8.24: the formals and body of an out-of-block method `C::f` are in
+    /// the scope of class C — push its frame for the class's type names.
+    fn push_method_class(&mut self, tn: &TypeName) -> bool {
+        if tn.scopes.is_empty() {
+            return false;
+        }
+        let segs: Vec<String> = tn.scopes.iter().map(|s| s.name.name.clone()).collect();
+        let Some(c) = self.class_path(&segs) else {
+            return false;
+        };
+        let bases = self.class_bases(&c);
+        self.frames.push(Frame {
+            inherits: true,
+            cls: Some(c),
+            bases,
+            ..Frame::default()
+        });
+        true
+    }
+
+    /// The base classes of class `c` (by the names they carry after this
+    /// pass), nearest first.
+    fn class_bases(&self, c: &str) -> Vec<String> {
+        let mut bases: Vec<String> = Vec::new();
+        let mut cur = self
+            .info
+            .classes
+            .get(c)
+            .and_then(|ci| ci.base.clone())
+            .and_then(|n| self.class_named(&n));
+        while let Some(b) = cur {
+            if bases.contains(&b) || bases.len() > 64 {
+                break;
+            }
+            let next = self.info.classes.get(&b).and_then(|ci| ci.base.clone());
+            bases.push(b);
+            cur = next.and_then(|n| self.class_named(&n));
+        }
+        bases
     }
 
     /// `method`: the body of an out-of-block class method, which sees the
@@ -1422,8 +1797,27 @@ impl Rw<'_> {
         for i in &mut c.implements {
             self.type_ident(i);
         }
+        let named = c.name.name.clone();
+        let mut bases = Vec::new();
+        if let Some(ext) = &c.extends {
+            let mut cur = self.class_named(&ext.name.name);
+            while let Some(b) = cur {
+                if bases.contains(&b) || bases.len() > 64 {
+                    break;
+                }
+                let next = self.info.classes.get(&b).and_then(|ci| ci.base.clone());
+                bases.push(b);
+                cur = next.and_then(|n| self.class_named(&n));
+            }
+        }
         let mut f = Frame {
             inherits: c.extends.is_some(),
+            cls: self
+                .info
+                .classes
+                .contains_key(&named)
+                .then(|| named.clone()),
+            bases,
             ..Frame::default()
         };
         for p in &c.params {
@@ -1476,11 +1870,31 @@ impl Rw<'_> {
                 },
                 ClassItem::Constraint(cc) => cc.items.iter_mut().for_each(|i| self.constraint(i)),
                 ClassItem::Typedef(td) => {
+                    // §8.3/§6.18: a class typedef whose name is declared
+                    // elsewhere too is renamed to its class-qualified spelling.
+                    if self.info.class_colliding.contains(&td.name.name)
+                        && self
+                            .info
+                            .classes
+                            .get(&named)
+                            .is_some_and(|ci| ci.types.contains(&td.name.name))
+                    {
+                        td.name.name = mangle(&named, &td.name.name);
+                    }
                     self.dtype(&mut td.data_type);
                     self.unpacked(&mut td.dimensions);
                 }
                 ClassItem::Parameter(pd) => self.param_decl(pd),
-                ClassItem::Class(nc) => self.class(nc),
+                ClassItem::Class(nc) => {
+                    if self.info.class_colliding.contains(&nc.name.name) {
+                        let m = mangle(&named, &nc.name.name);
+                        if let Some(l) = &mut nc.endlabel {
+                            l.name = m.clone();
+                        }
+                        nc.name.name = m;
+                    }
+                    self.class(nc)
+                }
                 ClassItem::Covergroup(cg) => self.covergroup(cg),
                 ClassItem::Import(imp) => self.import_decl(imp),
                 ClassItem::Empty => {}

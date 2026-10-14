@@ -3814,6 +3814,27 @@ pub fn register_class_enum_members(c: &ClassDeclaration, elab: &mut ElaboratedMo
             }
         }
     }
+    register_nested_qualified_typedefs(c, elab);
+}
+
+/// §8.3/§8.23: the typedefs of nested classes that `pkg_scope` gave their
+/// class-qualified spelling (`Outer::Inner::t`, a name declared elsewhere
+/// too) are registered under that unique spelling, which is how every
+/// reference to them is now written.
+fn register_nested_qualified_typedefs(c: &ClassDeclaration, elab: &mut ElaboratedModule) {
+    for item in &c.items {
+        if let ClassItem::Class(nc) = item {
+            for it in &nc.items {
+                if let ClassItem::Typedef(td) = it
+                    && td.name.name.contains("::")
+                    && !elab.typedefs.contains_key(&td.name.name)
+                {
+                    process_typedef(td, elab);
+                }
+            }
+            register_nested_qualified_typedefs(nc, elab);
+        }
+    }
 }
 
 /// §8.23: register a class's typedefs under their CLASS-QUALIFIED keys so
