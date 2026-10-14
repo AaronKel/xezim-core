@@ -10311,7 +10311,7 @@ pub fn elaborate_module_with_defs(
 
     // IEEE 1800-2017 §6.5: a variable cannot have multiple continuous drivers,
     // nor mix continuous and procedural drivers.
-    validate_driver_conflicts(&elab)?;
+    validate_driver_conflicts(&elab, module, all_defs)?;
 
     // IEEE 1800-2017 §8.21/§8.26: class instantiation legality.
     let scope_typedefs = all_defs.map(|defs| non_class_typedef_names(defs, &module));
@@ -12400,6 +12400,9 @@ enum WriterKind {
     Ff,
     /// `always`, `initial`, `final`.
     Other,
+    /// §6.5, §23.3.3: the actual of an instance's OUTPUT port, which the
+    /// port connection drives like a continuous assignment.
+    Port,
 }
 
 /// What an lvalue writes: the variable and the declared-label span of a
@@ -12532,8 +12535,14 @@ fn collect_stmt_write_spans(
 /// let users accept). Matches the reference simulator's verdicts: two `always_ff` blocks
 /// writing one variable are accepted (it does not enforce §9.2.2.4 between
 /// them), a write made inside a called function is not attributed to the
-/// caller, and a variable driven through an output port is not checked here.
-fn validate_driver_conflicts(elab: &ElaboratedModule) -> Result<(), String> {
+/// caller, and a variable driven through an output port conflicts with a
+/// continuous assignment or another output port, but not with procedural
+/// writes (the reference only warns about those).
+fn validate_driver_conflicts(
+    elab: &ElaboratedModule,
+    module: Definition,
+    all_defs: Option<&HashMap<String, Definition>>,
+) -> Result<(), String> {
     let is_var = |n: &str| elab.signals.contains_key(n) && !elab.nets.contains(n);
     // (writer index, kind, span) per variable.
     let mut writers: HashMap<String, Vec<(usize, WriterKind, Option<(i64, i64)>)>> =
@@ -12551,6 +12560,41 @@ fn validate_driver_conflicts(elab: &ElaboratedModule) -> Result<(), String> {
             }
         }
         next += 1;
+    }
+    // §6.5 / §23.3.3: each output-port connection of an instance in this
+    // module is a continuous driver of its actual.
+    if let Some(defs) = all_defs {
+        for item in module.items() {
+            let ModuleItem::ModuleInstantiation(mi) = item else {
+                continue;
+            };
+            let Some(sub) = defs.get(&mi.module_name.name) else {
+                continue;
+            };
+            if !matches!(sub, Definition::Module(_) | Definition::Program(_)) {
+                continue;
+            }
+            for hi in &mi.instances {
+                for actual in output_port_actuals(sub, &hi.connections) {
+                    let mut spans = Vec::new();
+                    lvalue_write_spans(&actual, elab, &mut spans);
+                    if let ExprKind::Concatenation(parts) = &actual.kind {
+                        for part in parts {
+                            lvalue_write_spans(part, elab, &mut spans);
+                        }
+                    }
+                    for (n, sp) in spans {
+                        if is_var(&n) {
+                            writers
+                                .entry(n)
+                                .or_default()
+                                .push((next, WriterKind::Port, sp));
+                        }
+                    }
+                    next += 1;
+                }
+            }
+        }
     }
     let mut add_process = |stmt: &Statement, kind: WriterKind, next: &mut usize| {
         let mut spans = Vec::new();
@@ -12600,7 +12644,12 @@ fn validate_driver_conflicts(elab: &ElaboratedModule) -> Result<(), String> {
                 let sp = if sa.is_some() { sa } else { sb };
                 use WriterKind as W;
                 let msg = match (ka, kb) {
-                    (W::Continuous, W::Continuous) => {
+                    // A port beside a procedural write is accepted.
+                    (W::Port, W::Comb | W::Ff | W::Other)
+                    | (W::Comb | W::Ff | W::Other, W::Port) => {
+                        continue;
+                    }
+                    (W::Continuous | W::Port, W::Continuous | W::Port) => {
                         if sp.is_none() {
                             format!("Variable '{n}' has multiple continuous drivers")
                         } else {
@@ -12657,6 +12706,64 @@ fn validate_driver_conflicts(elab: &ElaboratedModule) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The actual expressions an instance connects to the OUTPUT ports of `sub`:
+/// named (`.o(v)`), implicit (`.o`), positional and `.*` connections.
+fn output_port_actuals(sub: &Definition, conns: &[PortConnection]) -> Vec<Expression> {
+    let is_output = |name: &str| -> bool {
+        match sub.ports() {
+            PortList::Ansi(ports) => ports
+                .iter()
+                .find(|p| p.name.name == name)
+                .is_some_and(|p| matches!(p.direction, Some(PortDirection::Output))),
+            _ => sub.items().iter().any(|it| {
+                matches!(it, ModuleItem::PortDeclaration(pd)
+                    if matches!(pd.direction, PortDirection::Output)
+                        && pd.declarators.iter().any(|d| d.name.name == name))
+            }),
+        }
+    };
+    let port_names: Vec<String> = match sub.ports() {
+        PortList::Ansi(ports) => ports.iter().map(|p| p.name.name.clone()).collect(),
+        PortList::NonAnsi(names) => names.iter().map(|n| n.name.clone()).collect(),
+        PortList::Empty => Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut named: HashSet<&str> = HashSet::default();
+    for (i, c) in conns.iter().enumerate() {
+        match c {
+            PortConnection::Ordered(Some(e)) => {
+                if port_names.get(i).is_some_and(|n| is_output(n)) {
+                    out.push(e.clone());
+                }
+            }
+            PortConnection::Named {
+                name,
+                expr,
+                implicit,
+            } => {
+                named.insert(name.name.as_str());
+                if !is_output(&name.name) {
+                    continue;
+                }
+                match expr {
+                    Some(e) => out.push(e.clone()),
+                    None if *implicit => out.push(make_ident_expr(&name.name)),
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    if conns.iter().any(|c| matches!(c, PortConnection::Wildcard)) {
+        for n in &port_names {
+            if !named.contains(n.as_str()) && is_output(n) {
+                out.push(make_ident_expr(n));
+            }
+        }
+    }
+    out
 }
 
 /// Escape hatch for `validate_driver_conflicts`: report a conflicting
