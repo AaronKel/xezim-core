@@ -39730,6 +39730,27 @@ fn rewrite_expr_impl(
                 .map(|c| rewrite_constraint_item(c, prefix, port_map, local_names, interface_map))
                 .collect(),
         },
+        // §11.3.6: an assignment used as an expression (`i = i + 1` as a
+        // `for` step, `(a += 1)`) names its target and operand like the
+        // assignment statement does. Cloned verbatim, a renamed block local
+        // (§6.21) used as a loop variable kept its old name in the step,
+        // which wrote another variable, and the loop never ended.
+        ExprKind::AssignExpr { lvalue, rvalue } => ExprKind::AssignExpr {
+            lvalue: Box::new(rewrite_expr(
+                lvalue,
+                prefix,
+                port_map,
+                local_names,
+                interface_map,
+            )),
+            rvalue: Box::new(rewrite_expr(
+                rvalue,
+                prefix,
+                port_map,
+                local_names,
+                interface_map,
+            )),
+        },
         // §12.6: `expr matches pattern` names the instance's objects too.
         ExprKind::Matches { expr: e, pattern } => ExprKind::Matches {
             expr: Box::new(rewrite_expr_impl(
