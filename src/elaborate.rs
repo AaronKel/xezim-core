@@ -3194,6 +3194,13 @@ pub struct ElaboratedModule {
     /// `elaborate_module_with_defs`.
     #[serde(default)]
     pub interfaces: HashSet<String>,
+    /// §25.9 / §6.22.1: each interface's header parameters in declaration
+    /// order with their default rendered as a specialization fragment (a
+    /// literal value or a type name; None when it cannot be reduced here).
+    /// Lets the simulator key `virtual I` and `virtual I#(<defaults>)` as
+    /// the same type.
+    #[serde(default)]
+    pub interface_param_defaults: HashMap<String, Vec<(String, Option<String>)>>,
     /// LRM §17.2: checker declarations indexed by name. Stored so an
     /// instantiation can inline the body with formal→actual port
     /// substitution (basic single-instance semantics). Populated at
@@ -3671,6 +3678,7 @@ impl ElaboratedModule {
             modport_member_dirs: HashMap::default(),
             class_type_args: HashMap::default(),
             interfaces: HashSet::default(),
+            interface_param_defaults: HashMap::default(),
             checker_decls: HashMap::default(),
             property_decls: HashMap::default(),
             property_params: HashMap::default(),
@@ -10978,6 +10986,29 @@ pub fn elaborate_module_with_defs(
                 // LRM §25.9: register the interface name so runtime
                 // detects virtual-interface task formals.
                 elab.interfaces.insert(iface_name.clone());
+                let mut defaults: Vec<(String, Option<String>)> = Vec::new();
+                for pd in iface.params.iter().filter(|pd| !pd.local) {
+                    match &pd.kind {
+                        crate::ast::decl::ParameterKind::Data { assignments, .. } => {
+                            for a in assignments {
+                                let d = a
+                                    .init
+                                    .as_ref()
+                                    .and_then(|e| const_eval_i64_with_params(e, None))
+                                    .map(|n| n.to_string());
+                                defaults.push((a.name.name.clone(), d));
+                            }
+                        }
+                        crate::ast::decl::ParameterKind::Type { assignments } => {
+                            for a in assignments {
+                                let d = a.init.as_ref().and_then(data_type_to_spec_fragment);
+                                defaults.push((a.name.name.clone(), d));
+                            }
+                        }
+                    }
+                }
+                elab.interface_param_defaults
+                    .insert(iface_name.clone(), defaults);
                 for item in &iface.items {
                     if let ModuleItem::ModportDeclaration(md) = item {
                         for mp in &md.items {
@@ -12478,6 +12509,28 @@ pub fn data_type_to_spec_fragment(dt: &DataType) -> Option<String> {
             }
             .to_string(),
         ),
+        // §25.9: a virtual-interface type, spelled as the simulator's
+        // specialization keys spell it (`virtual I#(a,b).mp`).
+        DataType::Interface {
+            name,
+            modport,
+            type_args,
+            ..
+        } => {
+            let mut out = format!("virtual {}", name.name);
+            if !type_args.is_empty() {
+                let args: Vec<String> = type_args.iter().map(expr_to_arg_string).collect();
+                if args.iter().any(|a| a.contains("<unknown>")) {
+                    return None;
+                }
+                out.push_str(&format!("#({})", args.join(",")));
+            }
+            if let Some(mp) = modport {
+                out.push('.');
+                out.push_str(&mp.name);
+            }
+            Some(out)
+        }
         _ => None,
     }
 }
@@ -12498,6 +12551,10 @@ fn expr_to_arg_string(ex: &Expression) -> String {
         }
         ExprKind::TypeLiteral(dt) => match dt.as_ref() {
             DataType::TypeReference { name, .. } => name.name.name.clone(),
+            // §25.9: `extends B#(virtual I#(T))`.
+            DataType::Interface { .. } => {
+                data_type_to_spec_fragment(dt).unwrap_or_else(|| "<unknown>".to_string())
+            }
             _ => "<unknown>".to_string(),
         },
         ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.clone(),
