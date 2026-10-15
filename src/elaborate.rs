@@ -25887,6 +25887,22 @@ fn inline_instantiations_inner(
                         // it at time 0 (enum members are already in scope, having
                         // been processed from this same package's typedefs).
                         crate::ast::decl::PackageItem::Data(dd) => {
+                            // §8.25: a package-level class variable keeps its
+                            // specialization (`C #(byte) v;`) for `v = new`,
+                            // as a module-level one does.
+                            if let DataType::TypeReference { type_args, .. } = &dd.data_type
+                                && !type_args.is_empty()
+                            {
+                                for decl in &dd.declarators {
+                                    elab.class_type_args
+                                        .entry(decl.name.name.clone())
+                                        .or_insert_with(|| type_args.clone());
+                                    elab.class_type_args.insert(
+                                        format!("{}::{}", name, decl.name.name),
+                                        type_args.clone(),
+                                    );
+                                }
+                            }
                             let width = resolve_type_width(
                                 &dd.data_type,
                                 Some(&elab.parameters),
