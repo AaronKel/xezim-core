@@ -1389,7 +1389,7 @@ fn set_param_default(
 }
 
 /// Parse a `-g` value as a constant expression; None when it is not one.
-fn parse_override_value(text: &str) -> Option<ast::expr::Expression> {
+pub(crate) fn parse_override_value(text: &str) -> Option<ast::expr::Expression> {
     use ast::decl::{ModuleItem, ParameterKind};
     let src = format!(
         "module __xezim_param_value; localparam __xezim_v = {};\nendmodule\n",

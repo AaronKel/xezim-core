@@ -1262,6 +1262,506 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     elaborate_class_with_params(c, None)
 }
 
+/// §8.23 / §8.25.1: a class's constant declarations — header value
+/// parameters, then body `localparam`/`parameter`s, in declaration order —
+/// kept so a `C#(args)::N` reference outside the class can evaluate `N` for
+/// that specialization.
+struct ClassConstDecl {
+    /// Header parameter names (type and value) in order, for positional
+    /// `#(...)` arguments.
+    header_order: Vec<String>,
+    /// Every value constant with its default initializer.
+    values: Vec<(String, Option<Expression>)>,
+    /// The base class (§8.13): its constants are visible through this
+    /// class's scope too.
+    extends: Option<String>,
+}
+
+thread_local! {
+    /// Class constant declarations by class name (`register_class_consts`).
+    static CLASS_CONST_DECLS_TLS: std::cell::RefCell<HashMap<String, Rc<ClassConstDecl>>>
+        = std::cell::RefCell::new(HashMap::default());
+}
+
+fn class_const_decl(c: &ClassDeclaration) -> ClassConstDecl {
+    let mut header_order = Vec::new();
+    let mut values = Vec::new();
+    for p in &c.params {
+        match &p.kind {
+            ParameterKind::Data { assignments, .. } => {
+                for a in assignments {
+                    header_order.push(a.name.name.clone());
+                    values.push((a.name.name.clone(), a.init.clone()));
+                }
+            }
+            ParameterKind::Type { assignments } => {
+                header_order.extend(assignments.iter().map(|a| a.name.name.clone()));
+            }
+        }
+    }
+    for item in &c.items {
+        if let ClassItem::Parameter(pd) = item {
+            if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                values.extend(
+                    assignments
+                        .iter()
+                        .map(|a| (a.name.name.clone(), a.init.clone())),
+                );
+            }
+        }
+    }
+    ClassConstDecl {
+        header_order,
+        values,
+        extends: c.extends.as_ref().map(|e| e.name.name.clone()),
+    }
+}
+
+/// §8.13 / §8.23: the constants a class inherits — each ancestor's
+/// registered `anc::N` value, nearest ancestor first, for the names the
+/// class does not declare itself.
+fn inherited_class_consts(
+    c: &ClassDeclaration,
+    params: &HashMap<String, Value>,
+) -> Vec<(String, Value)> {
+    let own: HashSet<String> = class_const_decl(c)
+        .values
+        .into_iter()
+        .map(|v| v.0)
+        .collect();
+    let mut out: Vec<(String, Value)> = Vec::new();
+    let mut cur = c.extends.as_ref().map(|e| e.name.name.clone());
+    let mut guard = 0;
+    while let Some(anc) = cur {
+        guard += 1;
+        let Some(decl) = CLASS_CONST_DECLS_TLS.with(|m| m.borrow().get(&anc).cloned()) else {
+            break;
+        };
+        if guard > 64 {
+            break;
+        }
+        for (n, _) in &decl.values {
+            if own.contains(n) || out.iter().any(|(o, _)| o == n) {
+                continue;
+            }
+            if let Some(v) = params
+                .get(&format!("{}::{}", anc, n))
+                .cloned()
+                .or_else(|| param_fallback_get(&format!("{}::{}", anc, n)))
+            {
+                out.push((n.clone(), v));
+            }
+        }
+        cur = decl.extends.clone();
+    }
+    out
+}
+
+/// §8.23: register a class's constants so a dimension or parameter outside
+/// the class can name them through the class scope (`cls::N`,
+/// `pkg::cls::N`, `Outer::Inner::N`). Each is stored in `elab.parameters`
+/// under every scoped spelling; const-eval resolves a `::` chain against
+/// those keys. A class with value parameters registers only its
+/// declarations: its constants depend on the specialization, so
+/// `C#(args)::N` evaluates them on demand (`class_spec_const`). Without
+/// this, `rand logic [7:0] a[2 * model_c::BEATS]` elaborated to ZERO
+/// elements (#316).
+fn register_class_consts(c: &ClassDeclaration, prefixes: &[String], elab: &mut ElaboratedModule) {
+    for item in &c.items {
+        if let ClassItem::Class(sub) = item {
+            let mut nested: Vec<String> = prefixes
+                .iter()
+                .map(|p| format!("{}::{}", p, sub.name.name))
+                .collect();
+            nested.push(sub.name.name.clone());
+            register_class_consts(sub, &nested, elab);
+        }
+    }
+    let decl = class_const_decl(c);
+    // §8.13: a base class's constants are reachable through the derived
+    // class's scope (`der_c::B`).
+    if c.extends.is_some() {
+        for (n, v) in inherited_class_consts(c, &elab.parameters) {
+            for pfx in prefixes {
+                params_insert_traced(
+                    &mut elab.parameters,
+                    line!(),
+                    format!("{}::{}", pfx, n),
+                    v.clone(),
+                );
+            }
+        }
+    }
+    if !class_binds_values(c) {
+        if c.extends.is_some() {
+            CLASS_CONST_DECLS_TLS.with(|m| {
+                m.borrow_mut().insert(c.name.name.clone(), Rc::new(decl));
+            });
+        }
+        return;
+    }
+    if !class_has_value_params(c) {
+        let consts = class_const_scope(c, Some(&elab.parameters));
+        for (name, _) in &decl.values {
+            let Some(v) = consts.get(name) else {
+                continue;
+            };
+            for pfx in prefixes {
+                params_insert_traced(
+                    &mut elab.parameters,
+                    line!(),
+                    format!("{}::{}", pfx, name),
+                    v.clone(),
+                );
+            }
+        }
+    }
+    CLASS_CONST_DECLS_TLS.with(|m| {
+        m.borrow_mut().insert(c.name.name.clone(), Rc::new(decl));
+    });
+}
+
+/// Register the constants of every `$unit` and package class before any
+/// declaration is sized. Two passes: one class's constant may be defined
+/// through another's (`localparam N = other_c::M`), and `defs` iterates in
+/// hash order.
+fn hoist_class_consts(defs: &HashMap<String, Definition>, elab: &mut ElaboratedModule) {
+    for _pass in 0..2 {
+        for def in defs.values() {
+            match def {
+                Definition::Class(c) => {
+                    register_class_consts(c, &[c.name.name.clone()], elab);
+                }
+                Definition::Package(p) => {
+                    let has_class = p.items.iter().any(|i| {
+                        matches!(i, PackageItem::Class(c) if class_binds_values(c)
+                            || c.extends.is_some()
+                            || c.items.iter().any(|ci| matches!(ci, ClassItem::Class(_))))
+                    });
+                    if !has_class {
+                        continue;
+                    }
+                    let ov = overlay_pkg_params(p, elab);
+                    for item in &p.items {
+                        if let PackageItem::Class(c) = item {
+                            let prefixes = [
+                                format!("{}::{}", p.name.name, c.name.name),
+                                c.name.name.clone(),
+                            ];
+                            register_class_consts(c, &prefixes, elab);
+                        }
+                    }
+                    restore_overlay(elab, ov);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// §8.25.1: split a specialization's `#(...)` text (tokens joined by
+/// spaces) into its arguments: `(Some(name), expr)` for `.name(expr)`,
+/// `(None, expr)` for a positional one. A type argument does not parse as an
+/// expression and yields `None` (its position still counts).
+fn parse_spec_args(text: &str) -> Vec<(Option<String>, Option<Expression>)> {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for ch in text.chars() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                pieces.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(ch);
+    }
+    if !cur.trim().is_empty() || !pieces.is_empty() {
+        pieces.push(cur);
+    }
+    pieces
+        .into_iter()
+        .map(|piece| {
+            let t = piece.trim();
+            if let Some(rest) = t.strip_prefix('.') {
+                let rest = rest.trim_start();
+                let (name, body) = match rest.find('(') {
+                    Some(i) => (rest[..i].trim(), rest[i + 1..].trim_end()),
+                    None => (rest.trim(), ""),
+                };
+                let body = body.strip_suffix(')').unwrap_or(body).trim();
+                let e = (!body.is_empty())
+                    .then(|| crate::parse_override_value(body))
+                    .flatten();
+                (Some(name.to_string()), e)
+            } else {
+                (None, crate::parse_override_value(t))
+            }
+        })
+        .collect()
+}
+
+/// §8.25.1: constant `member` of the specialization `cls#(text)`: the header
+/// parameters take the arguments (evaluated in the referencing scope), the
+/// rest their defaults, and the body constants follow from them.
+fn class_spec_const(
+    cls: &str,
+    args: &[(Option<String>, Option<Expression>)],
+    member: &str,
+    params: &HashMap<String, Value>,
+) -> Option<Value> {
+    let decl = CLASS_CONST_DECLS_TLS.with(|m| m.borrow().get(cls).cloned())?;
+    if !decl.values.iter().any(|(n, _)| n == member) {
+        return None;
+    }
+    let mut overrides: HashMap<String, Value> = HashMap::default();
+    for (i, (name, e)) in args.iter().enumerate() {
+        let Some(e) = e else {
+            continue;
+        };
+        let pname = match name {
+            Some(n) => n.clone(),
+            None => match decl.header_order.get(i) {
+                Some(n) => n.clone(),
+                None => continue,
+            },
+        };
+        overrides.insert(pname, eval_const_expr_val(e, params));
+    }
+    let mut env = params.clone();
+    for (n, init) in &decl.values {
+        let v = match (overrides.remove(n), init) {
+            (Some(v), _) => v,
+            (None, Some(init)) => eval_const_expr_val(init, &env),
+            (None, None) => continue,
+        };
+        if n == member {
+            return Some(v);
+        }
+        env.insert(n.clone(), v);
+    }
+    None
+}
+
+/// §8.23 / §8.25.1: the value of a class-scoped constant reference
+/// `base::member` — `C::N`, `pkg::C::N`, `Outer::Inner::N` or `C#(args)::N`
+/// — or `None` when `base` names no registered class scope.
+fn class_scoped_const(
+    base: &Expression,
+    member: &str,
+    params: &HashMap<String, Value>,
+) -> Option<Value> {
+    fn walk<'a>(e: &'a Expression, segs: &mut Vec<&'a str>) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                segs.extend(h.path.iter().map(|s| s.name.name.as_str()));
+                true
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                walk(expr, segs) && {
+                    segs.push(member.name.as_str());
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+    let mut segs: Vec<&str> = Vec::new();
+    if let ExprKind::Specialization {
+        base: inner,
+        type_args_text,
+    } = &base.kind
+    {
+        if !walk(inner, &mut segs) {
+            return None;
+        }
+        let args = parse_spec_args(type_args_text);
+        return class_spec_const(segs.last()?, &args, member, params);
+    }
+    if !walk(base, &mut segs) || segs.is_empty() {
+        return None;
+    }
+    let lookup = |k: &str| params.get(k).cloned().or_else(|| param_fallback_get(k));
+    lookup(&format!("{}::{}", segs.join("::"), member))
+        .or_else(|| {
+            (segs.len() >= 2)
+                .then(|| lookup(&format!("{}::{}", segs[segs.len() - 1], member)))
+                .flatten()
+        })
+        .or_else(|| class_spec_const(segs.last()?, &[], member, params))
+}
+
+/// §8.23: `[cls::N]` — like `[N]` — parses as an associative dimension
+/// keyed by a "type" named `cls::N` (the parser cannot tell a type from a
+/// constant). The constant's value when the scoped name is a registered
+/// class-scoped (or package) constant rather than a typedef.
+fn scoped_type_name_const(name: &TypeName, params: &HashMap<String, Value>) -> Option<Value> {
+    if name.scopes.is_empty() {
+        return None;
+    }
+    let mut chain: Vec<&str> = name.scopes.iter().map(|s| s.name.name.as_str()).collect();
+    chain.push(name.name.name.as_str());
+    let joined = chain.join("::");
+    let leaf2 = chain[chain.len() - 2..].join("::");
+    if typedefs_snapshot(|td| td.is_some_and(|t| t.contains_key(&joined) || t.contains_key(&leaf2)))
+    {
+        return None;
+    }
+    let last = name.scopes.last()?;
+    if !last.type_args.is_empty() || name.scopes.iter().any(|s| !s.type_args.is_empty()) {
+        let args: Vec<(Option<String>, Option<Expression>)> = last
+            .type_args
+            .iter()
+            .map(|e| match &e.kind {
+                ExprKind::NamedArg { name, expr } => {
+                    (Some(name.name.clone()), expr.as_deref().cloned())
+                }
+                _ => (None, Some(e.clone())),
+            })
+            .collect();
+        return class_spec_const(&last.name.name, &args, &name.name.name, params);
+    }
+    let lookup = |k: &str| params.get(k).cloned().or_else(|| param_fallback_get(k));
+    lookup(&joined)
+        .or_else(|| lookup(&leaf2))
+        // `C#()::N` keeps no args on its scope link: the default
+        // specialization of a class with value parameters.
+        .or_else(|| class_spec_const(&last.name.name, &[], &name.name.name, params))
+}
+
+/// Rewrite an associative-looking `[cls::N]` dimension (see
+/// [`scoped_type_name_const`]) to the fixed size it names; `None` when the
+/// dimension has another shape or the name is no such constant.
+fn scoped_const_dim(
+    d: &UnpackedDimension,
+    params: &HashMap<String, Value>,
+) -> Option<UnpackedDimension> {
+    let UnpackedDimension::Associative {
+        data_type: Some(dt),
+        span,
+    } = d
+    else {
+        return None;
+    };
+    let DataType::TypeReference {
+        name, dimensions, ..
+    } = dt.as_ref()
+    else {
+        return None;
+    };
+    if !dimensions.is_empty() {
+        return None;
+    }
+    let n = scoped_type_name_const(name, params)?.to_i64()?;
+    Some(UnpackedDimension::Expression {
+        expr: Box::new(int_literal(n, *span)),
+        span: *span,
+    })
+}
+
+/// A decimal integer literal expression for a folded constant.
+fn int_literal(n: i64, span: Span) -> Expression {
+    Expression::new(
+        ExprKind::Number(NumberLiteral::Integer {
+            size: None,
+            signed: true,
+            base: NumberBase::Decimal,
+            value: n.to_string(),
+            cached_val: Default::default(),
+        }),
+        span,
+    )
+}
+
+/// §7.4.2 / §8.23: an unpacked STRUCT member `m[N]` / `m[cls::N]` parses
+/// with an associative dimension keyed by a "type" `N` (see
+/// `normalize_unpacked_dims`); a struct type records it so, and every later
+/// reader took the member for an associative array — `$size` read 0 and the
+/// width came out one element. Size such dimensions where the typedef is
+/// recorded. `None` when nothing changes.
+fn size_struct_member_dims(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    typedef_types: &HashMap<String, DataType>,
+    class_scope: bool,
+) -> Option<DataType> {
+    let DataType::Struct(su) = dt else {
+        return None;
+    };
+    let lit = |n: i64, span: Span| Box::new(int_literal(n, span));
+    // One dimension folded to literals when it needs `params` to size.
+    let fold = |d: &UnpackedDimension| -> Option<UnpackedDimension> {
+        match d {
+            // Outside a class only a SCOPED name (`cls::N`, `pkg::N`) is
+            // folded: it is one constant design-wide, while a bare module
+            // parameter may differ per instance and is sized where used.
+            UnpackedDimension::Associative {
+                data_type: Some(dt),
+                ..
+            } if class_scope
+                || matches!(dt.as_ref(), DataType::TypeReference { name, .. }
+                    if !name.scopes.is_empty()) =>
+            {
+                match normalize_unpacked_dims(std::slice::from_ref(d), params, typedef_types)
+                    .pop()?
+                {
+                    UnpackedDimension::Expression { expr, span } => {
+                        let n = const_eval_i64_with_params(&expr, Some(params))?;
+                        Some(UnpackedDimension::Expression {
+                            expr: lit(n, expr.span),
+                            span,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            UnpackedDimension::Expression { expr, span }
+                if class_scope && const_eval_i64_with_params(expr, None).is_none() =>
+            {
+                let n = const_eval_i64_with_params(expr, Some(params))?;
+                Some(UnpackedDimension::Expression {
+                    expr: lit(n, expr.span),
+                    span: *span,
+                })
+            }
+            UnpackedDimension::Range { left, right, span }
+                if class_scope
+                    && (const_eval_i64_with_params(left, None).is_none()
+                        || const_eval_i64_with_params(right, None).is_none()) =>
+            {
+                let l = const_eval_i64_with_params(left, Some(params))?;
+                let r = const_eval_i64_with_params(right, Some(params))?;
+                Some(UnpackedDimension::Range {
+                    left: lit(l, left.span),
+                    right: lit(r, right.span),
+                    span: *span,
+                })
+            }
+            _ => None,
+        }
+    };
+    let mut out: Option<StructUnionType> = None;
+    for (mi, m) in su.members.iter().enumerate() {
+        if let Some(inner) =
+            size_struct_member_dims(&m.data_type, params, typedef_types, class_scope)
+        {
+            out.get_or_insert_with(|| su.clone()).members[mi].data_type = inner;
+        }
+        for (di, d) in m.declarators.iter().enumerate() {
+            for (k, dim) in d.dimensions.iter().enumerate() {
+                if let Some(f) = fold(dim) {
+                    out.get_or_insert_with(|| su.clone()).members[mi].declarators[di].dimensions
+                        [k] = f;
+                }
+            }
+        }
+    }
+    out.map(DataType::Struct)
+}
+
 /// Collect the constant bindings visible to a class's own declarations:
 /// the enclosing scope's parameters (module / package / `$unit`) overlaid
 /// with the class's own value parameters and body `localparam`s, each
@@ -1279,6 +1779,12 @@ fn class_const_scope(
     scope_params: Option<&HashMap<String, Value>>,
 ) -> HashMap<String, Value> {
     let mut params: HashMap<String, Value> = scope_params.cloned().unwrap_or_default();
+    // §8.13: inherited constants, overridden below by the class's own.
+    if c.extends.is_some() {
+        for (n, v) in inherited_class_consts(c, &params) {
+            params.insert(n, v);
+        }
+    }
     let mut bind = |name: &str, init: Option<&crate::ast::expr::Expression>| {
         // A parameter with no default (`#(parameter int W)`) contributes
         // nothing — leave it unbound so the dimension stays unresolved
@@ -1345,6 +1851,14 @@ pub fn elaborate_class_with_params(
     with_typedefs_owned(table, || elaborate_class_in_scope(c, scope_params))
 }
 
+/// Whether a class header declares a VALUE parameter (`class C #(int W)`):
+/// its constants then depend on the specialization.
+fn class_has_value_params(c: &ClassDeclaration) -> bool {
+    c.params
+        .iter()
+        .any(|p| matches!(p.kind, ParameterKind::Data { .. }))
+}
+
 /// Whether a class binds any VALUE parameter or body `localparam` of its own
 /// — otherwise its constant scope is exactly the enclosing one.
 fn class_binds_values(c: &ClassDeclaration) -> bool {
@@ -1364,7 +1878,6 @@ fn elaborate_class_in_scope(
     // Both scopes below start from a copy of the enclosing parameters; a
     // class that binds nothing of its own (most of them) borrows those
     // parameters instead of copying the whole map twice.
-    let binds_values = class_binds_values(c);
     let empty_scope: HashMap<String, Value>;
     let enclosing: &HashMap<String, Value> = match scope_params {
         Some(p) => p,
@@ -1373,6 +1886,13 @@ fn elaborate_class_in_scope(
             &empty_scope
         }
     };
+    // §8.13: constants inherited from a base class size declarations too.
+    let inherited = if c.extends.is_some() {
+        inherited_class_consts(c, enclosing)
+    } else {
+        Vec::new()
+    };
+    let binds_values = class_binds_values(c) || !inherited.is_empty();
     let owned_const_scope: HashMap<String, Value>;
     let const_scope: &HashMap<String, Value> = if binds_values {
         owned_const_scope = class_const_scope(c, scope_params);
@@ -1394,6 +1914,7 @@ fn elaborate_class_in_scope(
     } else {
         owned_unpacked_scope = {
             let mut m = scope_params.cloned().unwrap_or_default();
+            m.extend(inherited.iter().cloned());
             for item in &c.items {
                 if let ClassItem::Parameter(pd) = item {
                     if let crate::ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
@@ -1521,6 +2042,16 @@ fn elaborate_class_in_scope(
                                 data_type: Some(dt),
                                 span,
                             } => {
+                                // §8.23: `[cls::N]` names a class constant.
+                                if let Some(fixed) = scoped_const_dim(
+                                    &UnpackedDimension::Associative {
+                                        data_type: Some(dt.clone()),
+                                        span,
+                                    },
+                                    const_scope,
+                                ) {
+                                    return fixed;
+                                }
                                 if let DataType::TypeReference { name, .. } = dt.as_ref() {
                                     let n = name.name.name.clone();
                                     let is_type = typedefs_snapshot(|td| {
@@ -2296,7 +2827,17 @@ fn elaborate_class_in_scope(
             .items
             .iter()
             .filter_map(|it| match it {
-                ClassItem::Typedef(td) => Some((td.name.name.clone(), td.data_type.clone())),
+                // §8.23: a struct member sized by a constant (`m[Q]`).
+                ClassItem::Typedef(td) => Some((
+                    td.name.name.clone(),
+                    size_struct_member_dims(
+                        &td.data_type,
+                        const_scope,
+                        &HashMap::default(),
+                        !class_has_value_params(c),
+                    )
+                    .unwrap_or_else(|| td.data_type.clone()),
+                )),
                 _ => None,
             })
             .collect(),
@@ -3557,7 +4098,10 @@ fn is_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> bool {
         ExprKind::MemberAccess { expr, member } => {
             // `s.field` (const struct base) OR `pkg::CONST` (the scoped member is
             // an imported package constant / enum value, resolved by bare name).
-            is_const_expr(expr, params) || params.contains_key(&member.name)
+            is_const_expr(expr, params)
+                || params.contains_key(&member.name)
+                // §8.23: a class-scoped constant (`cls::N`, `cls#(4)::N`).
+                || class_scoped_const(expr, &member.name, params).is_some()
         }
         ExprKind::Index { expr, index } => {
             is_const_expr(expr, params) && is_const_expr(index, params)
@@ -3826,6 +4370,26 @@ pub fn register_class_enum_members(c: &ClassDeclaration, elab: &mut ElaboratedMo
             let prev_w = elab.typedefs.get(&td.name.name).copied();
             let prev_t = elab.typedef_types.get(&td.name.name).cloned();
             process_typedef(td, elab);
+            // §8.23: a struct member sized by the class's own constant
+            // (`m[Q]`) — `process_typedef` only sees the enclosing scope.
+            if class_binds_values(c)
+                && !class_has_value_params(c)
+                && let Some(dt @ DataType::Struct(_)) = elab.typedef_types.get(&td.name.name)
+            {
+                let scope = class_const_scope(c, Some(&elab.parameters));
+                if let Some(sized) = size_struct_member_dims(dt, &scope, &elab.typedef_types, true)
+                {
+                    let w = resolve_type_width(&sized, Some(&scope), Some(&elab.typedefs));
+                    typedefs_insert_traced(
+                        &mut elab.typedefs,
+                        "insert:class_local_struct_dims",
+                        td.name.name.clone(),
+                        w,
+                    );
+                    elab.typedef_types.insert(td.name.name.clone(), sized);
+                    sync_typedefs_tls(&elab.typedefs);
+                }
+            }
             if let Some(w) = prev_w {
                 typedefs_insert_traced(
                     &mut elab.typedefs,
@@ -3884,8 +4448,14 @@ pub fn register_class_scoped_typedef_aliases(
         prefixes.push(format!("{}::{}", p, c.name.name));
     }
     prefixes.push(c.name.name.clone());
-    let params = class_const_scope(c, None);
-    walk_class_typedefs(c, &prefixes, &params, elab);
+    register_class_consts(c, &prefixes, elab);
+    if c.items
+        .iter()
+        .any(|i| matches!(i, ClassItem::Typedef(_) | ClassItem::Class(_)))
+    {
+        let params = class_const_scope(c, None);
+        walk_class_typedefs(c, &prefixes, &params, elab);
+    }
     type_trace_tls_refresh("class_scope_alias", &elab.typedefs);
     sync_typedefs_tls(&elab.typedefs);
 }
@@ -3902,16 +4472,22 @@ fn walk_class_typedefs(
     for item in &c.items {
         match item {
             ClassItem::Typedef(td) => {
+                // A class with value parameters re-sizes per specialization;
+                // fold only its design-wide scoped constants.
+                let fold_class = !class_has_value_params(c);
+                let sized =
+                    size_struct_member_dims(&td.data_type, params, &elab.typedef_types, fold_class);
+                let dt = sized.as_ref().unwrap_or(&td.data_type);
                 for pfx in prefixes {
                     let key = format!("{}::{}", pfx, td.name.name);
-                    let w = resolve_type_width(&td.data_type, Some(params), Some(&elab.typedefs));
+                    let w = resolve_type_width(dt, Some(params), Some(&elab.typedefs));
                     typedefs_insert_traced(
                         &mut elab.typedefs,
                         "insert:class_scope_alias",
                         key.clone(),
                         w,
                     );
-                    elab.typedef_types.insert(key.clone(), td.data_type.clone());
+                    elab.typedef_types.insert(key.clone(), dt.clone());
                     if !td.dimensions.is_empty() {
                         elab.typedef_unpacked_dims
                             .insert(key.clone(), td.dimensions.clone());
@@ -4697,6 +5273,13 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
         // table first (and the REWRITTEN type is what gets recorded, so
         // every later resolution agrees).
         let bound_dt = prebind_type_dims(&td.data_type, elab);
+        let bound_dt = size_struct_member_dims(
+            bound_dt.as_ref().unwrap_or(&td.data_type),
+            &elab.parameters,
+            &elab.typedef_types,
+            false,
+        )
+        .or(bound_dt);
         let eff_dt: &DataType = bound_dt.as_ref().unwrap_or(&td.data_type);
         // A `typedef class foo_pool;` is parsed as a Void placeholder with
         // `forward:false` (a forward CLASS declaration — §6.18). When the same
@@ -5666,6 +6249,9 @@ pub fn elaborate_module_with_defs(
         // narrowing a struct port's testbench side by exactly 30 bits while
         // the DUT side (healed by the child fixpoint) stayed correct.
         hoist_package_params(defs, &mut elab);
+        // §8.23: class constants next, so a `cls::N` dimension sizes before
+        // any class or module declaration is elaborated.
+        hoist_class_consts(defs, &mut elab);
         // §26.3: a package typedef can reference ANOTHER package's scoped
         // typedef (`q::inner_t` inside p's struct). The per-package
         // processing below runs in map order, so p's struct width fell back
@@ -18047,6 +18633,12 @@ fn const_unpacked_bounds(
             data_type: Some(dt),
             ..
         } => {
+            if let Some(UnpackedDimension::Expression { expr, .. }) =
+                params.and_then(|p| scoped_const_dim(&dims[0], p))
+            {
+                let n = const_eval_i64_with_params(&expr, params)?;
+                return (n > 0).then(|| (0, n - 1));
+            }
             let nm = get_type_name(dt)?;
             let n = params?.get(&nm)?.to_u64()? as i64;
             if n > 0 { Some((0, n - 1)) } else { None }
@@ -20035,6 +20627,14 @@ pub fn extract_array_range(
             // shape of any further dimension) was then wrong, so instances
             // bound to `w[i][j]` drove nothing and the net read z. Reinterpret
             // it here, where the parameter table exists.
+            if let Some(n) = scoped_const_dim(&dims[0], params).and_then(|f| match f {
+                crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
+                    const_eval_i64_with_params(&expr, Some(params))
+                }
+                _ => None,
+            }) {
+                return (n > 0).then(|| (0, n - 1));
+            }
             if let DataType::TypeReference {
                 name, dimensions, ..
             } = &**dt
@@ -21370,6 +21970,9 @@ pub fn normalize_unpacked_dims(
                 data_type: Some(dt),
                 span,
             } => {
+                if let Some(fixed) = scoped_const_dim(d, params) {
+                    return fixed;
+                }
                 if let DataType::TypeReference { name, .. } = dt.as_ref() {
                     let n = &name.name.name;
                     if !typedef_types.contains_key(n) && params.contains_key(n) {
@@ -23309,6 +23912,11 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         // packed layout. Enables black-parrot's
         // `localparam icache_sets_p = proc_param_lp.icache_sets`.
         ExprKind::MemberAccess { expr: base, member } => {
+            // §8.23 / §8.25.1: a class-scoped constant (`cls::N`,
+            // `pkg::cls::N`, `cls#(4)::N`).
+            if let Some(v) = class_scoped_const(base, &member.name, params) {
+                return v;
+            }
             let base_val = eval_const_expr_val(base, params);
             if let ExprKind::Ident(h) = &base.kind {
                 let nm = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
