@@ -8307,8 +8307,29 @@ pub fn elaborate_module_with_defs(
                                         })),
                                         _ => None,
                                     };
+                                    // A packed-struct ELEMENT type: every element
+                                    // collection carries the field layout, so
+                                    // `q3[i][j].f` and a locator's `item.f` slice
+                                    // the element like a standalone `T q[$]`.
+                                    let elem_fields = packed_struct_field_layout(
+                                        &dd.data_type,
+                                        &elab.parameters,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    )
+                                    .filter(|f| !f.is_empty());
+                                    if let Some(f) = &elem_fields {
+                                        elab.packed_struct_fields
+                                            .entry(name.clone())
+                                            .or_insert_with(|| f.clone());
+                                    }
                                     for suffix in index_tuples(&shape) {
                                         let en = format!("{}{}", name, suffix);
+                                        if let Some(f) = &elem_fields {
+                                            elab.packed_struct_fields
+                                                .entry(en.clone())
+                                                .or_insert_with(|| f.clone());
+                                        }
                                         if let Some(is_str) = assoc_key {
                                             // Associative elements are sparse: no
                                             // backing buffer, no `.size` shadow.
@@ -15257,8 +15278,29 @@ fn elaborate_items_numbered(
                                         })),
                                         _ => None,
                                     };
+                                    // A packed-struct ELEMENT type: every element
+                                    // collection carries the field layout, so
+                                    // `q3[i][j].f` and a locator's `item.f` slice
+                                    // the element like a standalone `T q[$]`.
+                                    let elem_fields = packed_struct_field_layout(
+                                        &dd.data_type,
+                                        &elab.parameters,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    )
+                                    .filter(|f| !f.is_empty());
+                                    if let Some(f) = &elem_fields {
+                                        elab.packed_struct_fields
+                                            .entry(name.clone())
+                                            .or_insert_with(|| f.clone());
+                                    }
                                     for suffix in index_tuples(&shape) {
                                         let en = format!("{}{}", name, suffix);
+                                        if let Some(f) = &elem_fields {
+                                            elab.packed_struct_fields
+                                                .entry(en.clone())
+                                                .or_insert_with(|| f.clone());
+                                        }
                                         if let Some(is_str) = assoc_key {
                                             // Associative elements are sparse: no
                                             // backing buffer, no `.size` shadow.
