@@ -4056,6 +4056,17 @@ impl Parser {
                     kind: crate::ast::types::SimpleType::String,
                     span,
                 } => ("string".to_string(), *span),
+                // §6.12: `C #(real) x;` — dropping the argument built the
+                // object as the default specialization.
+                DataType::Real { kind, span } => (
+                    match kind {
+                        crate::ast::types::RealType::Real => "real",
+                        crate::ast::types::RealType::ShortReal => "shortreal",
+                        crate::ast::types::RealType::RealTime => "realtime",
+                    }
+                    .to_string(),
+                    *span,
+                ),
                 _ => return None,
             },
         };
