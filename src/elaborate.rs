@@ -22227,11 +22227,47 @@ fn unpacked_dims_elem_count(
                 (Some(l), Some(r)) => ((l - r).abs() + 1) as u32,
                 _ => 1,
             },
+            // §7.4.2/§20.6.2: `m[SP]` / `m[cls::N]` parses as an associative
+            // dimension keyed by a "type" (the parser cannot tell a type from
+            // a constant); a parameter that names no type is a size.
+            UnpackedDimension::Associative { .. } => params
+                .and_then(|p| assoc_dim_const_size(d, p))
+                .map_or(1, |v| v.clamp(1, u32::MAX as i64) as u32),
             _ => 1,
         };
         n = n.saturating_mul(c.max(1));
     }
     n
+}
+
+/// The size an associative-looking dimension names when its "key type" is
+/// really a constant: a class-scoped / package constant (`[cls::N]`, see
+/// [`scoped_const_dim`]) or a bare parameter no typedef shadows (`[SP]`).
+fn assoc_dim_const_size(d: &UnpackedDimension, params: &HashMap<String, Value>) -> Option<i64> {
+    if let Some(UnpackedDimension::Expression { expr, .. }) = scoped_const_dim(d, params) {
+        return const_eval_i64_with_params(&expr, Some(params));
+    }
+    let UnpackedDimension::Associative {
+        data_type: Some(dt),
+        ..
+    } = d
+    else {
+        return None;
+    };
+    let DataType::TypeReference {
+        name, dimensions, ..
+    } = dt.as_ref()
+    else {
+        return None;
+    };
+    if !dimensions.is_empty() || !name.scopes.is_empty() {
+        return None;
+    }
+    let n = &name.name.name;
+    if typedefs_snapshot(|td| td.is_some_and(|t| t.contains_key(n))) {
+        return None;
+    }
+    params.get(n)?.to_i64()
 }
 
 fn const_dim_indices(
