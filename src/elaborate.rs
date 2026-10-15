@@ -26576,6 +26576,29 @@ fn inline_instantiations_inner(
                             let is_signed =
                                 is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                             for decl in &dd.declarators {
+                                // §6.18/§7.4: a variable of an array / queue /
+                                // associative TYPEDEF (`aa_t m;`) inherits the
+                                // typedef's unpacked dimensions, as the
+                                // module-scope path's `effective_dims` does; the
+                                // package arm read `decl.dimensions` alone, so
+                                // the variable was a scalar of the element type.
+                                let typed_decl;
+                                let decl = match &dd.data_type {
+                                    DataType::TypeReference { name: tn, .. }
+                                        if decl.dimensions.is_empty() =>
+                                    {
+                                        match lookup_scoped_type(tn, &elab.typedef_unpacked_dims) {
+                                            Some(dims) => {
+                                                let mut d = decl.clone();
+                                                d.dimensions = dims.clone();
+                                                typed_decl = d;
+                                                &typed_decl
+                                            }
+                                            None => decl,
+                                        }
+                                    }
+                                    _ => decl,
+                                };
                                 let first_dim = decl.dimensions.first();
                                 let is_dynamic_dim = first_dim.is_some_and(|d| {
                                     matches!(
