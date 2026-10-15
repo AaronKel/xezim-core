@@ -137,16 +137,16 @@ impl OriginSink {
     }
 }
 
-/// Offset of the first byte of `b` equal to one of `targets` (or, with
-/// `high`, any non-ASCII byte), eight bytes at a time; `None` when there is
-/// none. The same answer as `b.iter().position(..)` with that predicate.
-fn find_byte(b: &[u8], targets: &[u8], high: bool) -> Option<usize> {
+/// Offset of the first byte of `b` equal to one of `targets`, eight bytes at
+/// a time; `None` when there is none. The same answer as
+/// `b.iter().position(..)` with that predicate.
+fn find_byte(b: &[u8], targets: &[u8]) -> Option<usize> {
     const LO: u64 = 0x0101_0101_0101_0101;
     const HI: u64 = 0x8080_8080_8080_8080;
     let mut i = 0;
     while i + 8 <= b.len() {
         let x = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        let mut m = if high { x & HI } else { 0 };
+        let mut m = 0;
         for &t in targets {
             let v = x ^ (LO * t as u64);
             // Exact for the lowest matching byte: borrows only reach bytes
@@ -160,7 +160,7 @@ fn find_byte(b: &[u8], targets: &[u8], high: bool) -> Option<usize> {
     }
     b[i..]
         .iter()
-        .position(|&c| targets.contains(&c) || (high && c >= 0x80))
+        .position(|&c| targets.contains(&c))
         .map(|p| i + p)
 }
 
@@ -774,9 +774,14 @@ impl Preprocessor {
         let n = bytes.len();
         let mut i = 0;
         while i < n {
-            // Plain ASCII text is copied verbatim; only `/`, `"` and non-ASCII
-            // bytes (re-encoded byte by byte below) need the careful path.
-            let run = find_byte(&bytes[i..], b"/\"", true).unwrap_or(n - i);
+            // Ordinary text — any UTF-8, not only ASCII — is copied verbatim;
+            // only `/` and `"` need the careful path. Non-ASCII text used to be
+            // re-encoded byte by byte (each byte became the Latin-1 char of the
+            // same value), which DOUBLE-encoded it: a string literal `"é"`
+            // decoded to four bytes instead of its two source bytes (IEEE
+            // 1800-2017 §5.9: a string literal is the sequence of its bytes).
+            // Stopping only at ASCII bytes keeps every slice on a char boundary.
+            let run = find_byte(&bytes[i..], b"/\"").unwrap_or(n - i);
             if run > 0 {
                 result.push_str(&source[i..i + run]);
                 i += run;
@@ -787,7 +792,7 @@ impl Preprocessor {
                     // Line comment: replace with spaces until newline to preserve line numbers
                     // BUT: keep the backslash if it's at the end of the line (continuation)
                     let start = i;
-                    i += find_byte(&bytes[i..], b"\n", false).unwrap_or(n - i);
+                    i += find_byte(&bytes[i..], b"\n").unwrap_or(n - i);
                     // Check if the line ends with a backslash (ignoring whitespace)
                     let mut j = i;
                     while j > start && bytes[j - 1].is_ascii_whitespace() {
@@ -816,7 +821,7 @@ impl Preprocessor {
                     i += 2;
                     while i + 1 < n {
                         // One space per byte that is none of the three below.
-                        let run = find_byte(&bytes[i..n - 1], b"*\n\\", false).unwrap_or(n - 1 - i);
+                        let run = find_byte(&bytes[i..n - 1], b"*\n\\").unwrap_or(n - 1 - i);
                         if run > 0 {
                             push_spaces(&mut result, run);
                             i += run;
@@ -845,16 +850,19 @@ impl Preprocessor {
                 result.push('\"');
                 i += 1;
                 while i < n {
-                    let run = find_byte(&bytes[i..], b"\\\"", true).unwrap_or(n - i);
+                    let run = find_byte(&bytes[i..], b"\\\"").unwrap_or(n - i);
                     if run > 0 {
                         result.push_str(&source[i..i + run]);
                         i += run;
                         continue;
                     }
                     if bytes[i] == b'\\' && i + 1 < n {
+                        // The escaped character is copied whole (it may be a
+                        // multi-byte UTF-8 char).
+                        let ch = source[i + 1..].chars().next().unwrap_or('\\');
                         result.push('\\');
-                        result.push(bytes[i + 1] as char);
-                        i += 2;
+                        result.push(ch);
+                        i += 1 + ch.len_utf8();
                         continue;
                     }
                     if bytes[i] == b'"' {
@@ -2144,9 +2152,9 @@ impl Preprocessor {
             // Copy ordinary text in bulk: inside a string only `\\` and `"`
             // matter, outside it only `` ` `` and `"`.
             let run = if in_string {
-                find_byte(&bytes[i..], b"\\\"", false)
+                find_byte(&bytes[i..], b"\\\"")
             } else {
-                find_byte(&bytes[i..], b"`\"", false)
+                find_byte(&bytes[i..], b"`\"")
             }
             .unwrap_or(bytes.len() - i);
             if run > 0 {
@@ -2529,7 +2537,7 @@ impl Preprocessor {
         let mut in_string = false;
         // Only `"` (string state) and `(` (attribute start) matter; every
         // other byte is copied through unchanged, in bulk.
-        while let Some(off) = find_byte(&bytes[i..], b"\"(", false) {
+        while let Some(off) = find_byte(&bytes[i..], b"\"(") {
             i += off;
             if bytes[i] == b'\"' {
                 if i == 0 || bytes[i - 1] != b'\\' {
