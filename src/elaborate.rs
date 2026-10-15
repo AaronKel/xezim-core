@@ -4531,13 +4531,21 @@ fn walk_class_typedefs(
 /// is walked from `elab.classes`, the `#(...)` args are bound to its
 /// `param_order`, and the typedef's target is sized under those bindings
 /// (`VecGen#(6)::vec_t` with `typedef logic [W-1:0] vec_t` → 6).
+/// The prefix may also be a typedef of a specialization (`typedef
+/// VecGen#(6) g_t;` ... `g_t::vec_t`, §6.18): it is followed to the
+/// specialization it names.
 pub fn specialized_class_scope_width(
     name: &crate::ast::types::TypeName,
     elab: &ElaboratedModule,
 ) -> Option<u32> {
-    // The scope link carrying `#(...)` args names the specialized class.
-    let link = name.scopes.iter().rev().find(|s| !s.type_args.is_empty())?;
-    let cls = elab.classes.get(&link.name.name)?;
+    // The scope link carrying `#(...)` args names the specialized class;
+    // without one, the last link may be a typedef naming a specialization.
+    let (cls_name, type_args): (&str, &[Expression]) =
+        match name.scopes.iter().rev().find(|s| !s.type_args.is_empty()) {
+            Some(link) => (&link.name.name, &link.type_args),
+            None => typedef_specialization(&name.scopes.last()?.name.name, elab)?,
+        };
+    let cls = elab.classes.get(cls_name)?;
     // Bind the class's value parameters: defaults first, then the
     // positional `#(...)` args in `param_order` (type and value params
     // interleaved, §6.20.2).
@@ -4548,15 +4556,79 @@ pub fn specialized_class_scope_width(
             params.insert(pn.clone(), v);
         }
     }
-    for (i, arg) in link.type_args.iter().enumerate() {
+    for (i, arg) in type_args.iter().enumerate() {
         if let Some(pn) = cls.param_order.get(i) {
             let v = eval_const_expr_val(arg, &params);
             params.insert(pn.clone(), v);
         }
     }
     let target = cls.typedef_targets.get(&name.name.name)?;
+    // §8.25: a typedef of one of the class's TYPE parameters
+    // (`typedef T elem_t;`) takes the type that argument binds.
+    if let DataType::TypeReference {
+        name: tn,
+        dimensions,
+        type_args: targs,
+        ..
+    } = target
+        && tn.scopes.is_empty()
+        && dimensions.is_empty()
+        && targs.is_empty()
+        && cls.type_param_names.iter().any(|t| t == &tn.name.name)
+        && let Some(arg) = cls
+            .param_order
+            .iter()
+            .position(|p| p == &tn.name.name)
+            .and_then(|i| type_args.get(i))
+    {
+        let w = match &arg.kind {
+            ExprKind::TypeLiteral(dt) => {
+                Some(resolve_type_width(dt, Some(&params), Some(&elab.typedefs)))
+            }
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let n = h.path[0].name.name.as_str();
+                atom_keyword_width(n).or_else(|| elab.typedefs.get(n).copied())
+            }
+            _ => None,
+        };
+        if let Some(w) = w.filter(|w| *w > 0) {
+            return Some(w);
+        }
+    }
     let w = resolve_type_width(target, Some(&params), Some(&elab.typedefs));
     Some(w.max(1))
+}
+
+/// §6.18/§8.25.1: the class and `#(...)` args a typedef names when it
+/// aliases a class specialization (`typedef holder #(byte, 6) h_t;`),
+/// following plain alias hops; None for any other typedef.
+fn typedef_specialization<'a>(
+    name: &str,
+    elab: &'a ElaboratedModule,
+) -> Option<(&'a str, &'a [Expression])> {
+    let mut cur = elab.typedef_types.get(name)?;
+    for _ in 0..16 {
+        let DataType::TypeReference {
+            name: tn,
+            type_args,
+            dimensions,
+            ..
+        } = cur
+        else {
+            return None;
+        };
+        if !dimensions.is_empty() || !tn.scopes.is_empty() {
+            return None;
+        }
+        if !type_args.is_empty() {
+            return elab
+                .classes
+                .contains_key(&tn.name.name)
+                .then_some((tn.name.name.as_str(), type_args.as_slice()));
+        }
+        cur = elab.typedef_types.get(&tn.name.name)?;
+    }
+    None
 }
 
 /// Evaluate every package's parameters to a fixpoint, registering each under
