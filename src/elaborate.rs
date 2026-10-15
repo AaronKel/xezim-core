@@ -8807,7 +8807,28 @@ pub fn elaborate_module_with_defs(
                                 ExprKind::Concatenation(exprs) => exprs.iter().collect(),
                                 _ => vec![],
                             };
-                            if !init_items.is_empty() {
+                            // §7.5/§7.10/§10.10: a dynamic array / queue initialized
+                            // by an unpacked array CONCATENATION (`{a, b, 9}`) or any
+                            // other non-pattern expression (`= other_q`) is one
+                            // whole-collection assignment: an operand that is itself
+                            // a collection contributes all of its elements. Spread
+                            // item-per-element, each collection operand became ONE
+                            // (zero) element, and a bare collection initializer was
+                            // dropped.
+                            if is_dynamic_dim
+                                && !matches!(init_expr.kind, ExprKind::AssignmentPattern(_))
+                            {
+                                elab.initial_blocks.push(InitialBlock {
+                                    stmt: Statement::new(
+                                        StatementKind::BlockingAssign {
+                                            lvalue: make_ident_expr(&decl.name.name),
+                                            rvalue: init_expr.clone(),
+                                        },
+                                        Span::dummy(),
+                                    ),
+                                    scope: String::new(),
+                                });
+                            } else if !init_items.is_empty() {
                                 let mut stmts: Vec<Statement> = Vec::new();
                                 for (i, item_expr) in init_items.iter().enumerate() {
                                     let idx_i = lo + i as i64;
@@ -15322,7 +15343,28 @@ fn elaborate_items_numbered(
                                 ExprKind::Concatenation(exprs) => exprs.iter().collect(),
                                 _ => vec![],
                             };
-                            if !init_items.is_empty() {
+                            // §7.5/§7.10/§10.10: a dynamic array / queue initialized
+                            // by an unpacked array CONCATENATION (`{a, b, 9}`) or any
+                            // other non-pattern expression (`= other_q`) is one
+                            // whole-collection assignment: an operand that is itself
+                            // a collection contributes all of its elements. Spread
+                            // item-per-element, each collection operand became ONE
+                            // (zero) element, and a bare collection initializer was
+                            // dropped.
+                            if is_dynamic_dim
+                                && !matches!(init_expr.kind, ExprKind::AssignmentPattern(_))
+                            {
+                                elab.initial_blocks.push(InitialBlock {
+                                    stmt: Statement::new(
+                                        StatementKind::BlockingAssign {
+                                            lvalue: make_ident_expr(&decl.name.name),
+                                            rvalue: init_expr.clone(),
+                                        },
+                                        Span::dummy(),
+                                    ),
+                                    scope: String::new(),
+                                });
+                            } else if !init_items.is_empty() {
                                 let mut stmts: Vec<Statement> = Vec::new();
                                 for (i, item_expr) in init_items.iter().enumerate() {
                                     let idx_i = lo + i as i64;
@@ -26896,7 +26938,28 @@ fn inline_instantiations_inner(
                                     ExprKind::Concatenation(exprs) => exprs.iter().collect(),
                                     _ => vec![],
                                 };
-                                if !init_items.is_empty() && !decl.dimensions.is_empty() {
+                                // §7.5/§7.10/§10.10: a dynamic array / queue initialized
+                                // by an unpacked array CONCATENATION (`{a, b, 9}`) or any
+                                // other non-pattern expression (`= other_q`) is one
+                                // whole-collection assignment: an operand that is itself
+                                // a collection contributes all of its elements. Spread
+                                // item-per-element, each collection operand became ONE
+                                // (zero) element, and a bare collection initializer was
+                                // dropped.
+                                if is_dynamic_dim
+                                    && !matches!(init_expr.kind, ExprKind::AssignmentPattern(_))
+                                {
+                                    elab.static_init_blocks.push(InitialBlock {
+                                        stmt: Statement::new(
+                                            StatementKind::BlockingAssign {
+                                                lvalue: make_ident_expr(&decl.name.name),
+                                                rvalue: init_expr.clone(),
+                                            },
+                                            Span::dummy(),
+                                        ),
+                                        scope: String::new(),
+                                    });
+                                } else if !init_items.is_empty() && !decl.dimensions.is_empty() {
                                     // Emit explicit per-element initializers. The
                                     // array is registered in `arrays` above, so
                                     // `name[i] = item` lands where reads look.
