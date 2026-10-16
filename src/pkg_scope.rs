@@ -71,6 +71,9 @@ struct PkgInfo {
     /// Value names declared directly in the package: functions, tasks,
     /// parameters, variables and `let`s.
     values: HashSet<String>,
+    /// Variable names declared directly in the package (a subset of
+    /// `values`).
+    vars: HashSet<String>,
     /// `import Q::name;` as (Q, name).
     explicit: Vec<(String, String)>,
     /// `import Q::*;`
@@ -88,6 +91,12 @@ struct Info {
     /// Value names (subroutines, parameters, variables, `let`s) declared by
     /// more than one package, or by a package and `$unit`.
     colliding_values: HashSet<String>,
+    /// Package VARIABLE names that two or more packages declare. Every
+    /// package's variables share one design-wide bare namespace at run
+    /// time, so each such variable is renamed to `pkg::name` and every
+    /// reference resolving to it rewritten to that spelling, exactly like a
+    /// colliding type name.
+    mangled_vars: HashSet<String>,
     /// Type names (typedefs, nested classes) a class declares that are also
     /// declared in another class or any other scope (§8.3, §6.18).
     class_colliding: HashSet<String>,
@@ -813,6 +822,10 @@ fn collect(descs: &[Description]) -> Option<Info> {
                 let pi = pkgs.entry(p.name.name.clone()).or_default();
                 for it in &p.items {
                     package_item_values(it, &mut pi.values);
+                    if let PackageItem::Data(dd) = it {
+                        pi.vars
+                            .extend(dd.declarators.iter().map(|v| v.name.name.clone()));
+                    }
                     match it {
                         PackageItem::Typedef(td) => {
                             pi.types.insert(td.name.name.clone());
@@ -882,6 +895,53 @@ fn collect(descs: &[Description]) -> Option<Info> {
     let colliding = clash(|pi| &pi.types, &other);
     let colliding_members = clash(|pi| &pi.members, &other_members);
     let colliding_values = clash(|pi| &pi.values, &other_values);
+    // A name some `import Q::n;` / `export Q::n;` spells out keeps its
+    // declared name: the import and export checks look it up by that name.
+    let mut explicit_named: HashSet<String> = HashSet::default();
+    for pi in pkgs.values() {
+        explicit_named.extend(pi.explicit.iter().map(|(_, n)| n.clone()));
+        explicit_named.extend(pi.exports.iter().filter_map(|(_, n)| n.clone()));
+    }
+    for d in descs {
+        let items = match d {
+            Description::Module(m) => &m.items,
+            Description::Interface(m) => &m.items,
+            Description::Program(m) => &m.items,
+            Description::PackageItem(PackageItem::Import(imp)) => {
+                explicit_named.extend(
+                    imp.items
+                        .iter()
+                        .filter_map(|ii| ii.item.as_ref())
+                        .map(|n| n.name.clone()),
+                );
+                continue;
+            }
+            _ => continue,
+        };
+        for it in items {
+            if let ModuleItem::ImportDeclaration(imp) = it {
+                explicit_named.extend(
+                    imp.items
+                        .iter()
+                        .filter_map(|ii| ii.item.as_ref())
+                        .map(|n| n.name.clone()),
+                );
+            }
+        }
+    }
+    let mangled_vars: HashSet<String> = {
+        let mut count: HashMap<&str, u32> = HashMap::default();
+        for pi in pkgs.values() {
+            for n in &pi.vars {
+                *count.entry(n.as_str()).or_default() += 1;
+            }
+        }
+        count
+            .into_iter()
+            .filter(|(n, c)| *c > 1 && !other_values.contains(*n) && !explicit_named.contains(*n))
+            .map(|(n, _)| n.to_string())
+            .collect()
+    };
     // §8.3: a class is a scope of its own; a type name a class declares
     // collides when it is declared anywhere else as well.
     let all_classes = design_classes(descs);
@@ -929,6 +989,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
         colliding,
         colliding_members,
         colliding_values,
+        mangled_vars,
         class_colliding,
         classes,
         class_by_bare,
@@ -1242,6 +1303,71 @@ impl Rw<'_> {
             }
         }
         None
+    }
+
+    /// The renamed storage `pkg::n` of the package variable a bare `n`
+    /// names here, when `n` is one of `mangled_vars` (see `resolve_value`
+    /// for the scope rules; inside its own package it is that package's).
+    fn mangled_var(&self, n: &str) -> Option<String> {
+        if !self.info.mangled_vars.contains(n) {
+            return None;
+        }
+        let declares = |p: &str| self.info.pkgs.get(p).is_some_and(|pi| pi.vars.contains(n));
+        for f in self.frames.iter().rev() {
+            if let Some(p) = &f.pkg {
+                if declares(p) {
+                    return Some(mangle(p, n));
+                }
+                if self
+                    .info
+                    .pkgs
+                    .get(p)
+                    .is_some_and(|pi| pi.values.contains(n))
+                {
+                    return None;
+                }
+            }
+            if f.values.contains(n) || f.inherits {
+                return None;
+            }
+            if let Some(q) = f.explicit.get(n) {
+                return self
+                    .info
+                    .value_owner(q, n, 0)
+                    .filter(|o| declares(o))
+                    .map(|o| mangle(&o, n));
+            }
+            let cands: BTreeSet<String> = f
+                .wild
+                .iter()
+                .filter_map(|q| self.info.value_owner(q, n, 0))
+                .collect();
+            match cands.len() {
+                0 => {}
+                1 => {
+                    return cands
+                        .into_iter()
+                        .next()
+                        .filter(|o| declares(o))
+                        .map(|o| mangle(&o, n));
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// `Q::n` naming a renamed package variable: its storage name.
+    fn mangled_qualified(&self, q: &str, n: &str) -> Option<String> {
+        if !self.info.mangled_vars.contains(n) || !self.is_package(q) {
+            return None;
+        }
+        let o = self.info.value_owner(q, n, 0)?;
+        self.info
+            .pkgs
+            .get(&o)
+            .is_some_and(|pi| pi.vars.contains(n))
+            .then(|| mangle(&o, n))
     }
 
     /// `n` (a bare identifier) rewritten to `pkg::n` when it names a
@@ -1641,6 +1767,14 @@ impl Rw<'_> {
     fn expr(&mut self, e: &mut Expression) {
         match &mut e.kind {
             ExprKind::MemberAccess { expr, member } => {
+                // `Q::v` naming a renamed package variable.
+                if let Some(q) = plain_ident(expr) {
+                    if let Some(m) = self.mangled_qualified(q, &member.name) {
+                        let span = e.span;
+                        *e = ident_expr(m, span);
+                        return;
+                    }
+                }
                 // `C::t` / `Outer::Inner::t` naming a renamed class type.
                 if self.info.class_colliding.contains(&member.name) {
                     if let Some(segs) = scope_chain(expr) {
@@ -1675,6 +1809,25 @@ impl Rw<'_> {
                 self.expr(expr);
             }
             ExprKind::Ident(h) => {
+                // A renamed package variable (see `mangled_vars`), as
+                // `Q::v...` or bare: spell it by its storage name and keep the
+                // selects and member path.
+                if h.root.is_none() && !self.info.mangled_vars.is_empty() {
+                    let qualified = h.path.len() >= 2
+                        && h.path[0].selects.is_empty()
+                        && self.info.mangled_vars.contains(&h.path[1].name.name);
+                    let to = if qualified {
+                        self.mangled_qualified(&h.path[0].name.name, &h.path[1].name.name)
+                    } else {
+                        None
+                    };
+                    if let Some(m) = to {
+                        h.path.remove(0);
+                        h.path[0].name.name = m;
+                    } else if let Some(m) = self.mangled_var(&h.path[0].name.name) {
+                        h.path[0].name.name = m;
+                    }
+                }
                 if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() {
                     let n = &h.path[0].name.name;
                     // A typedef `inline_type` replaces, used as an operand
@@ -2738,6 +2891,13 @@ impl Rw<'_> {
             PackageItem::Data(dd) => {
                 self.dtype(&mut dd.data_type);
                 self.declarators(&mut dd.declarators);
+                if let Some(p) = pkg {
+                    for d in &mut dd.declarators {
+                        if self.info.mangled_vars.contains(&d.name.name) {
+                            d.name.name = mangle(p, &d.name.name);
+                        }
+                    }
+                }
             }
             PackageItem::Class(c) => {
                 if let Some(m) = renamed(&c.name.name) {

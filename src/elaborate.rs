@@ -14052,6 +14052,15 @@ fn validate_expr_idents(
                 if is_builtin_type_keyword(name) || name == "void" {
                     return Ok(());
                 }
+                // §26.3: `pkg::name` is the storage spelling `pkg_scope`
+                // gives a variable several packages declare; it is
+                // registered with the package, after this check runs.
+                if name
+                    .split_once("::")
+                    .is_some_and(|(p, _)| elab.packages.contains(p))
+                {
+                    return Ok(());
+                }
                 if !elab.signals.contains_key(name) && !elab.parameters.contains_key(name) &&
                    !elab.functions.contains_key(name) && !elab.tasks.contains_key(name) &&
                    !elab.dpi_imports.contains_key(name) &&
