@@ -40592,6 +40592,29 @@ fn rewrite_expr_impl(
                 interface_map,
             )),
         },
+        // §11.4.14: a streaming concatenation's operands (and slice size)
+        // name variables like any operand. Cloned verbatim, a renamed block
+        // local (§6.21) inside `{<<{a}}` kept its old name.
+        ExprKind::StreamOp {
+            left_to_right,
+            slice_size,
+            exprs,
+        } => ExprKind::StreamOp {
+            left_to_right: *left_to_right,
+            slice_size: slice_size.as_ref().map(|e| {
+                Box::new(rewrite_expr(
+                    e,
+                    prefix,
+                    port_map,
+                    local_names,
+                    interface_map,
+                ))
+            }),
+            exprs: exprs
+                .iter()
+                .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map))
+                .collect(),
+        },
         other => other.clone(),
     };
     Expression::new(new_kind, expr.span)
