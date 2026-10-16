@@ -40277,6 +40277,25 @@ fn rewrite_expr_impl(
         ExprKind::MemberAccess { expr: base, member } => {
             let rewritten_base =
                 rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
+            // `flatten_pkg_member_refs`: only a package-headed `P::m` folds.
+            let keep = PKG_FLATTEN_ONLY.with(|s| {
+                s.borrow().as_ref().is_some_and(|pkgs| {
+                    !matches!(&rewritten_base.kind, ExprKind::Ident(h)
+                        if h.root.is_none()
+                            && h.path.len() == 1
+                            && h.path[0].selects.is_empty()
+                            && pkgs.contains(&h.path[0].name.name))
+                })
+            });
+            if keep {
+                return Expression::new(
+                    ExprKind::MemberAccess {
+                        expr: Box::new(rewritten_base),
+                        member: member.clone(),
+                    },
+                    expr.span,
+                );
+            }
             if let ExprKind::Ident(mut hier) = rewritten_base.kind {
                 // §25.5.4: `p.b` where `p` rewrote to an interface instance
                 // and `b` is a modport EXPRESSION member — substitute the
@@ -41083,6 +41102,33 @@ pub fn substitute_bare_idents_stmt(
     let empty_locals: std::collections::HashSet<String> = std::collections::HashSet::new();
     let empty_iface: HashMap<String, String> = HashMap::default();
     rewrite_stmt(stmt, "", &port_map, &empty_locals, &empty_iface)
+}
+
+thread_local! {
+    /// Set by `flatten_pkg_member_refs`: the package names whose `P::m`
+    /// member accesses fold to `Ident([P, m])`; every other member access
+    /// is left as it is.
+    static PKG_FLATTEN_ONLY: std::cell::RefCell<Option<std::collections::HashSet<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// §26.3: spell every `P::m` (P a package) in a subroutine body the way the
+/// process bodies get it from the inliner — `Ident([P, m])` rather than a
+/// `MemberAccess` on the package name. Module tasks and functions are not
+/// inlined, so their package references kept the member-access shape that
+/// the collection paths (`P::q.push_back`, `P::d = new[n]`, `P::aa[k].x`)
+/// do not resolve. Nothing else in the body changes.
+pub fn flatten_pkg_member_refs(
+    stmt: &Statement,
+    pkgs: &std::collections::HashSet<String>,
+) -> Statement {
+    PKG_FLATTEN_ONLY.with(|s| *s.borrow_mut() = Some(pkgs.clone()));
+    let empty_map: HashMap<String, Expression> = HashMap::default();
+    let empty_locals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let empty_iface: HashMap<String, String> = HashMap::default();
+    let out = rewrite_stmt(stmt, "", &empty_map, &empty_locals, &empty_iface);
+    PKG_FLATTEN_ONLY.with(|s| *s.borrow_mut() = None);
+    out
 }
 
 pub fn rename_process_shadowed_locals(
