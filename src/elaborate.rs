@@ -3266,6 +3266,12 @@ pub struct ElaboratedModule {
     /// unrelated enum (UVM's report summary showed `UVM_NORADIX` where a
     /// severity belonged).
     pub assoc_key_type_names: HashMap<String, String>,
+    /// §7.8: for an associative array of associative arrays
+    /// (`int m[int][string]`), whether each INNER level is string-keyed, in
+    /// declaration order after the first dimension. A multi-variable
+    /// `foreach` binds those index variables with the key type.
+    #[serde(default)]
+    pub assoc_inner_string_keys: HashMap<String, Vec<bool>>,
     /// N-dimensional unpacked array shapes (N >= 3): name → Vec of (lo, hi) per dim.
     pub arrays_nd: HashMap<String, (Vec<(i64, i64)>, u32)>,
     /// Parameter init expressions that couldn't be evaluated at elaboration time
@@ -3719,6 +3725,7 @@ impl ElaboratedModule {
             property_params: HashMap::default(),
             array_elem_class: HashMap::default(),
             assoc_key_type_names: HashMap::default(),
+            assoc_inner_string_keys: HashMap::default(),
             arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
             nets: HashSet::default(),
@@ -8281,6 +8288,10 @@ pub fn elaborate_module_with_defs(
                         });
                         elab.associative_arrays
                             .insert(decl.name.name.clone(), is_string_key);
+                        if let Some(lv) = assoc_inner_string_levels(&effective_dims) {
+                            elab.assoc_inner_string_keys
+                                .insert(decl.name.name.clone(), lv);
+                        }
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
                         }
@@ -15343,6 +15354,10 @@ fn elaborate_items_numbered(
                         });
                         elab.associative_arrays
                             .insert(decl.name.name.clone(), is_string_key);
+                        if let Some(lv) = assoc_inner_string_levels(&decl.dimensions) {
+                            elab.assoc_inner_string_keys
+                                .insert(decl.name.name.clone(), lv);
+                        }
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
                         }
@@ -18125,6 +18140,31 @@ pub fn resolve_typedef_chain<'a>(
         }
     }
     cur
+}
+
+/// §7.8: the inner-level string-key flags of an associative array of
+/// associative arrays (see `assoc_inner_string_keys`); `None` when `dims`
+/// has no associative dimension after the first.
+pub fn assoc_inner_string_levels(dims: &[UnpackedDimension]) -> Option<Vec<bool>> {
+    let inner = dims.get(1..)?;
+    if !inner
+        .iter()
+        .any(|d| matches!(d, UnpackedDimension::Associative { .. }))
+    {
+        return None;
+    }
+    Some(
+        inner
+            .iter()
+            .map(|d| {
+                matches!(
+                    d,
+                    UnpackedDimension::Associative { data_type: Some(dt), .. }
+                        if matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. })
+                )
+            })
+            .collect(),
+    )
 }
 
 /// §7.8.2: what the runtime needs about an associative array's KEY type —
@@ -26979,6 +27019,10 @@ fn inline_instantiations_inner(
                                             scope: String::new(),
                                         });
                                     }
+                                    if let Some(lv) = assoc_inner_string_levels(&decl.dimensions) {
+                                        elab.assoc_inner_string_keys
+                                            .insert(decl.name.name.clone(), lv);
+                                    }
                                     continue;
                                 }
                                 // §7.4.2/§7.4.5: a fixed MULTI-dimensional
@@ -34074,6 +34118,12 @@ fn inline_module_items(
                                             )
                                         });
                                         elab.associative_arrays.insert(sig_name.clone(), is_str);
+                                        if let Some(lv) =
+                                            assoc_inner_string_levels(&effective_decl_dims)
+                                        {
+                                            elab.assoc_inner_string_keys
+                                                .insert(sig_name.clone(), lv);
+                                        }
                                         // §10.7: the element width, under the SCOPED name — the runtime
                                         // looks it up by resolved signal name, and a bare leaf would
                                         // collide with a same-named array in another module.
