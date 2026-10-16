@@ -780,6 +780,45 @@ enum ClassLookup {
 /// Rename colliding package type names to `pkg::name` and rewrite their
 /// references (see the module docs). Errors when a type reference is made
 /// ambiguous by two wildcard imports.
+/// §6.21: a subroutine of a module, interface, program or package declared
+/// `automatic` is automatic unless it says otherwise. Record that on the
+/// subroutine itself, so a later stage telling a static subroutine (whose
+/// variables keep their values between calls) from an automatic one needs
+/// only the subroutine's own lifetime.
+pub fn stamp_automatic_subroutines(descs: &mut [Description]) {
+    use crate::ast::types::Lifetime;
+    fn stamp(l: &mut Option<Lifetime>) {
+        if l.is_none() {
+            *l = Some(Lifetime::Automatic);
+        }
+    }
+    for d in descs.iter_mut() {
+        let items = match d {
+            Description::Module(m) if m.lifetime == Some(Lifetime::Automatic) => &mut m.items,
+            Description::Interface(m) if m.lifetime == Some(Lifetime::Automatic) => &mut m.items,
+            Description::Program(m) if m.lifetime == Some(Lifetime::Automatic) => &mut m.items,
+            Description::Package(p) if p.lifetime == Some(Lifetime::Automatic) => {
+                for it in p.items.iter_mut() {
+                    match it {
+                        PackageItem::Function(fd) => stamp(&mut fd.lifetime),
+                        PackageItem::Task(td) => stamp(&mut td.lifetime),
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        for it in items.iter_mut() {
+            match it {
+                ModuleItem::FunctionDeclaration(fd) => stamp(&mut fd.lifetime),
+                ModuleItem::TaskDeclaration(td) => stamp(&mut td.lifetime),
+                _ => {}
+            }
+        }
+    }
+}
+
 pub fn qualify_colliding_package_types(descs: &mut [Description]) -> Result<(), String> {
     QUALIFIED_MEMBERS.with(|m| m.borrow_mut().clear());
 

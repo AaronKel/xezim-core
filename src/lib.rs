@@ -1592,6 +1592,7 @@ fn parse_and_elaborate(
     // module) gets its package-qualified spelling before anything keys the
     // flat per-design type tables by it (#300).
     pkg_scope::qualify_colliding_package_types(&mut all_descriptions)?;
+    pkg_scope::stamp_automatic_subroutines(&mut all_descriptions);
     let cli = module_timescale_cli();
     // `-override_timescale`: one timescale for everything, in seconds.
     let forced_secs: Option<(f64, f64)> = cli
