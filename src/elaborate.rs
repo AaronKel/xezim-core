@@ -23107,6 +23107,61 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
                 }
                 _ => mdecl,
             };
+            // §7.2.1: a DYNAMIC member (`int d[]`, `int q[$]`, `int a[key]`)
+            // is its own collection object under `var.member`, registered as
+            // the module-scope declaration path does. Here a queue was taken
+            // for a fixed 64-element array (`size()` read 65) and an
+            // associative member was never registered (`num()` read 0).
+            // `m[N]` with `N` a constant parses as an associative dimension
+            // keyed by the type `N`; classify the normalized dimensions.
+            let mdims =
+                normalize_unpacked_dims(&mdecl.dimensions, &elab.parameters, &elab.typedef_types);
+            match mdims.first() {
+                Some(UnpackedDimension::Associative { data_type: kdt, .. }) => {
+                    let is_str = kdt.as_ref().is_some_and(|dt| {
+                        matches!(
+                            dt.as_ref(),
+                            DataType::Simple {
+                                kind: SimpleType::String,
+                                ..
+                            }
+                        )
+                    });
+                    elab.associative_arrays
+                        .entry(mbase.clone())
+                        .or_insert(is_str);
+                    if let Some(lv) = assoc_inner_string_levels(&mdims) {
+                        elab.assoc_inner_string_keys.insert(mbase.clone(), lv);
+                    }
+                    elab.var_decl_types
+                        .insert(mbase.clone(), member.data_type.clone());
+                    continue;
+                }
+                Some(d @ (UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. })) => {
+                    let w = resolve_type_width(
+                        &member.data_type,
+                        Some(&elab.parameters),
+                        Some(&elab.typedefs),
+                    )
+                    .max(1);
+                    elab.dynamic_arrays.insert(mbase.clone());
+                    if let UnpackedDimension::Queue { max_size, .. } = d {
+                        elab.queue_vars.insert(mbase.clone());
+                        if let Some(n) = max_size
+                            .as_ref()
+                            .and_then(|ms| const_eval_i64_with_params(ms, Some(&elab.parameters)))
+                            .filter(|n| *n >= 0)
+                        {
+                            elab.queue_max_sizes.insert(mbase.clone(), (n + 1) as u32);
+                        }
+                    }
+                    elab.arrays.entry(mbase.clone()).or_insert((0, 63, w));
+                    elab.var_decl_types
+                        .insert(mbase.clone(), member.data_type.clone());
+                    continue;
+                }
+                _ => {}
+            }
             if mdecl.dimensions.is_empty() {
                 register_member_leaf(elab, &mbase, &member.data_type);
             } else {
