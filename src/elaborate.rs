@@ -13852,8 +13852,12 @@ fn validate_stmt_idents(
                 match fi {
                     ForInit::VarDecl { name, init: e, .. } => {
                         validate_expr_idents(e, elab, locals)?;
-                        locals.insert(name.name.clone());
-                        for_locals.push(name.name.clone());
+                        // §12.7.1/§12.7.3: a loop variable shadows a
+                        // same-named local only inside the loop; the local
+                        // stays declared after it.
+                        if locals.insert(name.name.clone()) {
+                            for_locals.push(name.name.clone());
+                        }
                     }
                     ForInit::Assign { lvalue, rvalue } => {
                         validate_expr_idents(lvalue, elab, locals)?;
@@ -13876,8 +13880,9 @@ fn validate_stmt_idents(
             validate_expr_idents(array, elab, locals)?;
             let mut foreach_locals = Vec::new();
             for id in vars.iter().flatten() {
-                locals.insert(id.name.clone());
-                foreach_locals.push(id.name.clone());
+                if locals.insert(id.name.clone()) {
+                    foreach_locals.push(id.name.clone());
+                }
             }
             validate_stmt_idents(body, elab, locals)?;
             for n in foreach_locals {
