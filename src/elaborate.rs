@@ -25450,6 +25450,48 @@ fn collect_design_declared_names(
 /// Names a statement itself declares — block-local variables, for/foreach
 /// loop variables, named blocks. Flow-insensitive: a name declared anywhere
 /// in the body counts everywhere in it.
+/// The labels of the named blocks (sequential and parallel) in `stmt`.
+fn collect_block_labels<S: std::hash::BuildHasher>(
+    stmt: &Statement,
+    out: &mut std::collections::HashSet<String, S>,
+) {
+    use crate::ast::stmt::StatementKind as K;
+    match &stmt.kind {
+        K::SeqBlock { name, stmts } | K::ParBlock { name, stmts, .. } => {
+            if let Some(n) = name {
+                out.insert(n.name.clone());
+            }
+            for st in stmts {
+                collect_block_labels(st, out);
+            }
+        }
+        K::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            collect_block_labels(then_stmt, out);
+            if let Some(e) = else_stmt {
+                collect_block_labels(e, out);
+            }
+        }
+        K::Case { items, .. } => {
+            for it in items {
+                collect_block_labels(&it.stmt, out);
+            }
+        }
+        K::For { body, .. }
+        | K::Foreach { body, .. }
+        | K::While { body, .. }
+        | K::DoWhile { body, .. }
+        | K::Repeat { body, .. }
+        | K::Forever { body }
+        | K::TimingControl { stmt: body, .. }
+        | K::Wait { stmt: body, .. } => collect_block_labels(body, out),
+        _ => {}
+    }
+}
+
 fn collect_stmt_declared_names(stmt: &Statement, out: &mut HashSet<String>) {
     use crate::ast::stmt::StatementKind as K;
     match &stmt.kind {
@@ -26134,6 +26176,22 @@ fn validate_inlined_bodies(
     outside_classes.extend(leaves);
     let known = known;
 
+    // §23.6: a named block of any process is a scope the module's other
+    // processes may name (`blk.v`).
+    let mut block_labels: HashSet<String> = HashSet::default();
+    for p in &elab.pending_always {
+        collect_block_labels(&p.source, &mut block_labels);
+    }
+    for p in &elab.pending_initial {
+        collect_block_labels(&p.source, &mut block_labels);
+    }
+    let known: HashSet<String> = if block_labels.is_empty() {
+        known
+    } else {
+        let mut k = known;
+        k.extend(block_labels);
+        k
+    };
     // One check per distinct source body: sibling instances share the Rc.
     let mut seen: HashSet<usize> = HashSet::default();
     let mut first: Option<(String, Span, String)> = None;
@@ -29886,6 +29944,11 @@ fn prepare_module_items(
             ModuleItem::TaskDeclaration(td) => {
                 local_names.insert(td.name.name.name.clone());
             }
+            // §23.6: a named block of a process is a scope of this module:
+            // `blk.v` names the block's variable in THIS instance, so it takes
+            // the instance prefix like a child instance's name.
+            ModuleItem::AlwaysConstruct(ac) => collect_block_labels(&ac.stmt, &mut local_names),
+            ModuleItem::InitialConstruct(ic) => collect_block_labels(&ic.stmt, &mut local_names),
             // Named properties / sequences are registered per instance.
             ModuleItem::PropertyDeclaration(pd) => {
                 local_names.insert(pd.name.name.clone());
