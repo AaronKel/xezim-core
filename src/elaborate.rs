@@ -2291,10 +2291,9 @@ fn elaborate_class_in_scope(
                         // the member becomes a fixed array of SCALARS and the
                         // element collections get no storage at all. Claim the
                         // shape here, before either.
-                        let coll_elem_kind = match effective_dims.last() {
-                            Some(UnpackedDimension::Queue { max_size, .. })
-                                if effective_dims.len() >= 2 =>
-                            {
+                        let coll_split = coll_elem_split(&effective_dims);
+                        let coll_elem_kind = match coll_split.map(|k| &effective_dims[k]) {
+                            Some(UnpackedDimension::Queue { max_size, .. }) => {
                                 Some(CollDimKind::Queue(
                                     max_size
                                         .as_ref()
@@ -2304,12 +2303,8 @@ fn elaborate_class_in_scope(
                                         .map(|n| (n + 1).max(1) as u32),
                                 ))
                             }
-                            Some(UnpackedDimension::Unsized(_)) if effective_dims.len() >= 2 => {
-                                Some(CollDimKind::Dyn)
-                            }
-                            Some(UnpackedDimension::Associative { data_type: kdt, .. })
-                                if effective_dims.len() >= 2 =>
-                            {
+                            Some(UnpackedDimension::Unsized(_)) => Some(CollDimKind::Dyn),
+                            Some(UnpackedDimension::Associative { data_type: kdt, .. }) => {
                                 Some(CollDimKind::Assoc {
                                     string_key: kdt.as_ref().is_some_and(|dt| {
                                         matches!(
@@ -2326,7 +2321,7 @@ fn elaborate_class_in_scope(
                         };
                         let outer_shape: Option<Vec<(i64, i64)>> =
                             coll_elem_kind.as_ref().and_then(|_| {
-                                effective_dims[..effective_dims.len() - 1]
+                                effective_dims[..coll_split.unwrap_or(0)]
                                     .iter()
                                     .map(|dm| match dm {
                                         UnpackedDimension::Range { left, right, .. } => match (
@@ -8395,15 +8390,15 @@ pub fn elaborate_module_with_defs(
                     // `q[i]` was a plain scalar.
                     // A leading dynamic dim is fine too (`int qq[$][$]`): its
                     // backing buffer gives the outer shape.
-                    if effective_dims.len() >= 2 {
-                        if let Some(qd) = effective_dims.last() {
+                    if let Some(split) = coll_elem_split(&effective_dims) {
+                        if let Some(qd) = effective_dims.get(split) {
                             if matches!(
                                 qd,
                                 UnpackedDimension::Unsized(_)
                                     | UnpackedDimension::Queue { .. }
                                     | UnpackedDimension::Associative { .. }
                             ) {
-                                let outer = &effective_dims[..effective_dims.len() - 1];
+                                let outer = &effective_dims[..split];
                                 let shape: Option<Vec<(i64, i64)>> = outer
                                     .iter()
                                     .map(|d| {
@@ -15406,14 +15401,15 @@ fn elaborate_items_numbered(
                             &elab.parameters,
                             &elab.typedef_types,
                         );
-                        if let Some(qd) = eff_dims.last() {
+                        let split = coll_elem_split(&eff_dims).unwrap_or(eff_dims.len());
+                        if let Some(qd) = eff_dims.get(split) {
                             if matches!(
                                 qd,
                                 UnpackedDimension::Unsized(_)
                                     | UnpackedDimension::Queue { .. }
                                     | UnpackedDimension::Associative { .. }
                             ) {
-                                let outer = &eff_dims[..eff_dims.len() - 1];
+                                let outer = &eff_dims[..split];
                                 let shape: Option<Vec<(i64, i64)>> = outer
                                     .iter()
                                     .map(|d| {
@@ -18130,6 +18126,35 @@ fn rewrite_stmt_delays(stmt: &mut Statement, unit_s: f64, prec_s: f64, tick_s: f
 /// several aliases (black-parrot's CCE types) loses its layout. Follow the chain
 /// until a non-`TypeReference` (or an unresolved name) is hit; a small iteration
 /// guard prevents looping on recursive typedefs (caught separately at decl time).
+/// IEEE 1800-2023 §7.4.5 / §7.8: the dimension at which an unpacked array's
+/// ELEMENT becomes a collection of its own, after one or more leading
+/// dimensions: the innermost one (`int q[3][$]`, `int a[2][k_t]`), or the
+/// FIRST associative one when more dimensions follow it (`int
+/// v[2][string][string]`, `int d[][string][string]`: every `v[i]` is an
+/// associative array of associative arrays). Requiring the innermost
+/// dimension to be the only collection left `v[0]` unregistered, so
+/// `v[0]["A"]["B"] = 7` was lost.
+pub fn coll_elem_split(dims: &[UnpackedDimension]) -> Option<usize> {
+    if dims.len() < 2 {
+        return None;
+    }
+    if let Some(k) = dims
+        .iter()
+        .position(|d| matches!(d, UnpackedDimension::Associative { .. }))
+        && k >= 1
+        && k + 1 < dims.len()
+    {
+        return Some(k);
+    }
+    matches!(
+        dims[dims.len() - 1],
+        UnpackedDimension::Unsized(_)
+            | UnpackedDimension::Queue { .. }
+            | UnpackedDimension::Associative { .. }
+    )
+    .then_some(dims.len() - 1)
+}
+
 pub fn resolve_typedef_chain<'a>(
     dt: &'a DataType,
     typedef_types: &'a HashMap<String, DataType>,
@@ -34286,16 +34311,15 @@ fn inline_module_items(
                                 // fixed array element, and `q[i].push_back(x)`
                                 // inside an instance was a silent no-op
                                 // (`q[i].size()` read 0 forever).
-                                if effective_decl_dims.len() >= 2 {
-                                    if let Some(qd) = effective_decl_dims.last() {
+                                if let Some(split) = coll_elem_split(&effective_decl_dims) {
+                                    if let Some(qd) = effective_decl_dims.get(split) {
                                         if matches!(
                                             qd,
                                             UnpackedDimension::Unsized(_)
                                                 | UnpackedDimension::Queue { .. }
                                                 | UnpackedDimension::Associative { .. }
                                         ) {
-                                            let outer = &effective_decl_dims
-                                                [..effective_decl_dims.len() - 1];
+                                            let outer = &effective_decl_dims[..split];
                                             let shape: Option<Vec<(i64, i64)>> = outer
                                                 .iter()
                                                 .map(|d| {
