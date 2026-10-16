@@ -1400,6 +1400,24 @@ impl Value {
         }
     }
 
+    /// IEEE 1800-2023 §20.5: `$rtoi(r)`, a signed 32-bit `integer` holding `r`
+    /// truncated toward zero. The truncated value is taken as a 64-bit
+    /// integer whose low 32 bits are the result; a value outside the 64-bit
+    /// signed range (or a NaN or infinity) has no such integer and yields 0,
+    /// as the reference simulator does (`$rtoi(1.0e19)` is 0). Saturating it
+    /// gave -1.
+    pub fn rtoi(f: f64) -> Value {
+        let t = f.trunc();
+        let i = if (-9.223_372_036_854_775_808e18..9.223_372_036_854_775_808e18).contains(&t) {
+            t as i64
+        } else {
+            0
+        };
+        let mut v = Value::from_u64(i as u64, 32);
+        v.is_signed = true;
+        v
+    }
+
     /// Build an X/Z-free value from little-endian two-state words; bits of
     /// `v` above `width` are dropped.
     pub fn from_words(v: &[u64], width: u32) -> Value {

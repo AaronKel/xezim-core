@@ -24003,7 +24003,7 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             match name.as_str() {
                 // $rtoi TRUNCATES toward zero (unlike an assignment to int,
                 // which rounds).
-                "$rtoi" => Value::from_u64((f.trunc() as i64) as u64, 32),
+                "$rtoi" => Value::rtoi(f),
                 "$itor" => Value::from_f64(f),
                 "$ceil" => Value::from_f64(f.ceil()),
                 "$floor" => Value::from_f64(f.floor()),
