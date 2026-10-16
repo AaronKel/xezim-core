@@ -1203,6 +1203,13 @@ pub struct ElaboratedClass {
     /// resolved to nothing and `q[i].size()` stayed 0 forever.
     #[serde(default)]
     pub array_of_coll_properties: HashMap<String, (Vec<(i64, i64)>, u32, CollDimKind)>,
+    /// §7.4.2 / §20.7: the DECLARED `(left, right)` bounds of every unpacked
+    /// dimension of a fixed-size array member with at least one descending
+    /// dimension (`int ds[3:1]`). `array_properties` / `array_nd_properties`
+    /// normalize to `(lo, hi)`, which loses the direction an assignment
+    /// pattern, `%p`, `foreach` and `$left`/`$right` follow.
+    #[serde(default)]
+    pub array_prop_decl_dims: HashMap<String, Vec<(i64, i64)>>,
 }
 
 /// The kind of COLLECTION that sits at the innermost dimension of an
@@ -1958,6 +1965,7 @@ fn elaborate_class_in_scope(
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
     let mut array_of_coll_properties: HashMap<String, (Vec<(i64, i64)>, u32, CollDimKind)> =
         HashMap::default();
+    let mut array_prop_decl_dims: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
     let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
     let mut static_assoc_key_types: HashMap<String, String> = HashMap::default();
@@ -2406,6 +2414,32 @@ fn elaborate_class_in_scope(
                             } else {
                                 None
                             };
+                            // §7.4.2: keep the declared direction of a
+                            // descending dimension (see `array_prop_decl_dims`).
+                            let decl_dims: Option<Vec<(i64, i64)>> = effective_dims
+                                .iter()
+                                .map(|dm| match dm {
+                                    UnpackedDimension::Range { left, right, .. } => {
+                                        match (
+                                            const_eval_i64_with_params(left, unpacked_params),
+                                            const_eval_i64_with_params(right, unpacked_params),
+                                        ) {
+                                            (Some(l), Some(r)) => Some((l, r)),
+                                            _ => None,
+                                        }
+                                    }
+                                    UnpackedDimension::Expression { expr, .. } => {
+                                        match const_eval_i64_with_params(expr, unpacked_params) {
+                                            Some(n) if n > 0 => Some((0, n - 1)),
+                                            _ => None,
+                                        }
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            if let Some(dd) = decl_dims.filter(|d| d.iter().any(|&(l, r)| l > r)) {
+                                array_prop_decl_dims.insert(decl.name.name.clone(), dd);
+                            }
                             if let Some(shape) = nd_shape {
                                 array_nd_properties
                                     .insert(decl.name.name.clone(), (shape, width.max(1)));
@@ -2866,6 +2900,7 @@ fn elaborate_class_in_scope(
         param_sized_props,
         array_nd_properties,
         array_of_coll_properties,
+        array_prop_decl_dims,
     }
 }
 
