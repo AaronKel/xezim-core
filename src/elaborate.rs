@@ -6826,6 +6826,15 @@ pub fn elaborate_module_with_defs(
 
                 if is_real {
                     val = Value::from_f64(val.to_f64());
+                } else if val.is_real
+                    && width > 0
+                    && !matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+                    && !is_string_data_type(data_type)
+                {
+                    // §6.12.2: a real value of an INTEGRAL parameter converts
+                    // to its type (see the module-body twin).
+                    val = real_to_integral(val.to_f64(), width);
+                    val.is_signed = is_type_signed_resolved(data_type, &elab.typedef_types);
                 } else if !val.is_real && is_type_two_state_resolved(data_type, &elab.typedef_types)
                 {
                     // §6.11.1/§10.7: a 2-state parameter type holds no X/Z.
@@ -10219,6 +10228,12 @@ pub fn elaborate_module_with_defs(
                         if current_is_real {
                             val = Value::from_f64(val.to_f64());
                         } else {
+                            // §6.12.2: a real value of an INTEGRAL parameter
+                            // converts to its type (a 64-bit one stayed real:
+                            // `localparam longint P = 2.0**64` read 1.8e19).
+                            if val.is_real && !is_string_data_type(data_type) {
+                                val = real_to_integral(val.to_f64(), current_width);
+                            }
                             // §10.7: the parameter's declared type governs the
                             // stored value — force its signedness (so a signed
                             // source in an UNSIGNED param reads unsigned, e.g.
@@ -22288,12 +22303,7 @@ fn param_integral_target(
 /// §6.12.2: a real converted to an integral type rounds to the nearest
 /// integer, ties away from zero, and then wraps to the target width.
 fn real_to_integral(f: f64, w: u32) -> Value {
-    if !f.is_finite() {
-        return Value::zero(w);
-    }
-    let mut v = Value::from_u64(f.round() as i64 as u64, 64);
-    v.is_signed = true;
-    v.resize(w)
+    Value::from_real_wrapped(f, w)
 }
 
 /// §6.20.2 / §10.7 / §23.10.2: the value a parameter of integral type

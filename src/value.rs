@@ -1418,6 +1418,61 @@ impl Value {
         v
     }
 
+    /// IEEE 1800-2023 §6.12.2: a real converted to an integral type of
+    /// `width` bits. It rounds to the nearest integer, ties away from zero,
+    /// and that integer lands in the target like any integral value: its
+    /// two's-complement bits wrap modulo 2^width (a real 2^64 in a `longint`
+    /// is 0), and a target wider than 64 bits keeps every bit (`1.0e30` or
+    /// `-(2.0**100)` in a `bit [127:0]`). No real saturates: it is a 53-bit
+    /// integer times a power of two. A NaN or infinity converts to 0.
+    #[inline]
+    pub fn from_real_wrapped(f: f64, width: u32) -> Value {
+        let width = width.max(1);
+        if !f.is_finite() {
+            return Value::zero(width);
+        }
+        // `f64::round` is already ties-away-from-zero.
+        let r = f.round();
+        if width <= 64 && r.abs() < 9.223_372_036_854_775_808e18 {
+            return Value::from_u64(r as i64 as u64, width);
+        }
+        Self::from_real_wrapped_wide(r, width)
+    }
+
+    /// `from_real_wrapped` of a rounded `r` that does not fit an i64 or a
+    /// target wider than 64 bits: its two's-complement bits, word by word.
+    #[inline(never)]
+    fn from_real_wrapped_wide(r: f64, width: u32) -> Value {
+        let nwords = width.div_ceil(64) as usize;
+        let mut words = vec![0u64; nwords];
+        if r != 0.0 {
+            // |r| = mant * 2^exp exactly (|r| >= 1, so `exp >= -52`).
+            let bits = r.abs().to_bits();
+            let exp = ((bits >> 52) & 0x7ff) as i64 - 1075;
+            let mant = (bits & ((1u64 << 52) - 1)) | (1u64 << 52);
+            if exp < 0 {
+                words[0] = mant >> (-exp);
+            } else {
+                let (wi, sh) = ((exp / 64) as usize, (exp % 64) as u32);
+                if wi < nwords {
+                    words[wi] = mant << sh;
+                }
+                if sh > 0 && wi + 1 < nwords {
+                    words[wi + 1] = mant >> (64 - sh);
+                }
+            }
+            if r < 0.0 {
+                let mut carry = true;
+                for w in words.iter_mut() {
+                    let (v, c) = (!*w).overflowing_add(carry as u64);
+                    *w = v;
+                    carry = c;
+                }
+            }
+        }
+        Value::from_words(&words, width)
+    }
+
     /// Build an X/Z-free value from little-endian two-state words; bits of
     /// `v` above `width` are dropped.
     pub fn from_words(v: &[u64], width: u32) -> Value {
@@ -1920,11 +1975,10 @@ impl Value {
             // ties away from zero). Cast via i64 so a negative real keeps its
             // two's-complement low bits — a direct `as u64` saturates any
             // negative value to 0 (§10.7 real→integral, e.g. -7.0 -> 4'd9).
-            let f = self.to_f64();
-            if !f.is_finite() {
-                return Value::zero(target);
-            }
-            return Value::from_u64(f.round() as i64 as u64, target);
+            // §6.12.2: the rounded integer wraps to the target width, and a
+            // target wider than 64 bits keeps every bit (an i64 cast
+            // saturated `-(2.0**100)` in a `bit [127:0]`).
+            return Value::from_real_wrapped(self.to_f64(), target);
         }
         if target == self.width {
             return self.clone();
