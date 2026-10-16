@@ -5433,14 +5433,40 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     }
     // §6.18/§7.4: record any unpacked dimensions on the typedef
     // (`typedef logic [7:0] A [0:3];`) so a variable `A v;` inherits them.
-    if !td.dimensions.is_empty() {
+    // §6.18/§7.4.5: an alias of a dimensioned typedef (`typedef A B;`,
+    // `typedef A C [2];`) carries the base's unpacked dimensions after its
+    // own, and its element type is the base's element type. Recording only
+    // the alias's own dimensions made `B v;` a scalar of the element width.
+    let base_dims = match &td.data_type {
+        DataType::TypeReference {
+            name, dimensions, ..
+        } if dimensions.is_empty() && name.qualified() != td.name.name => {
+            lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                .cloned()
+                .map(|d| (d, lookup_scoped_type(name, &elab.typedef_types).cloned()))
+        }
+        _ => None,
+    };
+    if let Some((bd, elem)) = base_dims {
+        let mut dims = td.dimensions.clone();
+        dims.extend(bd);
+        elab.typedef_unpacked_dims
+            .insert(td.name.name.clone(), dims);
+        if let Some(elem) = elem {
+            elab.typedef_types.insert(td.name.name.clone(), elem);
+        }
+    } else if !td.dimensions.is_empty() {
         elab.typedef_unpacked_dims
             .insert(td.name.name.clone(), td.dimensions.clone());
     }
     // §20.6.2/§20.7: const-eval sizes `$bits(arr_t)` / `$dimensions(v)` from
     // the full definition, not just the element width.
     if let Some(dt) = elab.typedef_types.get(&td.name.name) {
-        tls_register_typedef_shape(&td.name.name, dt, &td.dimensions);
+        let dims = elab
+            .typedef_unpacked_dims
+            .get(&td.name.name)
+            .unwrap_or(&td.dimensions);
+        tls_register_typedef_shape(&td.name.name, dt, dims);
     }
     // Refresh the thread-local typedef snapshot so any subsequent
     // const-eval `$bits(typedef_name)` call sees this typedef (M2).
