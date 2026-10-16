@@ -3779,7 +3779,14 @@ impl ElaboratedModule {
             // Same unpacked-array expansion the eager drain does; this is the
             // path the bytecode compiler takes, and a sub-module's
             // `assign dst = src;` between arrays reaches only one of the two.
-            match whole_array_assign_parts(&ca.lhs, &ca.rhs, ca.delay, &self.arrays) {
+            match whole_array_assign_parts_dir(
+                &ca.lhs,
+                &ca.rhs,
+                ca.delay,
+                &self.arrays,
+                Some(&self.descending_arrays),
+                Some(&self.unpacked_decl_dims),
+            ) {
                 Some(parts) => {
                     for e in parts {
                         f(e);
@@ -39072,6 +39079,24 @@ pub fn whole_array_assign_parts(
     delay: u64,
     arrays: &HashMap<String, (i64, i64, u32)>,
 ) -> Option<Vec<ContinuousAssignment>> {
+    whole_array_assign_parts_dir(lhs, rhs, delay, arrays, None, None)
+}
+
+/// `whole_array_assign_parts`, knowing each array's declared dimensions:
+/// `descending` names the 1-D arrays declared `[hi:lo]`, and `decl_dims`
+/// gives the declared `(left, right)` of every unpacked dimension. An
+/// assignment pattern's first item goes to the LEFT bound (§10.9, §7.4.6).
+pub fn whole_array_assign_parts_dir(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    arrays: &HashMap<String, (i64, i64, u32)>,
+    descending: Option<&HashSet<String>>,
+    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+) -> Option<Vec<ContinuousAssignment>> {
+    if let ExprKind::AssignmentPattern(_) = &rhs.kind {
+        return pattern_array_assign_parts(lhs, rhs, delay, arrays, descending, decl_dims);
+    }
     let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind) else {
         return None;
     };
@@ -39093,12 +39118,15 @@ pub fn whole_array_assign_parts(
     if n > 4096 {
         return None; // pathological; leave it alone
     }
+    // §7.6: elements pair up left to right, whatever each range's direction.
+    let desc = |nm: &str| descending.is_some_and(|d| d.contains(nm));
+    let (ld, rd) = (desc(ln), desc(rn));
     Some(
         (0..=n)
             .map(|k| ContinuousAssignment {
                 origin: None,
-                lhs: make_index_expr(ln, llo + k),
-                rhs: make_index_expr(rn, rlo + k),
+                lhs: make_index_expr(ln, if ld { lhi - k } else { llo + k }),
+                rhs: make_index_expr(rn, if rd { rhi - k } else { rlo + k }),
                 delay,
                 rhs_parent_scoped: false,
                 delay_fall: None,
@@ -39106,6 +39134,184 @@ pub fn whole_array_assign_parts(
             })
             .collect(),
     )
+}
+
+/// §10.3 / §10.9: `assign arr = '{...};` — a continuous assignment of an
+/// assignment pattern to a whole unpacked array drives each element with
+/// its item: positional (`'{3, 4}`, the first item at the LEFT bound),
+/// replicated (`'{2{x}}`), index-keyed and `default:`, nested one pattern
+/// per dimension (`'{'{1, 2}, '{3, 4}}`). Other shapes (named or typed
+/// keys, an element that is itself an aggregate) are left as they were.
+fn pattern_array_assign_parts(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    arrays: &HashMap<String, (i64, i64, u32)>,
+    descending: Option<&HashSet<String>>,
+    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+) -> Option<Vec<ContinuousAssignment>> {
+    let ExprKind::Ident(lh) = &lhs.kind else {
+        return None;
+    };
+    if lh.path.len() != 1 || !lh.path[0].selects.is_empty() {
+        return None;
+    }
+    let ln = &lh.path[0].name.name;
+    let dims: Vec<(i64, i64)> = match decl_dims.and_then(|d| d.get(ln)) {
+        Some(d) if !d.is_empty() => d.clone(),
+        _ => {
+            let &(lo, hi, _) = arrays.get(ln)?;
+            if descending.is_some_and(|d| d.contains(ln)) {
+                vec![(hi, lo)]
+            } else {
+                vec![(lo, hi)]
+            }
+        }
+    };
+    let total: i64 = dims
+        .iter()
+        .map(|&(l, r)| (l - r).abs() + 1)
+        .try_fold(1i64, |a, n| a.checked_mul(n))?;
+    if total > 4096 {
+        return None;
+    }
+    let mut out: Vec<(Vec<i64>, Expression)> = Vec::new();
+    pattern_leaves(rhs, &dims, &mut Vec::new(), &mut out)?;
+    Some(
+        out.into_iter()
+            .map(|(idx, e)| ContinuousAssignment {
+                origin: None,
+                lhs: make_multi_index_expr(ln, &idx),
+                rhs: e,
+                delay,
+                rhs_parent_scoped: false,
+                delay_fall: None,
+                delay_off: None,
+            })
+            .collect(),
+    )
+}
+
+/// The element assignments of pattern `e` over the dimensions `dims`
+/// (declared `(left, right)`, outermost first), below index prefix `idx`.
+fn pattern_leaves(
+    e: &Expression,
+    dims: &[(i64, i64)],
+    idx: &mut Vec<i64>,
+    out: &mut Vec<(Vec<i64>, Expression)>,
+) -> Option<()> {
+    let Some(&(l, r)) = dims.first() else {
+        if matches!(e.kind, ExprKind::AssignmentPattern(_)) {
+            return None;
+        }
+        out.push((idx.clone(), e.clone()));
+        return Some(());
+    };
+    let ExprKind::AssignmentPattern(items) = &e.kind else {
+        return None;
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let n = ((l - r).abs() + 1) as usize;
+    let index_at = |k: usize| if l > r { l - k as i64 } else { l + k as i64 };
+    let mut elems: Vec<Option<&Expression>> = vec![None; n];
+    let mut flat: Vec<&Expression> = Vec::new();
+    let mut default: Option<&Expression> = None;
+    let ordered = items
+        .iter()
+        .all(|it| matches!(it, AssignmentPatternItem::Ordered(_)));
+    if ordered {
+        if let [AssignmentPatternItem::Ordered(only)] = items.as_slice()
+            && let ExprKind::Replication { count, exprs } = &only.kind
+        {
+            let c = const_eval_i64_with_params(count, None)?;
+            for _ in 0..c.max(0) {
+                flat.extend(exprs.iter());
+            }
+        } else {
+            flat.extend(items.iter().map(|it| it.expr()));
+        }
+        if flat.len() != n {
+            return None;
+        }
+        for (k, x) in flat.into_iter().enumerate() {
+            elems[k] = Some(x);
+        }
+    } else {
+        for it in items {
+            match it {
+                AssignmentPatternItem::Default(x) => default = Some(x),
+                AssignmentPatternItem::Keyed(key, x) => {
+                    let ix = const_eval_i64_with_params(key, None)?;
+                    if ix < l.min(r) || ix > l.max(r) {
+                        return None;
+                    }
+                    elems[(ix - l).unsigned_abs() as usize] = Some(x);
+                }
+                _ => return None,
+            }
+        }
+    }
+    for (k, x) in elems.into_iter().enumerate() {
+        idx.push(index_at(k));
+        match (x, default) {
+            (Some(x), _) => pattern_leaves(x, &dims[1..], idx, out)?,
+            // §10.9.1: `default:` reaches every leaf of a missing element.
+            (None, Some(d)) if !matches!(d.kind, ExprKind::AssignmentPattern(_)) => {
+                default_leaves(d, &dims[1..], idx, out)
+            }
+            (None, Some(d)) => pattern_leaves(d, &dims[1..], idx, out)?,
+            (None, None) => return None,
+        }
+        idx.pop();
+    }
+    Some(())
+}
+
+/// Every leaf below index prefix `idx` takes the `default:` value `d`.
+fn default_leaves(
+    d: &Expression,
+    dims: &[(i64, i64)],
+    idx: &mut Vec<i64>,
+    out: &mut Vec<(Vec<i64>, Expression)>,
+) {
+    let Some(&(l, r)) = dims.first() else {
+        out.push((idx.clone(), d.clone()));
+        return;
+    };
+    for i in l.min(r)..=l.max(r) {
+        idx.push(i);
+        default_leaves(d, &dims[1..], idx, out);
+        idx.pop();
+    }
+}
+
+/// `name[i0][i1]...` with constant indices.
+fn make_multi_index_expr(name: &str, idx: &[i64]) -> Expression {
+    let Some((&first, rest)) = idx.split_first() else {
+        return make_ident_expr(name);
+    };
+    let mut e = make_index_expr(name, first);
+    for &i in rest {
+        e = Expression::new(
+            ExprKind::Index {
+                expr: Box::new(e),
+                index: Box::new(Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: None,
+                        signed: true,
+                        base: crate::ast::expr::NumberBase::Decimal,
+                        value: i.to_string(),
+                        cached_val: std::cell::Cell::new(None),
+                    }),
+                    Span::dummy(),
+                )),
+            },
+            Span::dummy(),
+        );
+    }
+    e
 }
 
 /// Push the expansion of a whole-array continuous assign, returning true when
@@ -39116,7 +39322,14 @@ fn expand_whole_array_assign(
     delay: u64,
     elab: &mut ElaboratedModule,
 ) -> bool {
-    match whole_array_assign_parts(lhs, rhs, delay, &elab.arrays) {
+    match whole_array_assign_parts_dir(
+        lhs,
+        rhs,
+        delay,
+        &elab.arrays,
+        Some(&elab.descending_arrays),
+        Some(&elab.unpacked_decl_dims),
+    ) {
         Some(parts) => {
             elab.continuous_assigns.extend(parts);
             true
