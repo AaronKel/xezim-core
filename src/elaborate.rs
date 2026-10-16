@@ -8245,17 +8245,19 @@ pub fn elaborate_module_with_defs(
                     // dimensions when it declares none of its own (LRM §6.18,
                     // §7.4). For every other declaration this is exactly
                     // `decl.dimensions`, so behavior is unchanged.
-                    let effective_dims: Vec<UnpackedDimension> = if decl.dimensions.is_empty() {
-                        match &dd.data_type {
-                            DataType::TypeReference { name, .. } => elab
-                                .typedef_unpacked_dims
-                                .get(&name.name.name)
-                                .cloned()
-                                .unwrap_or_default(),
-                            _ => Vec::new(),
+                    // §7.4.5: declarator dimensions come before the typedef's.
+                    let effective_dims: Vec<UnpackedDimension> = match &dd.data_type {
+                        DataType::TypeReference {
+                            name, dimensions, ..
+                        } if dimensions.is_empty() => {
+                            let mut d = decl.dimensions.clone();
+                            if let Some(td) = lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                            {
+                                d.extend(td.iter().cloned());
+                            }
+                            d
                         }
-                    } else {
-                        decl.dimensions.clone()
+                        _ => decl.dimensions.clone(),
                     };
                     // `a[N]` (N a parameter) parses as an associative dim keyed by
                     // "type" N; rewrite it back to a fixed size.
@@ -15295,6 +15297,27 @@ fn elaborate_items_numbered(
                 let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                 let is_real = is_type_real(&dd.data_type);
                 for decl in &dd.declarators {
+                    // §6.18, §7.4.5: a variable of a dimensioned typedef takes
+                    // the typedef's unpacked dimensions after its own, as the
+                    // module-scope path does; this (generate-region) path used
+                    // the declarator's alone, so `aa_t m;` was a scalar.
+                    let typed_decl;
+                    let decl = match &dd.data_type {
+                        DataType::TypeReference {
+                            name, dimensions, ..
+                        } if dimensions.is_empty() => {
+                            match lookup_scoped_type(name, &elab.typedef_unpacked_dims) {
+                                Some(td) => {
+                                    let mut d = decl.clone();
+                                    d.dimensions.extend(td.iter().cloned());
+                                    typed_decl = d;
+                                    &typed_decl
+                                }
+                                None => decl,
+                            }
+                        }
+                        _ => decl,
+                    };
                     if elab.signals.contains_key(&decl.name.name)
                         || elab.parameters.contains_key(&decl.name.name)
                     {
@@ -23025,6 +23048,25 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
     for member in &su.members {
         for mdecl in &member.declarators {
             let mbase = format!("{}.{}", base, mdecl.name.name);
+            // §6.18, §7.4.5: a member typed by a dimensioned typedef takes the
+            // typedef's unpacked dimensions after its own.
+            let typed_mdecl;
+            let mdecl = match &member.data_type {
+                DataType::TypeReference {
+                    name, dimensions, ..
+                } if dimensions.is_empty() => {
+                    match lookup_scoped_type(name, &elab.typedef_unpacked_dims) {
+                        Some(td) => {
+                            let mut d = mdecl.clone();
+                            d.dimensions.extend(td.iter().cloned());
+                            typed_mdecl = d;
+                            &typed_mdecl
+                        }
+                        None => mdecl,
+                    }
+                }
+                _ => mdecl,
+            };
             if mdecl.dimensions.is_empty() {
                 register_member_leaf(elab, &mbase, &member.data_type);
             } else {
@@ -26848,14 +26890,19 @@ fn inline_instantiations_inner(
                                 // package arm read `decl.dimensions` alone, so
                                 // the variable was a scalar of the element type.
                                 let typed_decl;
+                                // §7.4.5: dimensions on the declarator come
+                                // before the typedef's (`fa_t v [0:1]` with
+                                // `typedef int fa_t [0:3]` is `int v[0:1][0:3]`).
                                 let decl = match &dd.data_type {
-                                    DataType::TypeReference { name: tn, .. }
-                                        if decl.dimensions.is_empty() =>
-                                    {
+                                    DataType::TypeReference {
+                                        name: tn,
+                                        dimensions: pd,
+                                        ..
+                                    } if pd.is_empty() => {
                                         match lookup_scoped_type(tn, &elab.typedef_unpacked_dims) {
                                             Some(dims) => {
                                                 let mut d = decl.clone();
-                                                d.dimensions = dims.clone();
+                                                d.dimensions.extend(dims.iter().cloned());
                                                 typed_decl = d;
                                                 &typed_decl
                                             }
@@ -26933,6 +26980,69 @@ fn inline_instantiations_inner(
                                         });
                                     }
                                     continue;
+                                }
+                                // §7.4.2/§7.4.5: a fixed MULTI-dimensional
+                                // package array (`int v [0:1][0:3]`, or a
+                                // dimensioned typedef plus declarator dims)
+                                // registers its whole shape, as the
+                                // module-scope path does. Only the first
+                                // dimension was registered, so `v[i][j]` was a
+                                // bit-select and `foreach (v[i, j])` walked bits.
+                                if decl.dimensions.len() >= 2
+                                    && decl.dimensions.iter().all(|d| {
+                                        matches!(
+                                            d,
+                                            UnpackedDimension::Range { .. }
+                                                | UnpackedDimension::Expression { .. }
+                                        )
+                                    })
+                                {
+                                    let shape: Option<Vec<(i64, i64)>> = decl
+                                        .dimensions
+                                        .iter()
+                                        .map(|d| {
+                                            extract_array_range(
+                                                std::slice::from_ref(d),
+                                                &elab.parameters,
+                                            )
+                                        })
+                                        .collect();
+                                    if let Some(shape) = shape {
+                                        let name = decl.name.name.clone();
+                                        if shape.len() == 2 {
+                                            elab.arrays_2d
+                                                .insert(name.clone(), (shape[0], shape[1], width));
+                                        } else {
+                                            elab.arrays_nd.insert(name.clone(), (shape, width));
+                                        }
+                                        if let Some(ud) = declared_unpacked_dims(
+                                            &decl.dimensions,
+                                            &elab.parameters,
+                                        ) {
+                                            elab.unpacked_decl_dims.insert(name.clone(), ud);
+                                        }
+                                        if is_type_two_state_resolved(
+                                            &dd.data_type,
+                                            &elab.typedef_types,
+                                        ) {
+                                            elab.two_state_signals.insert(name.clone());
+                                        }
+                                        elab.var_decl_types
+                                            .insert(name.clone(), dd.data_type.clone());
+                                        if let Some(init_expr) = &decl.init {
+                                            elab.static_init_blocks.push(InitialBlock {
+                                                stmt: Statement::new(
+                                                    StatementKind::BlockingAssign {
+                                                        lvalue: make_ident_expr(&name),
+                                                        rvalue: init_expr.clone(),
+                                                    },
+                                                    Span::dummy(),
+                                                ),
+                                                scope: String::new(),
+                                            });
+                                        }
+                                        continue;
+                                    }
                                 }
                                 // Element reads/writes go through `module.arrays`
                                 // (see the Index eval path), so any unpacked array
@@ -33814,20 +33924,23 @@ fn inline_module_items(
                                 // Without this the child-local variable
                                 // registered as a scalar and the whole-array
                                 // assigns through it carried nothing.
-                                let effective_decl_dims: Vec<UnpackedDimension> = if decl
-                                    .dimensions
-                                    .is_empty()
+                                // §7.4.5: declarator dimensions come before
+                                // the typedef's.
+                                let effective_decl_dims: Vec<UnpackedDimension> = match &dd
+                                    .data_type
                                 {
-                                    match &dd.data_type {
-                                        DataType::TypeReference { name, .. } => {
+                                    DataType::TypeReference {
+                                        name, dimensions, ..
+                                    } if dimensions.is_empty() => {
+                                        let mut d = decl.dimensions.clone();
+                                        if let Some(td) =
                                             lookup_scoped_type(name, &elab.typedef_unpacked_dims)
-                                                .cloned()
-                                                .unwrap_or_default()
+                                        {
+                                            d.extend(td.iter().cloned());
                                         }
-                                        _ => Vec::new(),
+                                        d
                                     }
-                                } else {
-                                    decl.dimensions.clone()
+                                    _ => decl.dimensions.clone(),
                                 };
                                 let effective_decl_dims = normalize_unpacked_dims(
                                     &effective_decl_dims,
