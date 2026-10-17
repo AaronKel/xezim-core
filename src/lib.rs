@@ -161,7 +161,8 @@ pub use value::Value;
 /// \x21 = \x20 + chained TypeName scopes and per-scope type arguments.
 /// \x22 = \x21 + ClassExtends.scopes, and package type names declared in
 /// more than one place renamed to `pkg::name` (§26.3).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x22";
+/// \x23 = \x22 + dynamic-outer associative class property dimensions (§7.4.5).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x23";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

@@ -1200,6 +1200,11 @@ pub struct ElaboratedClass {
     /// resolved to nothing and `q[i].size()` stayed 0 forever.
     #[serde(default)]
     pub array_of_coll_properties: HashMap<String, (Vec<(i64, i64)>, u32, CollDimKind)>,
+    /// §7.4.5/§7.5/§7.8: a dynamic outer dimension whose elements are
+    /// associative arrays. The tail dimensions retain each declared key type;
+    /// each object's rows are registered when new[n] allocates them.
+    #[serde(default)]
+    pub dynamic_assoc_properties: HashMap<String, Vec<UnpackedDimension>>,
     /// §7.4.2 / §20.7: the DECLARED `(left, right)` bounds of every unpacked
     /// dimension of a fixed-size array member with at least one descending
     /// dimension (`int ds[3:1]`). `array_properties` / `array_nd_properties`
@@ -1962,6 +1967,7 @@ fn elaborate_class_in_scope(
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
     let mut array_of_coll_properties: HashMap<String, (Vec<(i64, i64)>, u32, CollDimKind)> =
         HashMap::default();
+    let mut dynamic_assoc_properties: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut array_prop_decl_dims: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
     let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
@@ -2201,6 +2207,15 @@ fn elaborate_class_in_scope(
                         }
                     }
                     if !is_static {
+                        if matches!(effective_dims.first(), Some(UnpackedDimension::Unsized(_)))
+                            && effective_dims.len() > 1
+                            && effective_dims[1..]
+                                .iter()
+                                .all(|d| matches!(d, UnpackedDimension::Associative { .. }))
+                        {
+                            dynamic_assoc_properties
+                                .insert(decl.name.name.clone(), effective_dims[1..].to_vec());
+                        }
                         // §8.25: a fixed array sized by a header VALUE
                         // parameter (`int items[N]`) is a fixed array in every
                         // specialization, just of a different size. Classify
@@ -2892,6 +2907,7 @@ fn elaborate_class_in_scope(
         param_sized_props,
         array_nd_properties,
         array_of_coll_properties,
+        dynamic_assoc_properties,
         array_prop_decl_dims,
     }
 }
@@ -43142,6 +43158,33 @@ mod logged_map_tests {
             assoc_key_type_info(Some(&alias("key_t")), &HashMap::default(), &widths, &types),
             (None, Some("key_t".into())),
         );
+    }
+
+    /// §7.4.5: dynamic rows retain associative key types across artifacts;
+    /// fixed rows and scalar dynamic arrays keep their existing metadata.
+    #[test]
+    fn dynamic_associative_property_metadata_roundtrips() {
+        let parsed = crate::parse(
+            "class holder; int v[][string]; int deep[][string][int]; int fixed_rows[2][string]; int plain[]; endclass",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Class(decl) = &parsed.source.descriptions[0] else {
+            panic!("class expected");
+        };
+        let cd = elaborate_class(decl);
+        assert_eq!(cd.dynamic_assoc_properties.len(), 2);
+        assert_eq!(cd.dynamic_assoc_properties["v"].len(), 1);
+        assert_eq!(cd.dynamic_assoc_properties["deep"].len(), 2);
+        assert!(cd.queue_properties.contains_key("v"));
+        assert!(cd.array_of_coll_properties.contains_key("fixed_rows"));
+        assert!(!cd.assoc_properties.contains_key("v"));
+        let encoded = bincode::serialize(&cd).unwrap();
+        let restored: ElaboratedClass = bincode::deserialize(&encoded).unwrap();
+        assert!(
+            matches!(&restored.dynamic_assoc_properties["v"][0], UnpackedDimension::Associative { data_type: Some(dt), .. }
+            if matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }))
+        );
+        assert_eq!(restored.dynamic_assoc_properties["deep"].len(), 2);
     }
 
     fn tls_snapshot() -> Option<HashMap<String, u32>> {
