@@ -278,18 +278,22 @@ struct Domain {
     elements: Vec<String>,
     power: Option<String>,
     ground: Option<String>,
+    #[expect(dead_code, reason = "retain parsed UPF metadata for model extensions")]
     scope: String,
+    #[expect(dead_code, reason = "retain parsed UPF metadata for model extensions")]
     file: String,
 }
 
 #[derive(Debug, Clone)]
 struct Switch {
     name: String,
+    #[expect(dead_code, reason = "retain parsed UPF metadata for model extensions")]
     domain: Option<String>,
     input: (String, String),
     output: (String, String),
     controls: Vec<(String, String)>,
     on_states: Vec<(String, String, String)>,
+    #[expect(dead_code, reason = "retain parsed UPF metadata for model extensions")]
     off_states: Vec<(String, String)>,
 }
 
@@ -308,6 +312,7 @@ struct Isolation {
 
 #[derive(Debug, Clone)]
 struct Retention {
+    #[expect(dead_code, reason = "retain parsed UPF metadata for model extensions")]
     name: String,
     domain: String,
     elements: Vec<String>,
@@ -853,7 +858,7 @@ impl<'a> Design<'a> {
                     }
             )
         };
-        let mut push = |name: &str, out: &mut Vec<String>| {
+        let push = |name: &str, out: &mut Vec<String>| {
             if !inputs.iter().any(|i| i == name) {
                 let full = format!("{}.{}", prefix, name);
                 if !out.contains(&full) {

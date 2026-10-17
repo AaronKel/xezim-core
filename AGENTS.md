@@ -49,9 +49,9 @@ src/elaborate.rs          Elaborator: AST → flat simulation model. The repo's 
                           Resolves decls, continuous assigns, always blocks, classes, params,
                           port binding; produces ElaboratedModule
 src/value.rs              4-state Value (0/1/X/Z), width + signedness; ≤64-bit inline u64,
-                          wider → Vec<LogicBit>; BitsRef/BitsIter views
-src/packed_value.rs       Packed storage for wide signals (2 bits/bit, 4× less memory) —
-                          the perf workhorse; not yet wired into Value everywhere
+                          wider → owned packed value/XZ planes; BitsRef/BitsIter views
+src/packed_value.rs       Separate packed-bit representation; current Value already
+                          packs wide values into two bit planes
 src/bits2.rs              2-state arbitrary-width value (Verilator-style, no X/Z mask);
                           the compute-core type for the cycle-based path
 src/sdf/                  SDF parser + annotator (IEEE 1497-2001): IOPATH/INTERCONNECT delays
@@ -121,10 +121,10 @@ Keep that surface stable — `xezim` and `xezim-b` both depend on it.
   this is the shared lib — declaring it here covers xezim, xezim-b, and every
   test binary. **Never add another `#[global_allocator]`.** A consumer opting
   out uses `xezim-core = { path = "../xezim-core", default-features = false }`.
-- **Artifact format versioning**: `XEZIM_BYTECODE_MAGIC = b"XEZIMBC\x0c"`
+- **Artifact format versioning**: `XEZIM_BYTECODE_MAGIC = b"XEZIMBC\x22"`
   (`src/lib.rs`). The last byte is the serialized-format version. When you add
   or change a serialized field in `ElaboratedModule` (or any bincode-serialized
-  type), **bump `\x0c` to `\x0d`** and add one line to the version-ladder
+  type), **bump `\x22` to `\x23`** and add one line to the version-ladder
   comment above it, so stale `.xez` artifacts fail with a clear "recompile with
   current xezim" error instead of deserializing garbage.
 - **Artifacts are zstd-compressed bincode.** Default level 3 (overridable via
@@ -133,10 +133,10 @@ Keep that surface stable — `xezim` and `xezim-b` both depend on it.
   (`src/lib.rs`) so the caller's `-l` fd-level redirect works — it captures
   DPI/VPI C output too. Bare `println!`/`eprintln!` bypasses `--log`.
 - **Wide-value storage**: `Value` keeps ≤64-bit values inline (a `u64` value/mask
-  pair, no heap); wider values fall back to `Vec<LogicBit>`. `packed_value.rs`
-  is the memory-lean wide representation (2 bits/bit, 4× smaller) being rolled
-  in for perf — when extending it, keep the 4-state semantics identical to
-  `Value`.
+  pair, no heap); wider values own packed value/XZ planes in `WidePlanes`.
+  `packed_value.rs` retains a separate packed representation; do not assume
+  it reduces current `Value` storage fourfold. Keep all four logic states
+  identical when changing either representation.
 - **`sv-parser` stays parse-only.** No simulation, no elaboration, no value
   model. Prefer a precise error/diagnostic over silently accepting garbage; the
   parser is deliberately permissive on legal-but-rare LRM forms, and

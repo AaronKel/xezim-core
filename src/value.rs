@@ -11,8 +11,7 @@ use std::fmt;
 ///
 /// `#[repr(u8)]` pins the discriminants to the 2-bit codes already used by
 /// `to_code`/`from_code` (Zero=0, One=1, X=2, Z=3). That makes one `LogicBit`
-/// exactly one byte with no padding, which `wide_bits_eq` relies on to compare
-/// `Wide` storage a machine word at a time instead of a byte at a time.
+/// exactly one byte with no padding and keeps packed-bit conversions stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum LogicBit {
@@ -285,58 +284,8 @@ impl WidePlanes {
     }
 }
 
-/// Bit-vector equality for `Wide` storage, a machine word at a time.
-///
-/// `LogicBit` is not one of the primitive types std marks `BytewiseEq`, so the
-/// derived `Vec<LogicBit> == Vec<LogicBit>` lowers to `iter().zip().all()` —
-/// one byte compared per loop iteration, which is what showed up as the
-/// dominant cost of `signal_table[id] != val` change detection on wide buses.
-/// Because `LogicBit` is `#[repr(u8)]` (one byte, no padding, no provenance,
-/// and `==` is exactly byte equality) the two vectors can be compared as raw
-/// bytes, 8 at a time.
-#[inline]
-fn wide_bits_eq(a: &[LogicBit], b: &[LogicBit]) -> bool {
-    const _: () = assert!(std::mem::size_of::<LogicBit>() == 1);
-    let n = a.len();
-    if n != b.len() {
-        return false;
-    }
-    let pa = a.as_ptr().cast::<u8>();
-    let pb = b.as_ptr().cast::<u8>();
-    // SAFETY: `pa`/`pb` are the starts of two live byte ranges of `n` bytes
-    // each (LogicBit is one byte, so len == byte length). Every read below is
-    // an unaligned read fully inside `0..n` of its own range.
-    unsafe {
-        let mut i = 0usize;
-        while i + 8 <= n {
-            if pa.add(i).cast::<u64>().read_unaligned() != pb.add(i).cast::<u64>().read_unaligned()
-            {
-                return false;
-            }
-            i += 8;
-        }
-        if i < n {
-            if n >= 8 {
-                // Overlapping tail word — cheaper than a byte loop.
-                if pa.add(n - 8).cast::<u64>().read_unaligned()
-                    != pb.add(n - 8).cast::<u64>().read_unaligned()
-                {
-                    return false;
-                }
-            } else {
-                while i < n {
-                    if *pa.add(i) != *pb.add(i) {
-                        return false;
-                    }
-                    i += 1;
-                }
-            }
-        }
-    }
-    true
-}
-
 /// Mask selecting bit 0 of every byte of a `u64`.
+#[cfg(test)]
 const LSB_OF_EACH_BYTE: u64 = 0x0101_0101_0101_0101;
 
 /// Scatter the 8 bits of `b` into the low bit of 8 consecutive bytes
@@ -348,6 +297,7 @@ const LSB_OF_EACH_BYTE: u64 = 0x0101_0101_0101_0101;
 /// the `+ 0x7f7f…` / `>> 7` pair normalises "lane is nonzero" to 1 without any
 /// inter-lane carry (the largest lane value is `0x80 + 0x7f = 0xff`).
 #[inline(always)]
+#[cfg(test)]
 fn scatter_bits_to_bytes(b: u8) -> u64 {
     let lanes = (b as u64).wrapping_mul(LSB_OF_EACH_BYTE) & 0x8040_2010_0804_0201;
     (lanes.wrapping_add(0x7f7f_7f7f_7f7f_7f7f) >> 7) & LSB_OF_EACH_BYTE
@@ -365,6 +315,7 @@ fn scatter_bits_to_bytes(b: u8) -> u64 {
 /// similar bit-reversal constant: a `2^0` term would fold lane 7 back onto
 /// bit 0.)
 #[inline(always)]
+#[cfg(test)]
 fn gather_byte_lsbs(lanes: u64) -> u8 {
     ((lanes & LSB_OF_EACH_BYTE).wrapping_mul(0x0102_0408_1020_4080) >> 56) as u8
 }
@@ -380,7 +331,7 @@ fn storage_eq_slow(a: &ValueStorage, b: &ValueStorage) -> bool {
 impl PartialEq for ValueStorage {
     /// Same result as the previous `#[derive(PartialEq)]` (Inline compares its
     /// two words, Wide compares its bits, mixed variants are never equal); only
-    /// the Wide arm is faster (see `wide_bits_eq`).
+    /// the Wide arm delegates to the two packed planes.
     ///
     /// The two-word arm is the one `signal_table[id] != val` runs on every
     /// signal write, so it stays in the caller; the `Wide` word-at-a-time
@@ -964,7 +915,6 @@ impl Value {
     #[inline(always)]
     /// Both planes when storage is `Inline`, else None — the cheap
     /// discriminant check fast paths need without exposing the storage enum.
-    #[inline]
     pub fn inline_planes(&self) -> Option<(u64, u64)> {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => Some((*val_bits, *xz_bits)),
@@ -1196,14 +1146,6 @@ impl Value {
     /// Returns a temporary Vec for wide values, or constructs from inline.
     pub fn get_bits(&self) -> BitsRef<'_> {
         BitsRef { value: self }
-    }
-
-    #[inline(always)]
-    fn inline_vals(&self) -> Option<(u64, u64)> {
-        match &self.storage {
-            ValueStorage::Inline { val_bits, xz_bits } => Some((*val_bits, *xz_bits)),
-            _ => None,
-        }
     }
 
     #[inline(always)]
@@ -2347,7 +2289,6 @@ impl Value {
         }
     }
 
-    #[inline]
     /// IEEE 1800-2017 §11.8.2 step 2: in a SIGNED expression every operand is
     /// converted to the expression's width by **sign** extension before the
     /// operation. `to_u64` zero-extends, which turns a narrow signed `-3` into
@@ -2742,7 +2683,7 @@ impl Value {
                 b,
                 w,
                 |av, ax, bv, bx| {
-                    let zero_out = ((!av & !ax) | (!bv & !bx));
+                    let zero_out = (!av & !ax) | (!bv & !bx);
                     let one_out = av & !ax & bv & !bx;
                     (one_out, !zero_out & !one_out)
                 },
@@ -2818,7 +2759,7 @@ impl Value {
                 b,
                 w,
                 |av, ax, bv, bx| {
-                    let one_out = ((av & !ax) | (bv & !bx));
+                    let one_out = (av & !ax) | (bv & !bx);
                     let zero_out = !av & !ax & !bv & !bx;
                     (one_out, !one_out & !zero_out)
                 },
@@ -2880,7 +2821,7 @@ impl Value {
                 b,
                 w,
                 |av, ax, bv, bx| {
-                    let unknown = (ax | bx);
+                    let unknown = ax | bx;
                     ((av ^ bv) & !unknown, unknown)
                 },
                 op_bit,
@@ -4849,8 +4790,8 @@ mod tests {
     }
 
     /// The bit-per-byte scatter/gather helpers must be exact inverses over all
-    /// 256 byte patterns — `concat_refs`, `resize` and `range_select` all encode
-    /// their 4-state planes through them.
+    /// 256 byte patterns, preserving coverage of the earlier byte-lane
+    /// representation while runtime wide values use packed planes.
     #[test]
     fn scatter_gather_round_trip() {
         for b in 0u16..=255 {

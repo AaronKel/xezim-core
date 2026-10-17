@@ -285,7 +285,7 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
         .map_err(|e| format!("write '{}': {}", path, e))?;
 
     // Create a wrapper to count bytes written
-    let mut enc = zstd::stream::Encoder::new(w, level).map_err(|e| format!("zstd init: {}", e))?;
+    let enc = zstd::stream::Encoder::new(w, level).map_err(|e| format!("zstd init: {}", e))?;
 
     // We need to measure uncompressed size for statistics
     // Unfortunately zstd::Encoder doesn't expose this directly, so we'll
@@ -1780,12 +1780,12 @@ fn parse_and_elaborate(
     // auto-detected tops elaborate in this order, as the reference does.
     let mut def_source_pos: crate::hasher::HashMap<String, usize> =
         crate::hasher::HashMap::default();
-    /// When the design has multiple uninstantiated top-level modules, this
-    /// holds their names so that — after elaboration of the synthetic
-    /// `__xezim_multi_top` wrapper — each one's module-local static
-    /// declarations (classes/typedefs) can be hoisted into the global table
-    /// exactly as they would be if that module alone were the root. Empty for
-    /// single-top designs (no hoisting needed, no behaviour change).
+    // When the design has multiple uninstantiated top-level modules, this
+    // holds their names so that — after elaboration of the synthetic
+    // `__xezim_multi_top` wrapper — each one's module-local static
+    // declarations (classes/typedefs) can be hoisted into the global table
+    // exactly as they would be if that module alone were the root. Empty for
+    // single-top designs (no hoisting needed, no behaviour change).
     let mut multi_top_modules: Vec<String> = Vec::new();
     let mut top_level_imports = Vec::new();
     let mut top_level_lets = Vec::new();

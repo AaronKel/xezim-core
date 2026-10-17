@@ -222,7 +222,6 @@ impl ExactSizeIterator for PackedBitsIter<'_> {}
 #[cfg(test)]
 mod benchmarks {
     use super::*;
-    use std::time::Instant;
 
     fn create_wide_value(width: usize) -> Vec<LogicBit> {
         (0..width)

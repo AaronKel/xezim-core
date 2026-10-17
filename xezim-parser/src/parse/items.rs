@@ -2595,78 +2595,6 @@ impl Parser {
             TokenKind::KwCovergroup => Some(ModuleItem::CovergroupDeclaration(
                 self.parse_covergroup_declaration(),
             )),
-            TokenKind::KwClocking => {
-                let start = self.current().span.start;
-                self.bump();
-                let name = if self.at(TokenKind::Identifier) {
-                    Some(self.parse_identifier())
-                } else {
-                    None
-                };
-                if self.at(TokenKind::At) {
-                    let _ = self.parse_event_control();
-                }
-                self.expect(TokenKind::Semicolon);
-                let mut items = Vec::new();
-                let mut signals = Vec::new();
-                while !self.at(TokenKind::KwEndclocking) && !self.at(TokenKind::Eof) {
-                    match self.current_kind() {
-                        TokenKind::KwInput
-                        | TokenKind::KwOutput
-                        | TokenKind::KwInout
-                        | TokenKind::KwRef => {
-                            let sstart = self.current().span.start;
-                            let direction = self
-                                .parse_optional_direction()
-                                .unwrap_or(PortDirection::Input);
-                            // Optional data type inside clocking declaration.
-                            if self.is_data_type_keyword()
-                                || (self.at(TokenKind::Identifier)
-                                    && self.peek_kind() == TokenKind::Identifier)
-                            {
-                                let _ = self.parse_data_type();
-                            }
-                            loop {
-                                if self.at(TokenKind::Identifier) {
-                                    let id = self.parse_identifier();
-                                    signals.push(ClockingSignal {
-                                        direction,
-                                        name: id,
-                                        skew: None,
-                                        bound_to: None,
-                                        span: self.span_from(sstart),
-                                    });
-                                }
-                                if self.eat(TokenKind::Comma).is_none() {
-                                    break;
-                                }
-                            }
-                            self.expect(TokenKind::Semicolon);
-                        }
-                        _ => items.push(self.parse_statement()),
-                    }
-                }
-                self.expect(TokenKind::KwEndclocking);
-                let endlabel = self.parse_end_label();
-                // ClockingDeclaration struct needs an Option<Identifier> for name if we want to store it accurately,
-                // but for now let's just use a dummy identifier if it's missing.
-                let id = name.unwrap_or_else(|| Identifier {
-                    name: "default".to_string(),
-                    span: self.span_from(start),
-                });
-                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration {
-                    name: id,
-                    clock_signal: None,
-                    clock_edge: None,
-                    default_input_skew: None,
-                    default_output_skew: None,
-                    is_default: false,
-                    signals,
-                    items,
-                    endlabel,
-                    span: self.span_from(start),
-                }))
-            }
             TokenKind::KwDefault => {
                 self.bump();
                 if self.at(TokenKind::KwClocking) {
@@ -4744,7 +4672,7 @@ impl Parser {
         crate::pop_class_context();
         {
             let mut type_names = Vec::new();
-            let mut add_params = |pd: &ParameterDeclaration, out: &mut Vec<String>| match &pd.kind {
+            let add_params = |pd: &ParameterDeclaration, out: &mut Vec<String>| match &pd.kind {
                 ParameterKind::Data { assignments, .. } => {
                     out.extend(assignments.iter().map(|a| a.name.name.clone()))
                 }
@@ -4807,6 +4735,7 @@ impl Parser {
             .class_infos
             .last()
             .filter(|c| c.is_interface && c.bases.len() > 1)
+            .into_iter()
         {
             // (name, the specialized class it is inherited from)
             let mut origin: Vec<(String, String)> = Vec::new();
@@ -5043,25 +4972,6 @@ impl Parser {
                 self.bump();
                 ClassItem::Empty
             }
-        }
-    }
-
-    /// Consume a balanced `( ... )` group, including nested parens. Assumes the
-    /// current token is `(`. Used to skip clauses whose contents we don't model
-    /// (covergroup formals, `with function sample` port lists, `iff` guards).
-    fn skip_balanced_parens(&mut self) {
-        if !self.at(TokenKind::LParen) {
-            return;
-        }
-        self.bump();
-        let mut depth = 1;
-        while depth > 0 && !self.at(TokenKind::Eof) {
-            if self.at(TokenKind::LParen) {
-                depth += 1;
-            } else if self.at(TokenKind::RParen) {
-                depth -= 1;
-            }
-            self.bump();
         }
     }
 

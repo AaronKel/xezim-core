@@ -1326,44 +1326,6 @@ impl Parser {
         }
     }
 
-    /// IEEE 1800-2017 §12.6: wrap `stmt` so each `.name` pattern binding is
-    /// declared as an implicit logic local visible inside it. The bindings are
-    /// prepended as `logic <name>;` decls in a synthetic begin/end block, so
-    /// elaboration's scope walk finds them in `locals` before the matched
-    /// statement runs. Returns `stmt` unchanged when there are no bindings.
-    fn wrap_with_pattern_bindings(
-        &self,
-        bindings: Vec<crate::ast::Identifier>,
-        stmt: Statement,
-    ) -> Statement {
-        if bindings.is_empty() {
-            return stmt;
-        }
-        let span = stmt.span;
-        let mut stmts: Vec<Statement> = Vec::with_capacity(bindings.len() + 1);
-        for id in bindings {
-            let id_span = id.span;
-            let decl = StatementKind::VarDecl {
-                data_type: DataType::IntegerVector {
-                    kind: crate::ast::types::IntegerVectorType::Logic,
-                    signing: None,
-                    dimensions: Vec::new(),
-                    span: id_span,
-                },
-                lifetime: None,
-                declarators: vec![VarDeclarator {
-                    name: id,
-                    dimensions: Vec::new(),
-                    init: None,
-                    span: id_span,
-                }],
-            };
-            stmts.push(Statement::new(decl, id_span));
-        }
-        stmts.push(stmt);
-        Statement::new(StatementKind::SeqBlock { name: None, stmts }, span)
-    }
-
     fn parse_if_with_priority(&mut self, up: Option<UniquePriority>) -> Statement {
         let start = self.current().span.start;
         self.expect(TokenKind::KwIf);
@@ -2617,53 +2579,6 @@ impl Parser {
             }
         }
     }
-
-    fn parse_statement_skip(&mut self) -> () {
-        // Skip a single statement, balancing braces/parens. Used when we don't
-        // care about content (e.g. action of an SVA assertion we don't model).
-        let mut depth = 0i32;
-        let mut block_depth = 0i32;
-        while !self.at(TokenKind::Eof) {
-            match self.current_kind() {
-                TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => {
-                    depth += 1;
-                    self.bump();
-                }
-                TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket => {
-                    if depth > 0 {
-                        depth -= 1;
-                        self.bump();
-                    } else {
-                        break;
-                    }
-                }
-                TokenKind::KwBegin => {
-                    block_depth += 1;
-                    self.bump();
-                }
-                TokenKind::KwEnd => {
-                    if block_depth > 0 {
-                        block_depth -= 1;
-                        self.bump();
-                        if block_depth == 0 && depth == 0 {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                TokenKind::Semicolon => {
-                    self.bump();
-                    if depth == 0 && block_depth == 0 {
-                        break;
-                    }
-                }
-                _ => {
-                    self.bump();
-                }
-            }
-        }
-    }
 }
 
 // ============================================================================
@@ -2730,14 +2645,6 @@ fn rs_rewrite_return_as_rsreturn(s: &mut Statement) {
         }
         _ => {}
     }
-}
-
-fn is_zero_const(e: &Expression) -> bool {
-    if let ExprKind::Number(NumberLiteral::Integer { value, .. }) = &e.kind {
-        let v = value.trim();
-        return v == "0" || v.parse::<i64>().ok() == Some(0);
-    }
-    false
 }
 
 type ProdMap = HashMap<String, (Vec<(DataType, String)>, RsAlt)>;

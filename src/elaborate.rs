@@ -378,10 +378,8 @@ pub struct ContinuousAssignment {
     pub delay: u64,
     /// §10.3.3 fall delay (transition to 0) when it differs in form from
     /// `delay`; `None` for the single-delay form.
-    #[cfg_attr(feature = "serde", serde(default))]
     pub delay_fall: Option<u64>,
     /// §10.3.3 turn-off delay (transition to z).
-    #[cfg_attr(feature = "serde", serde(default))]
     pub delay_off: Option<u64>,
     /// §23.3.3: this assign is an instance PORT CONNECTION emitted at
     /// inline time — its RHS names live in the PARENT scope by
@@ -389,7 +387,6 @@ pub struct ContinuousAssignment {
     /// them: an actual like `.d(d ^ 1)` whose operand shares the FORMAL's
     /// name otherwise resolved to the child's own port net (`u1.d = u1.d
     /// ^ 1`, a self-loop that read x forever).
-    #[cfg_attr(feature = "serde", serde(default))]
     pub rhs_parent_scoped: bool,
     /// A continuous assignment the source spells out (an `assign`, or a net
     /// declaration assignment): the span of that statement and the instance
@@ -3048,7 +3045,6 @@ pub struct ElaboratedModule {
     /// §35.5.4 exported SV functions/tasks (`export "DPI-C" function f;`), in
     /// declaration order. The index is a stable id the C-callable trampoline
     /// passes back to identify which subroutine to run.
-    #[cfg_attr(feature = "serde", serde(default))]
     pub dpi_exports: Vec<String>,
     /// The C linkage name of each entry of `dpi_exports` (same index): the
     /// alias of `export "DPI-C" c_name = task sv_name;` when given, else the
@@ -3120,7 +3116,6 @@ pub struct ElaboratedModule {
     /// (§20.7 array queries must report declared order — `[3:1]` has
     /// $left=3/$right=1 and $increment=1; the arrays* tables normalize to
     /// (lo, hi) and lose it).
-    #[cfg_attr(feature = "serde", serde(default))]
     pub unpacked_decl_dims: HashMap<String, Vec<(i64, i64)>>,
     /// Packed vectors declared with an ASCENDING range (`logic [0:7]`), mapped
     /// to their width. Bit/part selects index these from the MSB end (label 0 =
@@ -3244,7 +3239,6 @@ pub struct ElaboratedModule {
     pub property_decls: HashMap<String, crate::ast::expr::Expression>,
     /// §16.6: formal port NAMES of each named property/sequence, keyed like
     /// `property_decls`. Empty vec for portless declarations.
-    #[cfg_attr(feature = "serde", serde(default))]
     pub property_params: HashMap<String, Vec<String>>,
     /// LRM §8.4: for an array-of-class-handles (`T arr[N]`,
     /// `T arr[];`), record the element's class name so runtime
@@ -7206,11 +7200,11 @@ pub fn elaborate_module_with_defs(
     // wraps — without it a `nettype real rn;` net lost `is_real` and read back
     // as the raw f64 bit pattern.
     let mut nettype_info: HashMap<String, (DataType, Option<String>)> = HashMap::default();
-    let mut register_nettype = |elab: &mut ElaboratedModule,
-                                info: &mut HashMap<String, (DataType, Option<String>)>,
-                                seen: &mut HashSet<String>,
-                                nd: &crate::ast::decl::NettypeDeclaration,
-                                key: String| {
+    let register_nettype = |elab: &mut ElaboratedModule,
+                            info: &mut HashMap<String, (DataType, Option<String>)>,
+                            seen: &mut HashSet<String>,
+                            nd: &crate::ast::decl::NettypeDeclaration,
+                            key: String| {
         seen.insert(key.clone());
         let w = resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
         typedefs_insert_traced(&mut elab.typedefs, "insert:nettype", key.clone(), w);
@@ -10104,7 +10098,6 @@ pub fn elaborate_module_with_defs(
                             &elab.typedefs,
                             &elab.typedef_types,
                         );
-                        let is_struct_param = struct_fields.as_ref().is_some_and(|f| !f.is_empty());
 
                         let mut val = if elab.parameters.contains_key(&assign.name.name)
                             && !preseeded_params.contains(&assign.name.name)
@@ -14551,87 +14544,6 @@ fn expr_refs_are_all_local(e: &Expression) -> bool {
     ok
 }
 
-/// Re-evaluate parameter initializers to a FIXPOINT so a forward reference
-/// resolves. Values are only UPDATED, never inserted, and any parameter given
-/// by an instantiation override is skipped — so a correctly ordered design and
-/// an overridden parameter both re-evaluate to exactly what they already have,
-/// and the loop settles on the first pass in the common case.
-fn resolve_forward_referenced_params(
-    items: &[ModuleItem],
-    elab: &mut ElaboratedModule,
-    param_overrides: &HashMap<String, Value>,
-) {
-    let mut pending: Vec<(&str, &DataType, &Expression)> = Vec::new();
-    for item in items {
-        let (ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd)) = item
-        else {
-            continue;
-        };
-        let ParameterKind::Data {
-            data_type,
-            assignments,
-        } = &pd.kind
-        else {
-            continue;
-        };
-        for assign in assignments {
-            let name = assign.name.name.as_str();
-            if param_overrides.contains_key(name) {
-                continue;
-            }
-            if let Some(init) = &assign.init {
-                pending.push((name, data_type, init));
-            }
-        }
-    }
-    if pending.is_empty() {
-        return;
-    }
-    for _ in 0..8 {
-        let mut changed = false;
-        for (name, data_type, init) in &pending {
-            let mut width =
-                resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
-            if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
-                width = 32;
-            }
-            let subbed;
-            let init_eval: &Expression = if expr_has_call(init) {
-                match substitute_const_fn_calls(init, &elab.parameters, elab, 0)
-                    .filter(|e| !expr_has_call(e))
-                {
-                    Some(e) => {
-                        subbed = e;
-                        &subbed
-                    }
-                    None => init,
-                }
-            } else {
-                init
-            };
-            let mut v = eval_init_for_width(init_eval, &elab.parameters, width);
-            if is_type_signed(data_type) {
-                v.is_signed = true;
-            }
-            if elab.parameters.get(*name) != Some(&v) {
-                params_insert_traced(
-                    &mut elab.parameters,
-                    line!(),
-                    (*name).to_string(),
-                    v.clone(),
-                );
-                if let Some(sig) = elab.signals.get_mut(*name) {
-                    sig.value = v;
-                }
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-}
-
 /// Create implicit 1-bit wire signals for identifiers referenced in continuous assigns
 /// but not declared anywhere (IEEE 1800-2017 §6.10).
 /// §6.10 candidates that appear as INSTANCE PORT ACTUALS. Walks generate
@@ -16963,12 +16875,12 @@ fn filter_dead_giant_declarators(
     Some(filtered)
 }
 
-/// Combine packed-dimension widths with saturating math and clamp the result to
-/// `SANE_MAX_PACKED_WIDTH`, warning once PER DISTINCT DETAIL when an absurd
-/// width is suppressed. `detail` carries whatever identity the call site can
-/// cheaply assemble (offending range bounds, parameter names + resolved
-/// values, source byte offset) so the user can find the declaration — a bare
-/// "somewhere a width underflowed" was unactionable on customer designs.
+// Combine packed-dimension widths with saturating math and clamp the result to
+// `SANE_MAX_PACKED_WIDTH`, warning once PER DISTINCT DETAIL when an absurd
+// width is suppressed. `detail` carries whatever identity the call site can
+// cheaply assemble (offending range bounds, parameter names + resolved
+// values, source byte offset) so the user can find the declaration — a bare
+// "somewhere a width underflowed" was unactionable on customer designs.
 thread_local! {
     /// Pre-elaboration scans (xezim's should-fail lint) resolve widths on the
     /// RAW AST — before dead-declaration elision has decided anything — so
@@ -37681,7 +37593,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         }
         cur
     }
-    let mut touch = |parent: &mut HashMap<String, String>, n: &str| {
+    let touch = |parent: &mut HashMap<String, String>, n: &str| {
         parent.entry(n.to_string()).or_insert_with(|| n.to_string());
     };
     for n in net_resolver.keys() {
