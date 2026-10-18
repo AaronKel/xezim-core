@@ -6956,6 +6956,13 @@ pub fn elaborate_module_with_defs(
                 );
                 let port_shape = fixed_unpacked_shape(&effective_port_dims, &elab.parameters)
                     .unwrap_or_default();
+                if let Some(dims) = declared_unpacked_dims(&effective_port_dims, &elab.parameters) {
+                    elab.unpacked_decl_dims
+                        .insert(port.name.name.clone(), dims.clone());
+                    if dims.first().is_some_and(|(l, r)| l > r) {
+                        elab.descending_arrays.insert(port.name.name.clone());
+                    }
+                }
                 // §23.2.2.4: a port default must be a CONSTANT expression —
                 // a reference to a runtime variable is rejected (ivtest
                 // sv_default_port_value3; the reference errors identically).
@@ -7715,6 +7722,13 @@ pub fn elaborate_module_with_defs(
                 let is_signed = is_type_signed(&nd.data_type);
                 let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
+                    // §7.6: net arrays retain left-to-right declaration order too.
+                    if let Some(dims) = declared_unpacked_dims(&decl.dimensions, &elab.parameters) {
+                        if dims.first().is_some_and(|(l, r)| l > r) {
+                            elab.descending_arrays.insert(decl.name.name.clone());
+                        }
+                        elab.unpacked_decl_dims.insert(decl.name.name.clone(), dims);
+                    }
                     if let Some(d) = net_delay_of(decl, nd, &elab.parameters) {
                         elab.net_delays.insert(decl.name.name.clone(), d);
                     }
@@ -15110,6 +15124,13 @@ fn elaborate_items_numbered(
                 let is_signed = is_type_signed(&nd.data_type);
                 let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
+                    // §7.6: net arrays retain left-to-right declaration order too.
+                    if let Some(dims) = declared_unpacked_dims(&decl.dimensions, &elab.parameters) {
+                        if dims.first().is_some_and(|(l, r)| l > r) {
+                            elab.descending_arrays.insert(decl.name.name.clone());
+                        }
+                        elab.unpacked_decl_dims.insert(decl.name.name.clone(), dims);
+                    }
                     if let Some(d) = net_delay_of(decl, nd, &elab.parameters) {
                         elab.net_delays.insert(decl.name.name.clone(), d);
                     }
@@ -29189,6 +29210,9 @@ fn register_fixed_unpacked_array(
     elem_width: u32,
     two_state: bool,
 ) {
+    elab.unpacked_decl_dims
+        .entry(name.to_string())
+        .or_insert_with(|| shape.to_vec());
     match shape {
         [d0] => {
             elab.arrays
@@ -29231,6 +29255,88 @@ fn shape_index_tuples(shape: &[(i64, i64)]) -> Vec<Vec<i64>> {
     out
 }
 
+/// §7.6 / §23.3.3: enumerate an unpacked actual left to right, stripping
+/// a slice into its element expressions before binding formal positions.
+fn unpacked_connection_elements(
+    expr: &Expression,
+    elab: &ElaboratedModule,
+    params: &HashMap<String, Value>,
+) -> Option<Vec<Expression>> {
+    fn split(e: &Expression) -> Option<(String, Vec<Expression>)> {
+        match &e.kind {
+            ExprKind::Paren(inner) => split(inner),
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                Some((h.path[0].name.name.clone(), h.path[0].selects.clone()))
+            }
+            ExprKind::Index { expr, index } => {
+                let (name, mut sels) = split(expr)?;
+                sels.push((**index).clone());
+                Some((name, sels))
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind: crate::ast::expr::RangeKind::Constant,
+                left,
+                right,
+            } => {
+                let (name, mut sels) = split(expr)?;
+                sels.push(Expression::new(
+                    ExprKind::Range(left.clone(), right.clone()),
+                    e.span,
+                ));
+                Some((name, sels))
+            }
+            _ => None,
+        }
+    }
+    let (name, sels) = split(expr)?;
+    let mut dims = elab.unpacked_decl_dims.get(&name).cloned().or_else(|| {
+        if let Some(&(lo, hi, _)) = elab.arrays.get(&name) {
+            Some(vec![if elab.descending_arrays.contains(&name) {
+                (hi, lo)
+            } else {
+                (lo, hi)
+            }])
+        } else if let Some(&(d0, d1, _)) = elab.arrays_2d.get(&name) {
+            Some(vec![d0, d1])
+        } else {
+            elab.arrays_nd.get(&name).map(|(d, _)| d.clone())
+        }
+    })?;
+    if sels.len() > dims.len() {
+        return None;
+    }
+    for (dim, sel) in dims.iter_mut().zip(sels) {
+        *dim = match &sel.kind {
+            ExprKind::Range(l, r) => (
+                const_eval_i64_with_params(l, Some(params))?,
+                const_eval_i64_with_params(r, Some(params))?,
+            ),
+            _ => {
+                let i = const_eval_i64_with_params(&sel, Some(params))?;
+                (i, i)
+            }
+        };
+    }
+    let mut elements = vec![make_ident_expr(&name)];
+    for (l, r) in dims {
+        let mut next = Vec::new();
+        let count = l.abs_diff(r).checked_add(1)?;
+        for base in elements {
+            for k in 0..count {
+                let i = if l <= r {
+                    l.checked_add(k as i64)?
+                } else {
+                    l.checked_sub(k as i64)?
+                };
+                next.push(ai_append_indices(base.clone(), &[i]));
+            }
+        }
+        elements = next;
+    }
+    Some(elements)
+}
+
 fn ai_append_indices(mut expr: Expression, indices: &[i64]) -> Expression {
     for &idx in indices {
         let span = expr.span;
@@ -29246,6 +29352,20 @@ fn ai_append_indices(mut expr: Expression, indices: &[i64]) -> Expression {
 }
 
 fn ai_num_expr(n: i64, span: crate::ast::Span) -> Expression {
+    if n < 0 {
+        // §5.7.1: a minus sign is not part of an unsigned decimal token.
+        // Encode the signed value explicitly, including i64::MIN.
+        return Expression::new(
+            ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                size: Some(64),
+                signed: true,
+                base: crate::ast::expr::NumberBase::Hex,
+                value: format!("{:x}", n as u64),
+                cached_val: std::cell::Cell::new(None),
+            }),
+            span,
+        );
+    }
     Expression::new(
         ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
             size: None,
@@ -33200,6 +33320,15 @@ fn inline_module_items(
                             let port_shape =
                                 fixed_unpacked_shape(&effective_port_dims, &sub_merged_params)
                                     .unwrap_or_default();
+                            if let Some(dims) =
+                                declared_unpacked_dims(&effective_port_dims, &sub_merged_params)
+                            {
+                                elab.unpacked_decl_dims
+                                    .insert(sig_name.clone(), dims.clone());
+                                if dims.first().is_some_and(|(l, r)| l > r) {
+                                    elab.descending_arrays.insert(sig_name.clone());
+                                }
+                            }
                             // Register the packed-struct field layout for a
                             // struct-typed port so a member write to the port's
                             // internal signal (`dut.out.a` for an `output
@@ -33417,6 +33546,52 @@ fn inline_module_items(
                                 let is_signed = is_type_signed(&pd.data_type);
                                 for decl in &pd.declarators {
                                     let sig_name = cat2(&inst_prefix, &decl.name.name);
+                                    let dims = if decl.dimensions.is_empty() {
+                                        match &pd.data_type {
+                                            DataType::TypeReference { name, .. } => {
+                                                lookup_scoped_type(
+                                                    name,
+                                                    &elab.typedef_unpacked_dims,
+                                                )
+                                                .cloned()
+                                                .unwrap_or_default()
+                                            }
+                                            _ => Vec::new(),
+                                        }
+                                    } else {
+                                        decl.dimensions.clone()
+                                    };
+                                    let dims = normalize_unpacked_dims(
+                                        &dims,
+                                        &sub_local_params,
+                                        &elab.typedef_types,
+                                    );
+                                    if let Some(shape) =
+                                        fixed_unpacked_shape(&dims, &sub_local_params)
+                                            .filter(|d| !d.is_empty())
+                                    {
+                                        register_fixed_unpacked_array(
+                                            elab,
+                                            &sig_name,
+                                            &shape,
+                                            width,
+                                            is_type_two_state_resolved(
+                                                &pd.data_type,
+                                                &elab.typedef_types,
+                                            ),
+                                        );
+                                        if let Some(declared) =
+                                            declared_unpacked_dims(&dims, &sub_local_params)
+                                        {
+                                            if declared.first().is_some_and(|(l, r)| l > r) {
+                                                elab.descending_arrays.insert(sig_name.clone());
+                                            }
+                                            elab.unpacked_decl_dims
+                                                .insert(sig_name.clone(), declared);
+                                        }
+                                        elab.var_decl_types
+                                            .insert(sig_name.clone(), pd.data_type.clone());
+                                    }
                                     // §7.4.1: a non-ANSI PORT of a packed
                                     // multi-D / packed-struct type needs the
                                     // same shape registrations a variable
@@ -33777,6 +33952,14 @@ fn inline_module_items(
                                     &sub_merged_params,
                                     &elab.typedef_types,
                                 );
+                                if let Some(dims) =
+                                    declared_unpacked_dims(&effective_dims, &sub_merged_params)
+                                {
+                                    if dims.first().is_some_and(|(l, r)| l > r) {
+                                        elab.descending_arrays.insert(sig_name.clone());
+                                    }
+                                    elab.unpacked_decl_dims.insert(sig_name.clone(), dims);
+                                }
                                 // An UNPACKED array net inside a submodule
                                 // (`wire [15:0] pipe [0:2];`) must register its
                                 // range like the variable arm below, otherwise it
@@ -34853,19 +35036,40 @@ fn inline_module_items(
                             }
                         }
                     }
-                    let port_shape = match sub_mod.ports() {
-                        PortList::Ansi(ports) => ports
-                            .iter()
-                            .find(|p| p.name.name == *port_name)
-                            .and_then(|p| fixed_unpacked_shape(&p.dimensions, &sub_merged_params)),
-                        _ => None,
-                    }
-                    .unwrap_or_default();
+                    let port_shape = elab
+                        .unpacked_decl_dims
+                        .get(&sub_sig_name)
+                        .map(|dims| {
+                            dims.iter()
+                                .map(|&(l, r)| (l.min(r), l.max(r)))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
                     if !port_shape.is_empty() {
-                        for indices in shape_index_tuples(&port_shape) {
-                            let sub_expr =
-                                ai_append_indices(make_ident_expr(&sub_sig_name), &indices);
-                            let parent_elem = ai_append_indices(parent_expr.clone(), &indices);
+                        // §7.6: use each side's declared order, independently of
+                        // numeric index labels. A slice supplies its own bounds.
+                        let formal_elems = unpacked_connection_elements(
+                            &make_ident_expr(&sub_sig_name),
+                            elab,
+                            &sub_merged_params,
+                        );
+                        let actual_elems =
+                            unpacked_connection_elements(parent_expr, elab, local_params);
+                        let pairs = match (formal_elems, actual_elems) {
+                            (Some(f), Some(a)) if f.len() == a.len() => {
+                                f.into_iter().zip(a).collect::<Vec<_>>()
+                            }
+                            _ => shape_index_tuples(&port_shape)
+                                .into_iter()
+                                .map(|indices| {
+                                    (
+                                        ai_append_indices(make_ident_expr(&sub_sig_name), &indices),
+                                        ai_append_indices(parent_expr.clone(), &indices),
+                                    )
+                                })
+                                .collect(),
+                        };
+                        for (sub_expr, parent_elem) in pairs {
                             match prepared_sub.port_directions.get(port_name) {
                                 Some(PortDirection::Input) | Some(PortDirection::Inout) => {
                                     elab.continuous_assigns.push(ContinuousAssignment {
@@ -35021,6 +35225,14 @@ fn inline_module_items(
                 let mut no_subst_ports: std::collections::HashSet<String> =
                     std::collections::HashSet::default();
                 for (pname, actual) in port_map.iter() {
+                    // §23.3.3: an unpacked formal keeps its own index range.
+                    let array_formal = cat2(&inst_prefix, pname);
+                    if elab.arrays.contains_key(&array_formal)
+                        || elab.arrays_2d.contains_key(&array_formal)
+                        || elab.arrays_nd.contains_key(&array_formal)
+                    {
+                        no_subst_ports.insert(pname.clone());
+                    }
                     let Some(formal) = elab
                         .signals
                         .get(&cat2(&inst_prefix, &pname))
