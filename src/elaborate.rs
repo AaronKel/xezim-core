@@ -13,6 +13,7 @@ use crate::hasher::HashSet;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+mod module_class_scope;
 pub(crate) mod relaxed_static;
 
 struct ScopeGuardLite<F: FnMut()>(F);
@@ -31996,7 +31997,7 @@ fn inline_module_items(
                             span: v.span,
                         });
                     }
-                    None
+                    module_class_scope::type_override(v)
                 };
                 let formal_is_type_param = |formal: &str| -> bool {
                     sub_param_decls.iter().any(|p| {
@@ -33162,6 +33163,7 @@ fn inline_module_items(
                     .iter()
                     .filter_map(|it| match it {
                         ModuleItem::TypedefDeclaration(td) => Some(td.name.name.clone()),
+                        ModuleItem::ClassDeclaration(cd) => Some(cd.name.name.clone()),
                         _ => None,
                     })
                     .collect();
@@ -35346,7 +35348,7 @@ fn inline_module_items(
                 // the two disagree — those resolve to `<inst>.<port>` instead,
                 // which is registered with the FORMAL's width and element
                 // stride and is driven by the connection assign pushed above.
-                let rewrite_port_map: HashMap<String, Expression> = port_map
+                let mut rewrite_port_map: HashMap<String, Expression> = port_map
                     .iter()
                     .filter(|(name, _)| {
                         !matches!(
@@ -35356,6 +35358,21 @@ fn inline_module_items(
                     })
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
+                // §8.3 / §23.6: a module-instance class cannot replace a
+                // same-named compilation-unit or sibling-instance class.
+                let class_bindings: HashMap<String, Expression> = prepared_sub
+                    .effective_items
+                    .iter()
+                    .filter_map(|item| {
+                        let name = match item {
+                            ModuleItem::ClassDeclaration(cd) => &cd.name.name,
+                            ModuleItem::TypedefDeclaration(td) => &td.name.name,
+                            _ => return None,
+                        };
+                        Some((name.clone(), make_ident_expr(&cat2(&inst_prefix, name))))
+                    })
+                    .collect();
+                rewrite_port_map.extend(class_bindings.clone());
                 for (pname, actual) in &rewrite_port_map {
                     if matches!(
                         prepared_sub.port_directions.get(pname.as_str()),
@@ -35485,6 +35502,14 @@ fn inline_module_items(
                         }
                     }
                 }
+                // §6.20.3 / §8.23: temporary elaboration bindings do not
+                // survive inlining. Bake class-valued type parameters into
+                // expression receivers as well as declaration data types.
+                for (name, dt) in &pend_type_binds {
+                    if let Some(receiver) = module_class_scope::receiver(dt) {
+                        rewrite_port_map.insert(name.clone(), receiver);
+                    }
+                }
                 let pend_type_bind_widths: HashMap<String, u32> = pend_type_binds
                     .iter()
                     .map(|(n, dt)| {
@@ -35606,6 +35631,8 @@ fn inline_module_items(
                         &no_local,
                         &no_iface,
                     ));
+                    p.data_type =
+                        module_class_scope::data_type(&p.data_type, &inst_prefix, &class_bindings);
                     p.dimensions = rewrite_unpacked_dims_genvar(
                         &p.dimensions,
                         &param_expr_map,
@@ -35635,6 +35662,11 @@ fn inline_module_items(
                             &no_local,
                             &no_iface,
                         ));
+                        new_fd.return_type = module_class_scope::data_type(
+                            &new_fd.return_type,
+                            &inst_prefix,
+                            &class_bindings,
+                        );
                         // A FORMAL shadows any same-named module-scope object
                         // inside the body (§13.4): `local_names` is the set of
                         // module-scope names that GET the instance prefix, so
@@ -35662,19 +35694,22 @@ fn inline_module_items(
                                 ));
                             }
                         }
-                        new_fd.items = fd
-                            .items
-                            .iter()
-                            .map(|s| {
-                                rewrite_stmt(
-                                    s,
+                        let formal_names: Vec<&str> =
+                            fd.ports.iter().map(|p| p.name.name.as_str()).collect();
+                        new_fd.items = with_shadowed(
+                            &formal_names,
+                            &rewrite_port_map,
+                            &fn_locals,
+                            |ports, locals| {
+                                rewrite_stmt_list_scoped(
+                                    &fd.items,
                                     &inst_prefix,
-                                    &rewrite_port_map,
-                                    &fn_locals,
+                                    ports,
+                                    locals,
                                     &sub_interface_map,
                                 )
-                            })
-                            .collect();
+                            },
+                        );
                         elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
                     }
                     // §16.6/§16.8: a named property or sequence of an INLINED
@@ -35760,42 +35795,41 @@ fn inline_module_items(
                                 ));
                             }
                         }
-                        new_td.items = td
-                            .items
-                            .iter()
-                            .map(|s| {
-                                rewrite_stmt(
-                                    s,
+                        let formal_names: Vec<&str> =
+                            td.ports.iter().map(|p| p.name.name.as_str()).collect();
+                        new_td.items = with_shadowed(
+                            &formal_names,
+                            &rewrite_port_map,
+                            &task_locals,
+                            |ports, locals| {
+                                rewrite_stmt_list_scoped(
+                                    &td.items,
                                     &inst_prefix,
-                                    &rewrite_port_map,
-                                    &task_locals,
+                                    ports,
+                                    locals,
                                     &sub_interface_map,
                                 )
-                            })
-                            .collect();
+                            },
+                        );
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
                     }
                     if let ModuleItem::ClassDeclaration(cd) = sub_item {
-                        // §8.3: a class declared in an INSTANTIATED module was
-                        // silently dropped — `new` at a declaration initializer
-                        // found no class and produced null, and `randomize()`
-                        // saw no rand props or constraints. Register it under
-                        // its bare name like the top module's own classes
-                        // (classes share one namespace; a second instance
-                        // re-registers the identical definition).
                         validate_class_constraints(
                             cd,
                             Some(definitions),
                             Some(&elab.enum_members),
                             Some(&elab),
                         )?;
-                        register_class_enum_members(cd, elab);
-                        register_class_covergroups(cd, elab);
-                        register_class_scoped_typedef_aliases(cd, None, elab);
-                        let mut ec = elaborate_class_with_params(cd, Some(&elab.parameters));
+                        let scoped = module_class_scope::class(cd, &inst_prefix, &class_bindings);
+                        register_class_enum_members(&scoped, elab);
+                        register_class_covergroups(&scoped, elab);
+                        register_class_scoped_typedef_aliases(&scoped, None, elab);
+                        let mut ec = elaborate_class_with_params(&scoped, Some(&elab.parameters));
                         ec.declaring_module = Some(sub_mod_name.clone());
-                        elab.classes
-                            .insert(cd.name.name.clone(), std::sync::Arc::new(ec));
+                        let ec = std::sync::Arc::new(ec);
+                        elab.classes.insert(scoped.name.name.clone(), ec.clone());
+                        elab.classes.entry(cd.name.name.clone()).or_insert(ec);
+                        register_nested_classes(&scoped, &scoped.name.name, elab);
                     }
                     // §19.3: a covergroup declared in an instantiated module or
                     // interface is a type of THAT instance, registered as
@@ -40663,6 +40697,19 @@ fn rewrite_expr_impl(
                 right: Box::new(nr),
             }
         }
+        ExprKind::Specialization {
+            base,
+            type_args_text,
+        } => ExprKind::Specialization {
+            base: Box::new(rewrite_expr_impl(
+                base,
+                prefix,
+                port_map,
+                local_names,
+                interface_map,
+            )),
+            type_args_text: type_args_text.clone(),
+        },
         ExprKind::MemberAccess { expr: base, member } => {
             let rewritten_base =
                 rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
@@ -40827,13 +40874,13 @@ fn rewrite_expr_impl(
         // `$bits(logic [W-1:0])`: the type's bounds name this instance's
         // parameters like any other expression. Left bare, they resolved
         // against the root module's (or none, under the multi-top wrapper).
-        ExprKind::TypeLiteral(dt) => ExprKind::TypeLiteral(Box::new(rewrite_data_type_scoped(
-            dt,
-            prefix,
-            port_map,
-            local_names,
-            interface_map,
-        ))),
+        ExprKind::TypeLiteral(dt) => {
+            ExprKind::TypeLiteral(Box::new(module_class_scope::data_type(
+                &rewrite_data_type_scoped(dt, prefix, port_map, local_names, interface_map),
+                prefix,
+                port_map,
+            )))
+        }
         // A named class-parameter value `#(.W(N))`: `N` is scoped like any
         // positional value.
         ExprKind::NamedArg { name, expr: inner } => ExprKind::NamedArg {
@@ -41722,15 +41769,32 @@ fn rewrite_stmt_list_scoped(
     interface_map: &HashMap<String, String>,
 ) -> Vec<Statement> {
     let mut cur: Option<std::collections::HashSet<String>> = None;
+    let mut cur_ports: Option<HashMap<String, Expression>> = None;
     let mut out = Vec::with_capacity(stmts.len());
     for st in stmts {
         let names = cur.as_ref().unwrap_or(local_names);
-        out.push(rewrite_stmt(st, prefix, port_map, names, interface_map));
+        let ports = cur_ports.as_ref().unwrap_or(port_map);
+        out.push(rewrite_stmt(st, prefix, ports, names, interface_map));
         if let StatementKind::VarDecl { declarators, .. } = &st.kind {
             if let Some(reduced) =
                 without_declared(names, declarators.iter().map(|d| d.name.name.as_str()))
             {
                 cur = Some(reduced);
+            }
+            for d in declarators {
+                // An empty prefix is an explicit alpha-renaming pass:
+                // its mapping names this declaration itself, not an outer
+                // module binding that the declaration shadows.
+                if !prefix.is_empty()
+                    && cur_ports
+                        .as_ref()
+                        .unwrap_or(port_map)
+                        .contains_key(&d.name.name)
+                {
+                    cur_ports
+                        .get_or_insert_with(|| port_map.clone())
+                        .remove(&d.name.name);
+                }
             }
         }
     }
@@ -41847,54 +41911,67 @@ fn rewrite_stmt(
             // The loop variables shadow same-named child-scope variables in
             // the condition, step and body; the init expressions are
             // evaluated before the declaration and keep the outer set.
-            let reduced = without_declared(
-                local_names,
-                init.iter().filter_map(|fi| match fi {
+            let bound: Vec<&str> = init
+                .iter()
+                .filter_map(|fi| match fi {
                     ForInit::VarDecl { name, .. } => Some(name.name.as_str()),
                     _ => None,
-                }),
-            );
-            let inner = reduced.as_ref().unwrap_or(local_names);
-            StatementKind::For {
-                init: init
-                    .iter()
-                    .map(|fi| match fi {
-                        ForInit::VarDecl {
-                            data_type,
-                            name,
-                            init,
-                        } => ForInit::VarDecl {
-                            data_type: data_type.clone(),
-                            name: name.clone(),
-                            init: rewrite_expr(init, prefix, port_map, local_names, interface_map),
-                        },
-                        ForInit::Assign { lvalue, rvalue } => ForInit::Assign {
-                            lvalue: rewrite_expr(
-                                lvalue,
-                                prefix,
-                                port_map,
-                                local_names,
-                                interface_map,
-                            ),
-                            rvalue: rewrite_expr(
-                                rvalue,
-                                prefix,
-                                port_map,
-                                local_names,
-                                interface_map,
-                            ),
-                        },
-                    })
-                    .collect(),
-                condition: condition
-                    .as_ref()
-                    .map(|c| rewrite_expr(c, prefix, port_map, inner, interface_map)),
-                step: step
-                    .iter()
-                    .map(|s| rewrite_expr(s, prefix, port_map, inner, interface_map))
-                    .collect(),
-                body: Box::new(rewrite_stmt(body, prefix, port_map, inner, interface_map)),
-            }
+                })
+                .collect();
+            with_shadowed(&bound, port_map, local_names, |inner_ports, inner| {
+                StatementKind::For {
+                    init: init
+                        .iter()
+                        .map(|fi| match fi {
+                            ForInit::VarDecl {
+                                data_type,
+                                name,
+                                init,
+                            } => ForInit::VarDecl {
+                                data_type: data_type.clone(),
+                                name: name.clone(),
+                                init: rewrite_expr(
+                                    init,
+                                    prefix,
+                                    port_map,
+                                    local_names,
+                                    interface_map,
+                                ),
+                            },
+                            ForInit::Assign { lvalue, rvalue } => ForInit::Assign {
+                                lvalue: rewrite_expr(
+                                    lvalue,
+                                    prefix,
+                                    port_map,
+                                    local_names,
+                                    interface_map,
+                                ),
+                                rvalue: rewrite_expr(
+                                    rvalue,
+                                    prefix,
+                                    port_map,
+                                    local_names,
+                                    interface_map,
+                                ),
+                            },
+                        })
+                        .collect(),
+                    condition: condition
+                        .as_ref()
+                        .map(|c| rewrite_expr(c, prefix, inner_ports, inner, interface_map)),
+                    step: step
+                        .iter()
+                        .map(|s| rewrite_expr(s, prefix, inner_ports, inner, interface_map))
+                        .collect(),
+                    body: Box::new(rewrite_stmt(
+                        body,
+                        prefix,
+                        inner_ports,
+                        inner,
+                        interface_map,
+                    )),
+                }
+            })
         }
         StatementKind::While { condition, body } => StatementKind::While {
             condition: rewrite_expr(condition, prefix, port_map, local_names, interface_map),
@@ -41916,14 +41993,20 @@ fn rewrite_stmt(
         // was fine. The loop VARIABLES stay untouched: they are declared by the
         // foreach itself, not inherited from the child's scope.
         StatementKind::Foreach { array, vars, body } => {
-            let reduced =
-                without_declared(local_names, vars.iter().flatten().map(|v| v.name.as_str()));
-            let inner = reduced.as_ref().unwrap_or(local_names);
-            StatementKind::Foreach {
-                array: rewrite_expr(array, prefix, port_map, local_names, interface_map),
-                vars: vars.clone(),
-                body: Box::new(rewrite_stmt(body, prefix, port_map, inner, interface_map)),
-            }
+            let bound: Vec<&str> = vars.iter().flatten().map(|v| v.name.as_str()).collect();
+            with_shadowed(&bound, port_map, local_names, |inner_ports, inner| {
+                StatementKind::Foreach {
+                    array: rewrite_expr(array, prefix, port_map, local_names, interface_map),
+                    vars: vars.clone(),
+                    body: Box::new(rewrite_stmt(
+                        body,
+                        prefix,
+                        inner_ports,
+                        inner,
+                        interface_map,
+                    )),
+                }
+            })
         }
         // Sibling of the missing-Assertion-arm bug: these kinds also fell
         // through `other => other.clone()` un-rewritten, so a dotted
@@ -41986,7 +42069,7 @@ fn rewrite_stmt(
             lifetime,
             declarators,
         } => StatementKind::VarDecl {
-            data_type: data_type.clone(),
+            data_type: module_class_scope::data_type(data_type, prefix, port_map),
             lifetime: *lifetime,
             declarators: declarators
                 .iter()
