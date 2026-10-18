@@ -16569,33 +16569,6 @@ fn scope_generated_subroutines(items: &mut [ModuleItem], scope: &str) {
     }
 }
 
-/// Collect `(renamed_name, "<scope>.<base>")` for every parameter/localparam
-/// declared directly in a generate-for iteration body.
-fn collect_param_decl_names(
-    items: &[ModuleItem],
-    out: &mut Vec<(String, String)>,
-    suffix: &str,
-    scope: &str,
-) {
-    for it in items {
-        match it {
-            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
-                if let ParameterKind::Data { assignments, .. } = &pd.kind {
-                    for a in assignments {
-                        if let Some(base) = a.name.name.strip_suffix(suffix) {
-                            out.push((a.name.name.clone(), format!("{}.{}", scope, base)));
-                        }
-                    }
-                }
-            }
-            ModuleItem::GenerateRegion(gr) => {
-                collect_param_decl_names(&gr.items, out, suffix, scope)
-            }
-            _ => {}
-        }
-    }
-}
-
 fn elaborate_generate_for(
     gf: &GenerateFor,
     elab: &mut ElaboratedModule,
@@ -16623,62 +16596,13 @@ fn elaborate_generate_for(
         // copy. Without this, two iterations both declare e.g. `valid_q` and
         // the elaborator's flat signal table flags a duplicate.
         let subst = substitute_genvar_in_items(&gf.items, var, i);
-        // Namespace the per-iteration rename by the block label so two
-        // generate-for blocks sharing a genvar name (common in black-parrot:
-        // many `for (genvar i …) begin : <label>`) don't collide on the flat
-        // signal table (`sig__gf_i_<n>_`).
-        let suffix = match &gf.name {
-            Some(l) => format!("__gf_{}_{}_{}_", l, var, i),
-            None => format!("__gf_{}_{}_", var, i),
-        };
-        let mut renamed = match &gf.name {
-            // Named block: rename declarations to their LRM hierarchical name
-            // (`gl[1].plain`) so `label[i].x` reads and writes resolve — the
-            // opaque suffix made every for-generate signal unreachable from
-            // outside its block (reads returned a 32-bit zero, writes
-            // vanished) while the identical named IF-generate worked.
-            Some(label) => {
-                let scope = format!("{}[{}]", label, i);
-                rename_decls_in_iter(&subst, &GenRename::Scope(&scope))
-            }
-            None => rename_decls_in_iter(&subst, &GenRename::Suffix(&suffix)),
-        };
-        if let Some(label) = &gf.name {
-            scope_generated_subroutines(&mut renamed, &format!("{}[{}]", label, i));
-        }
-        stamp_gen_scope(
-            &mut renamed,
-            &format!("{}[{}]", gen_scope_name(gf.name.as_ref(), ordinal), i),
-        );
+        // §27.6: unnamed blocks use the enclosing construct's genblk ordinal,
+        // exactly as named blocks use their label. Data and process scopes agree.
+        let scope = format!("{}[{}]", gen_scope_name(gf.name.as_ref(), ordinal), i);
+        let mut renamed = rename_decls_in_iter(&subst, &GenRename::Scope(&scope));
+        scope_generated_subroutines(&mut renamed, &scope);
+        stamp_gen_scope(&mut renamed, &scope);
         elaborate_items(&renamed, elab, all_defs)?;
-        // §27.6: a generate-block localparam is also visible hierarchically
-        // as `<label>[i].<name>`. The per-iteration rename above stores it
-        // under `<name><suffix>`, so a hierarchical read (`gb[2].MYIDX`)
-        // found nothing and returned 0. Alias the resolved values under the
-        // LRM-visible scoped name. Named blocks only — an unnamed block's
-        // `genblk<n>` ordinal is not known here.
-        if let Some(label) = &gf.name {
-            let scope = format!("{}[{}]", label, i);
-            let mut alias_names: Vec<(String, String)> = Vec::new();
-            collect_param_decl_names(&renamed, &mut alias_names, &suffix, &scope);
-            for (renamed_name, scoped_name) in alias_names {
-                if let Some(v) = elab.parameters.get(&renamed_name).cloned() {
-                    elab.parameters
-                        .entry(scoped_name.clone())
-                        .or_insert(v.clone());
-                    elab.signals.entry(scoped_name.clone()).or_insert(Signal {
-                        is_const: true,
-                        name: scoped_name,
-                        width: v.width,
-                        is_signed: v.is_signed,
-                        is_real: v.is_real,
-                        direction: None,
-                        value: v,
-                        type_name: None,
-                    });
-                }
-            }
-        }
         if trace && (iter_count % 8) == 0 {
             let rss = std::fs::read_to_string("/proc/self/statm")
                 .ok()
@@ -27773,18 +27697,13 @@ fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
 /// Nested loops insert the inner scope BEFORE the base name
 /// (`outer[0].x` + `inner[1]` → `outer[0].inner[1].x`), matching the LRM path.
 ///
-/// `Suffix` is the historical opaque rename (`x__gf_<label>_<var>_<i>_`), kept
-/// for UNNAMED blocks: their `genblk<n>` ordinal is not known at this point,
-/// so there is no LRM name to expose — uniqueness is all that's needed.
 enum GenRename<'a> {
-    Suffix(&'a str),
     Scope(&'a str),
 }
 
 impl GenRename<'_> {
     fn apply(&self, n: &str) -> String {
         match self {
-            GenRename::Suffix(sfx) => format!("{}{}", n, sfx),
             GenRename::Scope(sc) => match n.rsplit_once('.') {
                 Some((outer, base)) => format!("{}.{}.{}", outer, sc, base),
                 None => format!("{}.{}", sc, n),
@@ -27829,7 +27748,7 @@ fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleI
     // `<outer>[i].u`. Map those to `<outer>[i].<this>[j].u` as well, the way
     // a renamed declaration composes; without it a relative `u.report()` or
     // `u.n` two generate levels deep named a nonexistent `<outer>[i].u`.
-    if let GenRename::Scope(_) = rename {
+    {
         let mut inst_names: HashSet<String> = HashSet::default();
         collect_instance_names_in_items(items, &mut inst_names);
         if !inst_names.is_empty() {
@@ -29035,22 +28954,9 @@ fn collect_effective_items_scoped(
                     // iteration gets its own unique copy. Without this, two
                     // iterations both declare `valid_q` and the elaborator
                     // sees a flat duplicate.
-                    // Same named/unnamed split as elaborate_generate_for:
-                    // named blocks take the LRM hierarchical name so both
-                    // expansion paths (top module and inlined sub-module)
-                    // register the same `label[i].x` keys.
-                    let subst = match &gf.name {
-                        Some(l) => {
-                            let scope = format!("{}[{}]", l, i);
-                            rename_decls_in_iter(&subst, &GenRename::Scope(&scope))
-                        }
-                        None => {
-                            let suffix = format!("__gf_{}_{}_", gf.var, i);
-                            rename_decls_in_iter(&subst, &GenRename::Suffix(&suffix))
-                        }
-                    };
                     let scope =
                         format!("{}[{}]", gen_scope_name(gf.name.as_ref(), *gen_ordinal), i);
+                    let subst = rename_decls_in_iter(&subst, &GenRename::Scope(&scope));
                     let mut inner = collect_effective_items(&subst, &local_params);
                     prefix_gen_scope(&mut inner, &scope);
                     result.extend(inner);
