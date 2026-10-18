@@ -395,3 +395,30 @@ endmodule
     let or = text.find("op: LogOr").expect("no ||");
     assert!(and < or, "{text}");
 }
+
+/// §16.9.3: sampled clock arguments do not change ordinary sequence actual parsing.
+#[test]
+fn sampled_clock_arguments_preserve_sequence_actuals() {
+    let result = parse(
+        "module m; bit clk, a; ap: assert property (@(posedge clk) $rose(a, @(posedge clk))); aq: assert property (seq(@(posedge clk) a)); endmodule",
+    );
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let Some(Description::Module(module)) = result.source.descriptions.first() else {
+        panic!("not a module")
+    };
+    let assertions: Vec<_> = module
+        .items
+        .iter()
+        .filter_map(|item| {
+            if let ModuleItem::AssertionItem(a) = item {
+                Some(a)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(format!("{:?}", assertions[0]).contains("$__xz_clocking_arg"));
+    let sequence = format!("{:?}", assertions[1]);
+    assert!(sequence.contains("name: \"a\""), "{sequence}");
+    assert!(!sequence.contains("$__xz_clocking_arg"), "{sequence}");
+}

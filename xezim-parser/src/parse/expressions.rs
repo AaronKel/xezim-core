@@ -1430,7 +1430,10 @@ impl Parser {
                 let tok = self.bump();
                 let name = tok.text.clone();
                 let args = if self.at(TokenKind::LParen) {
-                    self.parse_call_args()
+                    self.parse_call_args_inner(matches!(
+                        name.as_str(),
+                        "$past" | "$rose" | "$fell" | "$stable" | "$changed"
+                    ))
                 } else {
                     Vec::new()
                 };
@@ -2277,6 +2280,10 @@ impl Parser {
     }
 
     pub(super) fn parse_call_args(&mut self) -> Vec<Expression> {
+        self.parse_call_args_inner(false)
+    }
+
+    fn parse_call_args_inner(&mut self, sampled_clock: bool) -> Vec<Expression> {
         let mut args = Vec::new();
         self.expect(TokenKind::LParen);
         if self.at(TokenKind::RParen) {
@@ -2336,7 +2343,12 @@ impl Parser {
                     self.span_from(start),
                 ));
             } else {
+                // §16.9.3: arguments are expressions even inside a property;
+                // an explicit @ clock is a sampled-function argument here.
+                let saved_sva = self.in_sva_seq;
+                self.in_sva_seq = saved_sva && !(sampled_clock && self.at(TokenKind::At));
                 args.push(self.parse_expression());
+                self.in_sva_seq = saved_sva;
             }
 
             if self.eat(TokenKind::Comma).is_none() {
