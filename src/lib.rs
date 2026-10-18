@@ -2878,6 +2878,7 @@ fn parse_and_elaborate(
         }
     }
 
+    elaborate::relaxed_static::normalize(&mut definitions);
     let top_name = top_module.ok_or("No module found")?;
     let top_def = definitions
         .get(&top_name)

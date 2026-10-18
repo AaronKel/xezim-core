@@ -13,6 +13,8 @@ use crate::hasher::HashSet;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+pub(crate) mod relaxed_static;
+
 struct ScopeGuardLite<F: FnMut()>(F);
 impl<F: FnMut()> Drop for ScopeGuardLite<F> {
     fn drop(&mut self) {
@@ -5983,7 +5985,9 @@ pub fn set_relax_implicit_static(on: bool) {
     RELAX_IMPLICIT_STATIC.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn relax_implicit_static() -> bool {
+/// Whether accepted implicit initializers retain static lifetime (§6.21).
+/// Consumers include this semantic mode in their elaborated-design cache key.
+pub fn relax_implicit_static() -> bool {
     if RELAX_IMPLICIT_STATIC.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
