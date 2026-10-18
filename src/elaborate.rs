@@ -12683,8 +12683,8 @@ pub fn data_type_to_spec_fragment(dt: &DataType) -> Option<String> {
         // named one (`class C #(type T = int);`). Without these arms the
         // default was dropped, so `T` was left unbound on an unspecialized
         // instance and a property declared `T p;` had no type to clamp to.
-        DataType::IntegerAtom { kind, .. } => Some(
-            match kind {
+        DataType::IntegerAtom { kind, signing, .. } => {
+            let mut out = match kind {
                 IntegerAtomType::Byte => "byte",
                 IntegerAtomType::ShortInt => "shortint",
                 IntegerAtomType::Int => "int",
@@ -12692,8 +12692,18 @@ pub fn data_type_to_spec_fragment(dt: &DataType) -> Option<String> {
                 IntegerAtomType::Integer => "integer",
                 IntegerAtomType::Time => "time",
             }
-            .to_string(),
-        ),
+            .to_string();
+            // §6.11 / §8.25: explicit non-default signing is type identity.
+            match (kind, signing) {
+                (IntegerAtomType::Time, Some(crate::ast::types::Signing::Signed)) => {
+                    out.push_str(" signed")
+                }
+                (IntegerAtomType::Time, _) => {}
+                (_, Some(crate::ast::types::Signing::Unsigned)) => out.push_str(" unsigned"),
+                _ => {}
+            }
+            Some(out)
+        }
         // The packed range is intentionally not rendered: a type ARGUMENT
         // loses its range at parse time too, so keeping the bare keyword here
         // matches what an explicit `#(logic [63:0])` produces.

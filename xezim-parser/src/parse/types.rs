@@ -415,6 +415,16 @@ impl Parser {
         let sp = self.span_from(start);
         if matches!(&dt, crate::ast::types::DataType::IntegerVector { dimensions, .. }
             if !dimensions.is_empty())
+            || matches!(
+                &dt,
+                crate::ast::types::DataType::IntegerAtom {
+                    signing: Some(_),
+                    ..
+                } | crate::ast::types::DataType::IntegerVector {
+                    signing: Some(_),
+                    ..
+                }
+            )
         {
             return crate::ast::expr::Expression::new(
                 crate::ast::expr::ExprKind::TypeLiteral(Box::new(dt)),

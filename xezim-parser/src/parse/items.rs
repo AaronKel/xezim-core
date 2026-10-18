@@ -3958,6 +3958,21 @@ impl Parser {
                         *span,
                     ));
                 }
+                DataType::IntegerAtom {
+                    signing: Some(_),
+                    span,
+                    ..
+                }
+                | DataType::IntegerVector {
+                    signing: Some(_),
+                    span,
+                    ..
+                } => {
+                    return Some(Expression::new(
+                        ExprKind::TypeLiteral(Box::new(dt.clone())),
+                        *span,
+                    ));
+                }
                 DataType::TypeReference { name, .. } => (name.name.name.clone(), name.name.span),
                 DataType::IntegerAtom { kind, span, .. } => (
                     match kind {

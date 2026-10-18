@@ -464,3 +464,17 @@ fn followed_by_keeps_right_associated_property() {
         args[1]
     );
 }
+
+/// §6.11 / §8.25: explicit atom signing survives a type argument.
+#[test]
+fn type_keyword_specialization_keeps_signing() {
+    let result = parse(
+        "class C #(type T=int); endclass module m; C #(byte unsigned) u; C #(logic signed) s; endmodule",
+    );
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let text = format!("{:?}", result.source.descriptions);
+    assert!(
+        text.contains("TypeLiteral") && text.contains("Unsigned") && text.contains("Signed"),
+        "{text}"
+    );
+}
