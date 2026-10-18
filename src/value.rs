@@ -2204,17 +2204,19 @@ impl Value {
             return Value::from_f64(-self.to_f64());
         }
         if self.has_xz() {
-            return Value::new(self.width);
+            let mut r = Value::new(self.width);
+            r.is_signed = self.is_signed;
+            return r;
         }
         let w = self.width;
         if w > 64 {
             let mut r = Value::from_words(&Self::words_neg(&self.arith_words(w, false)), w);
-            r.is_signed = true;
+            r.is_signed = self.is_signed;
             return r;
         }
         let v = self.to_u64().unwrap_or(0);
         let mut r = Value::from_u64(v.wrapping_neg(), w);
-        r.is_signed = true;
+        r.is_signed = self.is_signed;
         r
     }
 
@@ -6597,5 +6599,27 @@ mod wide_arith_tests {
         assert_eq!(ua.modulo(&ub).to_dec_string(), "33");
         assert_eq!(ub.less_than(&ua).to_u64(), Some(1));
         assert!(ua.div(&Value::zero(w)).has_xz());
+    }
+    /// §11.8.1: unary minus retains signedness at inline and wide widths.
+    #[test]
+    fn unary_minus_preserves_operand_type() {
+        for w in [1, 8, 64, 65, 200] {
+            for signed in [false, true] {
+                let mut v = Value::from_u64(1, w);
+                v.is_signed = signed;
+                let result = v.negate();
+                assert_eq!(result.width, w);
+                assert_eq!(result.is_signed, signed);
+                assert_eq!(result, {
+                    let mut r = Value::ones(w);
+                    r.is_signed = signed;
+                    r
+                });
+                let mut x = Value::new(w);
+                x.is_signed = signed;
+                assert_eq!(x.negate().is_signed, signed);
+                assert!(x.negate().has_xz());
+            }
+        }
     }
 }
