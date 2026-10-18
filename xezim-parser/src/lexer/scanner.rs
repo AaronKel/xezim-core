@@ -558,7 +558,22 @@ impl<'a> Lexer<'a> {
             }
             b'#' => {
                 self.pos += 1;
-                if self.input.get(self.pos) == Some(&b'#') {
+                if matches!(self.input.get(self.pos), Some(b'-' | b'='))
+                    && self.input.get(self.pos + 1) == Some(&b'#')
+                {
+                    let kind = if self.input[self.pos] == b'-' {
+                        TokenKind::HashMinusHash
+                    } else {
+                        TokenKind::HashEqualHash
+                    };
+                    self.pos += 2;
+                    let text = if kind == TokenKind::HashMinusHash {
+                        "#-#"
+                    } else {
+                        "#=#"
+                    };
+                    Token::new(kind, text.into(), Span::new(start, self.pos))
+                } else if self.input.get(self.pos) == Some(&b'#') {
                     self.pos += 1;
                     Token::new(TokenKind::HashHash, "##".into(), Span::new(start, self.pos))
                 } else {

@@ -437,6 +437,28 @@ impl Parser {
                 continue;
             }
 
+            // §16.12.9 / Table 16-3: the RHS is a right-associated
+            // property. Keep a marker to retain its vacuous outcome.
+            if self.in_sva_seq
+                && matches!(
+                    self.current_kind(),
+                    TokenKind::HashMinusHash | TokenKind::HashEqualHash
+                )
+            {
+                if min_bp > 1 {
+                    break;
+                }
+                let name = if self.at(TokenKind::HashMinusHash) {
+                    "$sva_follow_overlap"
+                } else {
+                    "$sva_follow_nonoverlap"
+                };
+                self.bump();
+                let rhs = self.parse_expr_bp(1);
+                lhs = Self::sva_marker(name, vec![lhs, rhs], self.span_from(start));
+                continue;
+            }
+
             // Binary/ternary operators
             if let Some((op, l_bp, r_bp)) = self.infix_bp() {
                 if l_bp < min_bp {
@@ -2813,8 +2835,8 @@ impl Parser {
     fn infix_bp(&self) -> Option<(BinaryOp, u8, u8)> {
         let kind = self.current_kind();
         match kind {
-            TokenKind::OrMinusArrow => Some((BinaryOp::OrMinusArrow, 1, 2)),
-            TokenKind::OrFatArrow => Some((BinaryOp::OrFatArrow, 1, 2)),
+            TokenKind::OrMinusArrow => Some((BinaryOp::OrMinusArrow, 1, 1)),
+            TokenKind::OrFatArrow => Some((BinaryOp::OrFatArrow, 1, 1)),
             // §16.9 Table 16-3: `##` binds looser than every expression
             // operator and tighter than the sequence `and` / `or` /
             // `intersect` / `throughout`, so `a ##1 b == c` is

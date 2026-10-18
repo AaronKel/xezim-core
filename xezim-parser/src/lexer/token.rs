@@ -45,6 +45,8 @@ pub enum TokenKind {
     Dot,
     Hash,
     HashHash,
+    HashMinusHash,
+    HashEqualHash,
     At,
     Dollar,
     Assign,   // =

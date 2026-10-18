@@ -422,3 +422,45 @@ fn sampled_clock_arguments_preserve_sequence_actuals() {
     assert!(sequence.contains("name: \"a\""), "{sequence}");
     assert!(!sequence.contains("$__xz_clocking_arg"), "{sequence}");
 }
+
+/// §16.12.9 / Table 16-3: a followed-by RHS is a property, associated right.
+#[test]
+fn followed_by_keeps_right_associated_property() {
+    use crate::ast::expr::{BinaryOp, ExprKind};
+    let result = parse(
+        "module m; bit clk,a,b,c; ap: assert property (@(posedge clk) a #-# b |-> c); endmodule",
+    );
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let Some(Description::Module(module)) = result.source.descriptions.first() else {
+        panic!("not a module")
+    };
+    let a = module
+        .items
+        .iter()
+        .find_map(|item| {
+            if let ModuleItem::AssertionItem(a) = item {
+                Some(a)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let ExprKind::SvaClocked { body, .. } = &a.expr.kind else {
+        panic!("{:?}", a.expr)
+    };
+    let ExprKind::SystemCall { name, args } = &body.kind else {
+        panic!("{body:?}")
+    };
+    assert_eq!(name, "$sva_follow_overlap");
+    assert!(
+        matches!(
+            args[1].kind,
+            ExprKind::Binary {
+                op: BinaryOp::OrMinusArrow,
+                ..
+            }
+        ),
+        "{:?}",
+        args[1]
+    );
+}
