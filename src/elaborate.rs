@@ -6267,6 +6267,7 @@ fn port_actual_is_simple(
 }
 
 /// Where a §6.21 violation was found, for the diagnostic.
+#[derive(Clone, Copy)]
 pub(crate) struct StaticInitScope<'a> {
     /// "function" / "task"
     pub kind: &'a str,
