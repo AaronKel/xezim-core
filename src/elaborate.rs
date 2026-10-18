@@ -27660,11 +27660,11 @@ fn inline_instantiations_inner(
 /// the genvar identifier so downstream constant-evaluation, edge-block
 /// resolution, and bit-select compilation see the resolved index.
 fn genvar_const_expr(value: i64) -> Expression {
-    let signed = value < 0;
+    // §27.4: the implicit genvar localparam is a signed integer.
     Expression::new(
         ExprKind::Number(NumberLiteral::Integer {
             size: Some(32),
-            signed,
+            signed: true,
             base: NumberBase::Decimal,
             value: value.to_string(),
             cached_val: std::cell::Cell::new(Some((value as u64, 0u64, 32u32))),
@@ -28456,6 +28456,19 @@ fn substitute_in_module_item(
     interface_map: &HashMap<String, String>,
 ) -> ModuleItem {
     match item {
+        // §27.4: each generated assertion and its actions see the
+        // iteration's implicit genvar localparam, like other processes.
+        ModuleItem::AssertionItem(a) => {
+            let stmt = crate::ast::stmt::Statement::new(
+                crate::ast::stmt::StatementKind::Assertion(a.clone()),
+                a.span,
+            );
+            let stmt = rewrite_stmt(&stmt, "", port_map, local_names, interface_map);
+            let crate::ast::stmt::StatementKind::Assertion(a) = stmt.kind else {
+                unreachable!()
+            };
+            ModuleItem::AssertionItem(a)
+        }
         ModuleItem::AlwaysConstruct(ac) => ModuleItem::AlwaysConstruct(AlwaysConstruct {
             kind: ac.kind,
             stmt: rewrite_stmt(&ac.stmt, "", port_map, local_names, interface_map),
