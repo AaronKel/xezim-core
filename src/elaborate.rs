@@ -29064,7 +29064,10 @@ fn ai_conn_expr_width(
                 .map(|s| s.name.name.as_str())
                 .collect::<Vec<_>>()
                 .join(".");
-            widths.get(&name).copied()
+            widths
+                .get(&name)
+                .copied()
+                .or_else(|| params.get(&name).map(|v| v.width))
         }
         EK::RangeSelect {
             left,
@@ -29084,6 +29087,72 @@ fn ai_conn_expr_width(
                 sum += ai_conn_expr_width(p, widths, params)?;
             }
             Some(sum)
+        }
+        EK::Number(crate::ast::expr::NumberLiteral::Integer { size: None, .. }) => Some(32),
+        EK::Unary { op, operand } => {
+            use crate::ast::expr::UnaryOp as U;
+            match op {
+                U::LogNot
+                | U::BitAnd
+                | U::BitNand
+                | U::BitOr
+                | U::BitNor
+                | U::BitXor
+                | U::BitXnor => Some(1),
+                _ => ai_conn_expr_width(operand, widths, params),
+            }
+        }
+        EK::Binary { op, left, right } => {
+            use crate::ast::expr::BinaryOp as B;
+            match op {
+                B::Eq
+                | B::Neq
+                | B::CaseEq
+                | B::CaseNeq
+                | B::WildcardEq
+                | B::WildcardNeq
+                | B::LogAnd
+                | B::LogOr
+                | B::LogImplies
+                | B::LogEquiv
+                | B::Lt
+                | B::Leq
+                | B::Gt
+                | B::Geq => Some(1),
+                B::ShiftLeft
+                | B::ShiftRight
+                | B::ArithShiftLeft
+                | B::ArithShiftRight
+                | B::Power => ai_conn_expr_width(left, widths, params),
+                B::Add
+                | B::Sub
+                | B::Mul
+                | B::Div
+                | B::Mod
+                | B::BitAnd
+                | B::BitOr
+                | B::BitXor
+                | B::BitXnor => Some(
+                    ai_conn_expr_width(left, widths, params)?
+                        .max(ai_conn_expr_width(right, widths, params)?),
+                ),
+                _ => None,
+            }
+        }
+        EK::Conditional {
+            then_expr,
+            else_expr,
+            ..
+        } => Some(
+            ai_conn_expr_width(then_expr, widths, params)?
+                .max(ai_conn_expr_width(else_expr, widths, params)?),
+        ),
+        EK::Replication { count, exprs } => {
+            let count = u32::try_from(const_eval_i64_with_params(count, Some(params))?).ok()?;
+            let width = exprs.iter().try_fold(0u32, |sum, e| {
+                sum.checked_add(ai_conn_expr_width(e, widths, params)?)
+            })?;
+            width.checked_mul(count)
         }
         EK::Paren(inner) => ai_conn_expr_width(inner, widths, params),
         _ => None,
@@ -29189,6 +29258,79 @@ fn ai_num_expr(n: i64, span: crate::ast::Span) -> Expression {
     )
 }
 
+/// §23.3.3.5 / §11.5.1: preserve writable leaves when splitting a
+/// concatenation. Selecting the concatenation itself is not an lvalue.
+fn ai_slice_expr(
+    expr: &Expression,
+    offset: u32,
+    width: u32,
+    widths: &HashMap<String, u32>,
+    params: &HashMap<String, Value>,
+) -> Expression {
+    if let ExprKind::Paren(inner) = &expr.kind {
+        return ai_slice_expr(inner, offset, width, widths, params);
+    }
+    if let ExprKind::Concatenation(parts) = &expr.kind {
+        let mut cursor = 0u32;
+        let mut selected = Vec::new();
+        for part in parts.iter().rev() {
+            let part_width = ai_conn_expr_width(part, widths, params).unwrap_or(0);
+            let start = offset.max(cursor);
+            let end = (offset + width).min(cursor + part_width);
+            if start < end {
+                selected.push(ai_slice_expr(
+                    part,
+                    start - cursor,
+                    end - start,
+                    widths,
+                    params,
+                ));
+            }
+            cursor += part_width;
+        }
+        selected.reverse();
+        return if selected.len() == 1 {
+            selected.remove(0)
+        } else {
+            Expression::new(ExprKind::Concatenation(selected), expr.span)
+        };
+    }
+    let mut base = expr;
+    let mut low = offset as i64;
+    let mut high = low + width as i64 - 1;
+    if let ExprKind::RangeSelect {
+        expr: inner,
+        left,
+        right,
+        kind: crate::ast::expr::RangeKind::Constant,
+    } = &expr.kind
+    {
+        if let (Some(left), Some(right)) = (
+            const_eval_i64_with_params(left, Some(params)),
+            const_eval_i64_with_params(right, Some(params)),
+        ) {
+            base = inner;
+            let direction = if left >= right { 1 } else { -1 };
+            low = right + direction * offset as i64;
+            high = low + direction * (width as i64 - 1);
+        }
+    }
+    let kind = if width == 1 {
+        ExprKind::Index {
+            expr: Box::new(base.clone()),
+            index: Box::new(ai_num_expr(low, expr.span)),
+        }
+    } else {
+        ExprKind::RangeSelect {
+            expr: Box::new(base.clone()),
+            kind: crate::ast::expr::RangeKind::Constant,
+            left: Box::new(ai_num_expr(high, expr.span)),
+            right: Box::new(ai_num_expr(low, expr.span)),
+        }
+    };
+    Expression::new(kind, expr.span)
+}
+
 fn ai_slice_conn(
     conn: &crate::ast::decl::PortConnection,
     p: u32,
@@ -29197,6 +29339,7 @@ fn ai_slice_conn(
     widths: &HashMap<String, u32>,
     port_shape: Option<&[(i64, i64)]>,
     unpacked_shapes: &HashMap<String, Vec<(i64, i64)>>,
+    instance_dims: &[(i64, i64)],
     params: &HashMap<String, Value>,
 ) -> crate::ast::decl::PortConnection {
     use crate::ast::decl::PortConnection as PC;
@@ -29213,11 +29356,27 @@ fn ai_slice_conn(
         if h.path.len() == 1 && h.path[0].selects.is_empty() {
             let actual_name = &h.path[0].name.name;
             if let Some(actual) = unpacked_shapes.get(actual_name) {
-                if actual.len() == formal.len() + 1
-                    && actual[1..] == *formal
-                    && (actual[0].1 - actual[0].0 + 1) as u32 == n
+                let rank = instance_dims.len();
+                if actual.len() == formal.len() + rank
+                    && actual[rank..] == *formal
+                    && actual[..rank]
+                        .iter()
+                        .zip(instance_dims)
+                        .all(|(&(al, ar), &(il, ir))| al.abs_diff(ar) == il.abs_diff(ir))
                 {
-                    let sliced = ai_append_indices(expr.clone(), &[actual[0].0 + k as i64]);
+                    // Unpacked actuals match left-to-left in every instance
+                    // dimension, while k counts packed slots from the right.
+                    let mut remainder = k;
+                    let mut indices = Vec::with_capacity(rank);
+                    for &(left, right) in actual[..rank].iter().rev() {
+                        let count = (left.abs_diff(right) + 1) as u32;
+                        let slot = remainder % count;
+                        remainder /= count;
+                        let direction = if left <= right { 1 } else { -1 };
+                        indices.push(left + direction * (count - 1 - slot) as i64);
+                    }
+                    indices.reverse();
+                    let sliced = ai_append_indices(expr.clone(), &indices);
                     return match conn {
                         PC::Ordered(_) => PC::Ordered(Some(sliced)),
                         PC::Named { name, implicit, .. } => PC::Named {
@@ -29236,46 +29395,7 @@ fn ai_slice_conn(
     if !distribute {
         return conn.clone();
     }
-    // Slice the BASE signal at an ABSOLUTE bit offset. If the connection is
-    // already a part-select `sig[hi:lo]`, index into `sig` at `lo + p*k` — NOT
-    // `sig[hi:lo][k]`, a nested bit-of-part-select that can't be driven as a
-    // cont-assign LHS (the whole reason arrayed-instance outputs stayed X).
-    let (base, base_lo): (&Expression, i64) = match &expr.kind {
-        ExprKind::RangeSelect {
-            expr: b,
-            left,
-            right,
-            kind: crate::ast::expr::RangeKind::Constant,
-        } => {
-            let l = const_eval_i64_with_params(left, Some(params));
-            let r = const_eval_i64_with_params(right, Some(params));
-            match (l, r) {
-                (Some(l), Some(r)) => (b.as_ref(), l.min(r)),
-                _ => (expr, 0),
-            }
-        }
-        _ => (expr, 0),
-    };
-    let off = base_lo + (p * k) as i64;
-    let sliced = if p == 1 {
-        Expression::new(
-            ExprKind::Index {
-                expr: Box::new(base.clone()),
-                index: Box::new(ai_num_expr(off, base.span)),
-            },
-            base.span,
-        )
-    } else {
-        Expression::new(
-            ExprKind::RangeSelect {
-                expr: Box::new(base.clone()),
-                kind: crate::ast::expr::RangeKind::Constant,
-                left: Box::new(ai_num_expr(off + p as i64 - 1, base.span)),
-                right: Box::new(ai_num_expr(off, base.span)),
-            },
-            base.span,
-        )
-    };
+    let sliced = ai_slice_expr(expr, p * k, p, widths, params);
     match conn {
         PC::Ordered(_) => PC::Ordered(Some(sliced)),
         PC::Named { name, implicit, .. } => PC::Named {
@@ -29303,19 +29423,34 @@ fn ai_expand_instances(
             out.push(hi.clone());
             continue;
         }
-        let Some((lo, hi_idx)) = extract_array_range(&hi.dimensions, params) else {
+        let Some(dims) = declared_unpacked_dims(&hi.dimensions, params) else {
             out.push(hi.clone());
             continue;
         };
-        let rmin = lo.min(hi_idx);
-        let rmax = lo.max(hi_idx);
-        // §23.3.3: a one-element array (`bus_if b[1]`) still names its
-        // element `b[0]`. Leaving it unexpanded registered the instance as a
-        // plain `b`, so `b[0]` bound to nothing: a module port connected to it
-        // read x, and every edge wait on its members completed at once.
-        let n = (rmax - rmin + 1) as u32;
-        for j in rmin..=rmax {
-            let k = (j - rmin) as u32;
+        let Some(n) = dims
+            .iter()
+            .try_fold(1u32, |count, (left, right)| {
+                count.checked_mul(u32::try_from(left.abs_diff(*right) + 1).ok()?)
+            })
+            .filter(|n| *n <= 1 << 20)
+        else {
+            out.push(hi.clone());
+            continue;
+        };
+        // §23.3.3.5: expand every dimension; the rightmost dimension
+        // varies first and all right-hand indices take the least-significant slice.
+        let normalized: Vec<_> = dims.iter().map(|&(l, r)| (l.min(r), l.max(r))).collect();
+        for indices in shape_index_tuples(&normalized) {
+            let mut k = 0u32;
+            for (&index, &(left, right)) in indices.iter().zip(&dims) {
+                let count = (left.abs_diff(right) + 1) as u32;
+                let slot = if left >= right {
+                    index - right
+                } else {
+                    right - index
+                };
+                k = k * count + slot as u32;
+            }
             let new_conns = hi
                 .connections
                 .iter()
@@ -29343,12 +29478,17 @@ fn ai_expand_instances(
                         widths,
                         port_shapes.get(port_idx).map(Vec::as_slice),
                         unpacked_shapes,
+                        &dims,
                         params,
                     )
                 })
                 .collect();
             let mut ident = hi.name.clone();
-            ident.name = format!("{}[{}]", hi.name.name, j);
+            ident.name = hi.name.name.clone();
+            for index in &indices {
+                use std::fmt::Write as _;
+                let _ = write!(ident.name, "[{index}]");
+            }
             out.push(HInst {
                 name: ident,
                 dimensions: vec![],
@@ -29397,7 +29537,7 @@ fn ai_module_port_shapes(
     match def.ports() {
         PortList::Ansi(ps) => ps
             .iter()
-            .map(|p| fixed_unpacked_shape(&p.dimensions, params).unwrap_or_default())
+            .map(|p| declared_unpacked_dims(&p.dimensions, params).unwrap_or_default())
             .collect(),
         _ => Vec::new(),
     }
@@ -29448,7 +29588,7 @@ fn ai_scan_unpacked_shapes(
         match item {
             ModuleItem::PortDeclaration(pd) => {
                 for d in &pd.declarators {
-                    if let Some(shape) = fixed_unpacked_shape(&d.dimensions, params) {
+                    if let Some(shape) = declared_unpacked_dims(&d.dimensions, params) {
                         if !shape.is_empty() {
                             shapes.insert(d.name.name.clone(), shape);
                         }
@@ -29457,7 +29597,7 @@ fn ai_scan_unpacked_shapes(
             }
             ModuleItem::NetDeclaration(nd) => {
                 for d in &nd.declarators {
-                    if let Some(shape) = fixed_unpacked_shape(&d.dimensions, params) {
+                    if let Some(shape) = declared_unpacked_dims(&d.dimensions, params) {
                         if !shape.is_empty() {
                             shapes.insert(d.name.name.clone(), shape);
                         }
@@ -29466,7 +29606,7 @@ fn ai_scan_unpacked_shapes(
             }
             ModuleItem::DataDeclaration(dd) => {
                 for d in &dd.declarators {
-                    if let Some(shape) = fixed_unpacked_shape(&d.dimensions, params) {
+                    if let Some(shape) = declared_unpacked_dims(&d.dimensions, params) {
                         if !shape.is_empty() {
                             shapes.insert(d.name.name.clone(), shape);
                         }
@@ -29811,8 +29951,22 @@ fn prepare_module_items(
         matches!(it, ModuleItem::ModuleInstantiation(inst)
             if inst.instances.iter().any(|h| !h.dimensions.is_empty()))
     }) {
-        let widths = ai_scan_signal_widths(&effective_items, local_params, typedef_widths);
-        let unpacked_shapes = ai_scan_unpacked_shapes(&effective_items, local_params);
+        let mut widths = ai_scan_signal_widths(&effective_items, local_params, typedef_widths);
+        let mut unpacked_shapes = ai_scan_unpacked_shapes(&effective_items, local_params);
+        if let PortList::Ansi(ports) = source_def.ports() {
+            for port in ports {
+                let width = port
+                    .data_type
+                    .as_ref()
+                    .map(|dt| resolve_type_width(dt, Some(local_params), Some(typedef_widths)))
+                    .unwrap_or(1)
+                    .max(1);
+                widths.insert(port.name.name.clone(), width);
+                if let Some(shape) = declared_unpacked_dims(&port.dimensions, local_params) {
+                    unpacked_shapes.insert(port.name.name.clone(), shape);
+                }
+            }
+        }
         for item in effective_items.iter_mut() {
             if let ModuleItem::ModuleInstantiation(inst) = item {
                 if inst.instances.iter().any(|h| !h.dimensions.is_empty()) {
