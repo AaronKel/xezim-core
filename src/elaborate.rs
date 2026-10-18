@@ -30242,6 +30242,8 @@ fn prepare_module_items(
             // instance-scoped entries the rewrite will now point at are
             // registered unconditionally at instance time.
             ModuleItem::TypedefDeclaration(td) => {
+                // §6.18 / §6.24.1: casts and $bits name this instance's type.
+                local_names.insert(td.name.name.clone());
                 if let DataType::Enum(et) = &td.data_type {
                     for m in &et.members {
                         local_names.insert(m.name.name.clone());
