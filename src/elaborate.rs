@@ -20861,6 +20861,10 @@ pub fn declared_unpacked_dims(
     }
     let mut out = Vec::with_capacity(dims.len());
     for d in dims {
+        // §7.4.2: `[N]` names a size when N resolves to a parameter,
+        // even if the parser initially recorded an associative index type.
+        let resolved = scoped_const_dim(d, params);
+        let d = resolved.as_ref().unwrap_or(d);
         match d {
             crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
                 let l = const_eval_i64_with_params(left, Some(params))?;
@@ -20869,6 +20873,28 @@ pub fn declared_unpacked_dims(
             }
             crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
                 let size = const_eval_i64_with_params(expr, Some(params))?;
+                if size <= 0 {
+                    return None;
+                }
+                out.push((0, size - 1));
+            }
+            UnpackedDimension::Associative {
+                data_type: Some(dt),
+                ..
+            } => {
+                let DataType::TypeReference {
+                    name,
+                    dimensions,
+                    type_args,
+                    ..
+                } = dt.as_ref()
+                else {
+                    return None;
+                };
+                if name.has_scope() || !dimensions.is_empty() || !type_args.is_empty() {
+                    return None;
+                }
+                let size = params.get(&name.name.name)?.to_i64()?;
                 if size <= 0 {
                     return None;
                 }
@@ -43561,5 +43587,72 @@ mod logged_map_tests {
         TYPEDEFS_TLS_MIRROR.with(|m| m.set(None));
         sync_typedefs_tls(&t);
         assert!(same(&tls_snapshot().unwrap(), t.as_map()));
+    }
+    /// §7.4.2: parsed names can denote parameter sizes or associative types.
+    #[test]
+    fn declared_array_dimensions_resolve_parameter_names() {
+        let parsed = crate::parse(
+            "package dim_cfg; parameter int EDGE_COUNT=3; endpackage \
+             module dimension_probe #(parameter int EDGE_COUNT=2); \
+             typedef int key_t; wire sample[EDGE_COUNT][dim_cfg::EDGE_COUNT]; \
+             wire ranges[1:-1][0:2]; int keyed[key_t]; endmodule",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let module = parsed
+            .source
+            .descriptions
+            .iter()
+            .find_map(|d| match d {
+                crate::ast::Description::Module(m) => Some(m),
+                _ => None,
+            })
+            .unwrap();
+        let mut params = HashMap::default();
+        params.insert("EDGE_COUNT".into(), Value::from_u64(2, 32));
+        params.insert("dim_cfg::EDGE_COUNT".into(), Value::from_u64(3, 32));
+        let mut checked = 0;
+        for item in &module.items {
+            let declarators: Vec<_> = match item {
+                ModuleItem::NetDeclaration(d) => d
+                    .declarators
+                    .iter()
+                    .map(|d| (&d.name, &d.dimensions))
+                    .collect(),
+                ModuleItem::DataDeclaration(d) => d
+                    .declarators
+                    .iter()
+                    .map(|d| (&d.name, &d.dimensions))
+                    .collect(),
+                _ => continue,
+            };
+            for (name, dims) in declarators {
+                match name.name.as_str() {
+                    "sample" => {
+                        assert_eq!(
+                            declared_unpacked_dims(dims, &params),
+                            Some(vec![(0, 1), (0, 2)])
+                        );
+                        let mut zero = params.clone();
+                        zero.insert("EDGE_COUNT".into(), Value::zero(32));
+                        assert_eq!(declared_unpacked_dims(dims, &zero), None);
+                        assert_eq!(declared_unpacked_dims(dims, &HashMap::default()), None);
+                        checked += 1;
+                    }
+                    "ranges" => {
+                        assert_eq!(
+                            declared_unpacked_dims(dims, &params),
+                            Some(vec![(1, -1), (0, 2)])
+                        );
+                        checked += 1;
+                    }
+                    "keyed" => {
+                        assert_eq!(declared_unpacked_dims(dims, &params), None);
+                        checked += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(checked, 3);
     }
 }
