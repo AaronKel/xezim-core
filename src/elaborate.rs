@@ -9017,8 +9017,12 @@ pub fn elaborate_module_with_defs(
                             // item-per-element, each collection operand became ONE
                             // (zero) element, and a bare collection initializer was
                             // dropped.
-                            if is_dynamic_dim
-                                && !matches!(init_expr.kind, ExprKind::AssignmentPattern(_))
+                            // §10.9.1: retain fixed-array patterns as whole assignments,
+                            // including keyed/default entries and declared direction.
+                            if (!is_dynamic_dim
+                                && matches!(init_expr.kind, ExprKind::AssignmentPattern(_)))
+                                || (is_dynamic_dim
+                                    && !matches!(init_expr.kind, ExprKind::AssignmentPattern(_)))
                             {
                                 elab.initial_blocks.push(InitialBlock {
                                     stmt: Statement::new(
@@ -15545,8 +15549,12 @@ fn elaborate_items_numbered(
                             // item-per-element, each collection operand became ONE
                             // (zero) element, and a bare collection initializer was
                             // dropped.
-                            if is_dynamic_dim
-                                && !matches!(init_expr.kind, ExprKind::AssignmentPattern(_))
+                            // §10.9.1: retain fixed-array patterns as whole assignments,
+                            // including keyed/default entries and declared direction.
+                            if (!is_dynamic_dim
+                                && matches!(init_expr.kind, ExprKind::AssignmentPattern(_)))
+                                || (is_dynamic_dim
+                                    && !matches!(init_expr.kind, ExprKind::AssignmentPattern(_)))
                             {
                                 elab.initial_blocks.push(InitialBlock {
                                     stmt: Statement::new(
@@ -27057,6 +27065,19 @@ fn inline_instantiations_inner(
                                     }
                                     _ => decl,
                                 };
+                                // §10.9.1: package array patterns need the same
+                                // element type and declared bounds as module arrays.
+                                if !decl.dimensions.is_empty() {
+                                    elab.var_decl_types
+                                        .entry(decl.name.name.clone())
+                                        .or_insert_with(|| dd.data_type.clone());
+                                    if let Some(dims) =
+                                        declared_unpacked_dims(&decl.dimensions, &elab.parameters)
+                                    {
+                                        elab.unpacked_decl_dims
+                                            .insert(decl.name.name.clone(), dims);
+                                    }
+                                }
                                 let first_dim = decl.dimensions.first();
                                 let is_dynamic_dim = first_dim.is_some_and(|d| {
                                     matches!(
@@ -27429,8 +27450,15 @@ fn inline_instantiations_inner(
                                 // item-per-element, each collection operand became ONE
                                 // (zero) element, and a bare collection initializer was
                                 // dropped.
-                                if is_dynamic_dim
-                                    && !matches!(init_expr.kind, ExprKind::AssignmentPattern(_))
+                                // §10.9.1: retain fixed-array patterns as whole assignments,
+                                // including keyed/default entries and declared direction.
+                                if (!is_dynamic_dim
+                                    && matches!(init_expr.kind, ExprKind::AssignmentPattern(_)))
+                                    || (is_dynamic_dim
+                                        && !matches!(
+                                            init_expr.kind,
+                                            ExprKind::AssignmentPattern(_)
+                                        ))
                                 {
                                     elab.static_init_blocks.push(InitialBlock {
                                         stmt: Statement::new(
