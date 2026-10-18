@@ -2,6 +2,35 @@
 
 use super::*;
 
+/// Retain scoped-member shape while rebasing the owner of `C#(...)`.
+/// Flattening only the owner produces a hybrid package path that the
+/// specialization value reader cannot interpret as a static property.
+pub(super) fn specialized_receiver(
+    e: &Expression,
+    prefix: &str,
+    bindings: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interfaces: &HashMap<String, String>,
+) -> Expression {
+    if let ExprKind::MemberAccess { expr, member } = &e.kind {
+        Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(specialized_receiver(
+                    expr,
+                    prefix,
+                    bindings,
+                    local_names,
+                    interfaces,
+                )),
+                member: member.clone(),
+            },
+            e.span,
+        )
+    } else {
+        rewrite_expr_impl(e, prefix, bindings, local_names, interfaces)
+    }
+}
+
 fn receiver_text(e: &Expression) -> Option<String> {
     match &e.kind {
         ExprKind::Ident(h) if h.root.is_none() && h.path.iter().all(|p| p.selects.is_empty()) => {

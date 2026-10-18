@@ -40701,7 +40701,7 @@ fn rewrite_expr_impl(
             base,
             type_args_text,
         } => ExprKind::Specialization {
-            base: Box::new(rewrite_expr_impl(
+            base: Box::new(module_class_scope::specialized_receiver(
                 base,
                 prefix,
                 port_map,
