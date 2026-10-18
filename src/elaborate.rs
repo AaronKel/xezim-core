@@ -28066,6 +28066,17 @@ fn rename_item_decls(
             span: ic.span,
             gen_scope: ic.gen_scope.clone(),
         }),
+        // §27.4/§16.14.1: assertion predicates and actions refer to this
+        // iteration's declarations, just like initial/always bodies. Keeping
+        // the item unchanged bound a shadowed counter to the parent module.
+        ModuleItem::AssertionItem(a) => {
+            let st = Statement::new(StatementKind::Assertion(a.clone()), a.span);
+            let rewritten = rewrite_stmt(&st, "", port_map, local_names, interface_map);
+            let StatementKind::Assertion(a) = rewritten.kind else {
+                unreachable!()
+            };
+            ModuleItem::AssertionItem(a)
+        }
         ModuleItem::FunctionDeclaration(fd) => {
             let mut new_fd = fd.clone();
             new_fd.items = fd
