@@ -166,6 +166,11 @@ impl Parser {
             TokenKind::KwInterface => {
                 self.bump();
                 let name = self.parse_identifier();
+                // §25.9 / §8.4: class-item parsing consumes `virtual` as
+                // a qualifier, leaving `interface I #(...)` as the type.
+                // Preserve its parameter assignments before the modport,
+                // just as the `virtual` and named-type paths do.
+                let type_args = self.parse_type_args_hash(start);
                 let modport = if self.eat(TokenKind::Dot).is_some() {
                     Some(self.parse_identifier())
                 } else {
@@ -174,7 +179,7 @@ impl Parser {
                 DataType::Interface {
                     name,
                     modport,
-                    type_args: Vec::new(),
+                    type_args,
                     span: self.span_from(start),
                 }
             }
