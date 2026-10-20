@@ -28,3 +28,8 @@ jobs:
 
       - name: cargo msrv verify
         run: cargo msrv verify
+
+      - name: Parser MSRV
+        if: always()
+        working-directory: xezim-parser
+        run: cargo msrv verify

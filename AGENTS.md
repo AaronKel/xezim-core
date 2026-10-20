@@ -69,16 +69,17 @@ xezim-parser/src/strict_check.rs  Additive negative-case lint (gated by --strict
 ## Build & test
 
 Toolchain: Rust **1.92** MSRV (`rust-version` in `Cargo.toml`), edition 2024.
-CI (`test.yml`) runs `cargo test`; `msrv.yml` runs `cargo msrv verify`.
+CI (`test.yml`) runs core and parser tests separately; `msrv.yml` verifies
+both crates. The parser is a path dependency, not a workspace member.
 
 ```bash
 cargo build                          # debug
 cargo build --release                # optimized (lto=true, codegen-units=1)
-cargo test                           # unit tests in src/ + xezim-parser/src/tests.rs
-cargo test -p sv-parser              # just the parser subcrate
-cargo run -p sv-parser -- --check design.sv    # sv-parse CLI: parse-only, report errors
-cargo run -p sv-parser -- --dump-ast design.sv  # dump the AST (Rust Debug format)
-cargo run -p sv-parser -- --dump-json design.sv # one JSON object per file
+cargo test                           # core unit and integration tests
+cargo test --manifest-path xezim-parser/Cargo.toml # parser unit/integration/doc tests
+cargo run --manifest-path xezim-parser/Cargo.toml -- --check design.sv # parse-only
+cargo run --manifest-path xezim-parser/Cargo.toml -- --dump-ast design.sv # AST
+cargo run --manifest-path xezim-parser/Cargo.toml -- --dump-json design.sv # JSON
 ```
 
 Tests live next to code (`#[cfg(test)] mod tests` in `src/value.rs`,

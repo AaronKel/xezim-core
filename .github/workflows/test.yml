@@ -25,3 +25,9 @@ jobs:
 
       - name: cargo test (no features)
         run: cargo test
+
+      # The parser is a path dependency, so the root test command does not
+      # run its unit, integration or documentation tests.
+      - name: Parser tests
+        if: always()
+        run: cargo test --manifest-path xezim-parser/Cargo.toml
