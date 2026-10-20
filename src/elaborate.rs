@@ -19557,7 +19557,12 @@ fn const_eval_user_call(
         }
         // §13.4.3: actuals retain width, signedness, realness and X/Z until
         // conversion to the formal; an i64/32-bit bridge loses those values.
-        argv.push(eval_const_expr_val(&folded, &shell.parameters));
+        argv.push(const_function_actual(
+            fd.ports.get(argv.len()),
+            &folded,
+            &shell.parameters,
+            &shell,
+        ));
     }
     eval_const_user_function(&fd, &argv, &shell.parameters, &shell, 0)
 }
@@ -37459,6 +37464,29 @@ fn make_syscall(name: &str, args: Vec<Expression>, span: Span) -> Expression {
 /// parameter initializer that calls one of these used to be DEFERRED with
 /// value 0 — every dependent parameter and port width then wrapped
 /// (`LOG_X - 6` → 4294967290) and whole buses collapsed to 1 bit.
+/// §13.3 / §10.7: an integral formal provides the assignment context for
+/// its actual expression, before the function body sees its converted value.
+fn const_function_actual(
+    port: Option<&crate::ast::decl::FunctionPort>,
+    expr: &Expression,
+    params: &HashMap<String, Value>,
+    elab: &ElaboratedModule,
+) -> Value {
+    let value = eval_const_expr_val(expr, params);
+    if let Some(port) = port.filter(|p| p.dimensions.is_empty()) {
+        if let Some(target) = param_integral_target(
+            &port.data_type,
+            &HashMap::default(),
+            params,
+            &elab.typedefs,
+            &elab.typedef_types,
+        ) {
+            return convert_param_value(&value, Some(expr), params, target);
+        }
+    }
+    value
+}
+
 fn eval_const_user_function(
     fd: &FunctionDeclaration,
     arg_vals: &[Value],
@@ -38042,7 +38070,12 @@ fn substitute_const_fn_calls(
                 if expr_has_call(&sa) {
                     return None;
                 }
-                argv.push(eval_const_expr_val(&sa, params));
+                argv.push(const_function_actual(
+                    fd.ports.get(argv.len()),
+                    &sa,
+                    params,
+                    elab,
+                ));
             }
             let v = eval_const_user_function(&fd, &argv, params, elab, depth)?;
             // §13.4.1: preserve the declared return width and signedness,
