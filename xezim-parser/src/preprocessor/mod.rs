@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::diagnostics::{self, Location};
-use crate::source_map::{LineMap, LineOrigin, MapFile};
+use crate::source_map::{LineMap, LineOrigin, MacroColumn, MapFile};
 
 #[derive(Debug, Clone)]
 pub struct MacroDef {
@@ -79,6 +79,7 @@ pub struct Preprocessor {
     map_files: Vec<MapFile>,
     /// Macro names referenced by the line map, and their indices.
     map_macros: Vec<String>,
+    map_columns: Vec<Vec<MacroColumn>>,
     map_macro_idx: HashMap<String, u32>,
     /// `map_files` index of `current_file`.
     cur_file_idx: u32,
@@ -284,6 +285,7 @@ impl Preprocessor {
             undefined_seen: std::cell::RefCell::new(Vec::new()),
             map_files: Vec::new(),
             map_macros: Vec::new(),
+            map_columns: Vec::new(),
             map_macro_idx: HashMap::new(),
             cur_file_idx: 0,
             cur_line_text: String::new(),
@@ -757,9 +759,11 @@ impl Preprocessor {
     fn finish_map(&mut self, text: &str, origins: &[LineOrigin]) {
         let files = std::mem::take(&mut self.map_files);
         let macros = std::mem::take(&mut self.map_macros);
+        let columns = std::mem::take(&mut self.map_columns);
         self.map_macro_idx.clear();
         let lines = text.as_bytes().iter().filter(|&&b| b == b'\n').count();
-        self.last_map = (lines == origins.len()).then(|| LineMap::new(files, macros, origins));
+        self.last_map =
+            (lines == origins.len()).then(|| LineMap::new(files, macros, origins, columns));
     }
 
     /// The line map of the text the last `preprocess_file`/`preprocess` call
@@ -1605,8 +1609,8 @@ impl Preprocessor {
 
             let expanded = self.expand_macros(&logical_line);
             self.flush_expansion_diagnostics();
-            // Origins for the joined lines, and for macro text: the first
-            // user macro invoked on a line names the expansion.
+            // Base origins for joined lines and macro text. Exact same-line
+            // columns below distinguish each expansion and its following text.
             let joined_origin = |this: &mut Self, k: usize| -> LineOrigin {
                 if let Some(o) = fixed {
                     return o;
@@ -1621,18 +1625,23 @@ impl Preprocessor {
                     if fixed.is_some() {
                         return Some(base);
                     }
-                    let (mcol, name) = this.first_user_macro(text)?;
+                    let (mcol, name) = this.first_expanded_macro(text)?;
                     // Extent of the first expansion: ordinary tokens following
                     // the call on the same line keep their own column (#398).
                     let (mend, mcall) = this
                         .first_macro_extent(text, out_line, mcol)
                         .unwrap_or((0, 0));
+                    let columns = this.macro_columns(text, out_line).map_or(0, |columns| {
+                        this.map_columns.push(columns);
+                        this.map_columns.len() as u32
+                    });
                     Some(LineOrigin {
                         mac: this.macro_index(name),
                         mcol,
                         mfirst: true,
                         mend,
                         mcall,
+                        columns,
                         ..base
                     })
                 };
@@ -1787,7 +1796,7 @@ impl Preprocessor {
 
     /// Column (relative to the line start) and name of the first user macro
     /// invoked in `text`; `__FILE__`/`__LINE__` do not count.
-    fn first_user_macro<'a>(&self, text: &'a str) -> Option<(u32, &'a str)> {
+    fn first_expanded_macro<'a>(&self, text: &'a str) -> Option<(u32, &'a str)> {
         let mut in_str = false;
         let b = text.as_bytes();
         let mut i = 0;
@@ -1802,9 +1811,8 @@ impl Preprocessor {
                     }
                     let name = &text[start..j];
                     if !name.is_empty()
-                        && name != "__FILE__"
-                        && name != "__LINE__"
-                        && self.defines.contains_key(name)
+                        && (self.defines.contains_key(name)
+                            || matches!(name, "__FILE__" | "__LINE__"))
                     {
                         return Some((text[..i].chars().count() as u32, name));
                     }
@@ -1819,7 +1827,7 @@ impl Preprocessor {
     }
 
     /// Length of a complete macro invocation in `text` starting at the
-    /// backtick at byte `i` (which `first_user_macro` reported). The call is
+    /// backtick at byte `i` (which `first_expanded_macro` reported). The call is
     /// `` `NAME `` optionally followed by a balanced `(...)` actual list.
     fn macro_call_len(text: &str, i: usize) -> usize {
         let b = text.as_bytes();
@@ -1851,32 +1859,90 @@ impl Preprocessor {
         k - i
     }
 
+    fn macro_invocation_end(&self, text: &str, start: usize, name: &str) -> usize {
+        if self
+            .defines
+            .get(name)
+            .is_some_and(|def| def.params.is_some())
+        {
+            start + Self::macro_call_len(text, start)
+        } else {
+            start + name.len() + 1
+        }
+    }
+
+    /// Exact columns for several expansions on one source line. The common
+    /// single-expansion case uses its prefix/suffix extent without re-expanding.
+    /// Multiline or directive-producing expansions retain their existing map.
+    fn macro_columns(&mut self, source: &str, expanded: &str) -> Option<Vec<MacroColumn>> {
+        if source.contains('\n') || expanded.contains('\n') {
+            return None;
+        }
+        let (column, name) = self.first_expanded_macro(source)?;
+        let start = source.char_indices().nth(column as usize)?.0;
+        let end = self.macro_invocation_end(source, start, name);
+        self.first_expanded_macro(&source[end..])?;
+
+        let mut columns = Vec::new();
+        let mut input = 0;
+        let mut output = 0;
+        while let Some((column, name)) = self.first_expanded_macro(&source[input..]) {
+            let start = input + source[input..].char_indices().nth(column as usize)?.0;
+            let end = self.macro_invocation_end(source, start, name);
+            let prefix = &source[input..start];
+            if !expanded[output..].starts_with(prefix) {
+                return None;
+            }
+            output += prefix.len();
+            // Expansion diagnostics were already emitted for the complete
+            // line. Reconstruct only its map, without reporting them twice.
+            let errors = self.expansion_errors.borrow().len();
+            let undefined = self.undefined_seen.borrow().len();
+            let replacement = self.expand_macros(&source[start..end]);
+            self.expansion_errors.borrow_mut().truncate(errors);
+            self.undefined_seen.borrow_mut().truncate(undefined);
+            if !expanded[output..].starts_with(&replacement) {
+                return None;
+            }
+            let out_start = expanded[..output].chars().count() as u32;
+            output += replacement.len();
+            columns.push(MacroColumn {
+                start: out_start,
+                end: expanded[..output].chars().count() as u32,
+                source_start: source[..start].chars().count() as u32,
+                source_end: source[..end].chars().count() as u32,
+                mac: self.macro_index(name),
+            });
+            input = end;
+        }
+        (expanded[output..] == source[input..]).then_some(columns)
+    }
+
     /// Extent and original length of the FIRST macro invocation on a line.
     /// Returns `(mend, mcall)`:
-    /// - `mend`: column (exclusive) in `out_line` where the substitution ends;
+    /// - `mend`: number of output characters substituted at the invocation;
     ///   ordinary tokens that FOLLOW it on the same line sit at/after this and
     ///   are original text, so the line map must not attribute them to the
     ///   macro.
     /// - `mcall`: character length of the invocation (`` `NAME `` plus any
     ///   balanced `(...)`) in `in_line`.
     /// `mcol` is the char column of the invocation's backtick in `in_line`.
-    /// Returns `None` when the extent cannot be determined (multiple/nested
-    /// macros after the first, or a call running to the line end); callers
-    /// then keep the historical whole-tail-is-macro behaviour for `mend`.
+    /// Returns `None` when the unchanged suffix cannot be found at the end;
+    /// multiple expansions use `macro_columns` instead.
     fn first_macro_extent(&self, in_line: &str, out_line: &str, mcol: u32) -> Option<(u32, u32)> {
         let mbytes = in_line.char_indices().nth(mcol as usize).map(|(i, _)| i)?;
-        let call_len = Self::macro_call_len(in_line, mbytes);
+        let (_, name) = self.first_expanded_macro(in_line)?;
+        let call_len = self.macro_invocation_end(in_line, mbytes, name) - mbytes;
         if call_len == 0 {
             return None;
         }
         let after_call = &in_line[mbytes + call_len..];
-        if after_call.trim().is_empty() {
-            // The call runs to end of line: no ordinary text resumes after it.
-            return None;
-        }
         let obytes = out_line.char_indices().nth(mcol as usize)?.0;
         let rest = &out_line[obytes..];
-        let at = rest.find(after_call)?;
+        if !rest.ends_with(after_call) {
+            return None;
+        }
+        let at = rest.len() - after_call.len();
         // mend is a count of chars from the invocation backtick to where the
         // ordinary text resumes; mcall is the input call's char length.
         Some((

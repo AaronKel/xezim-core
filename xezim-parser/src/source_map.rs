@@ -39,9 +39,8 @@ pub(crate) struct LineOrigin {
     /// FOLLOW a macro call on the same line sit at `>= mcol + mend` and are
     /// original text, not macro text. On `mfirst == false` (continuation
     /// lines of a multi-line expansion) every token is macro text and this
-    /// value is ignored. A value of 0 means "extent unknown": the caller
-    /// falls back to treating the whole tail of the line as macro text
-    /// (the historical behaviour).
+    /// value is ignored. When both `mend` and `mcall` are zero the extent is
+    /// unknown; a known empty expansion has zero `mend` and nonzero `mcall`.
     pub mend: u32,
     /// Macro-expanded text: character length of the FIRST macro invocation
     /// (`` `NAME `` plus any balanced `(...)`) in the ORIGINAL line. When a
@@ -50,6 +49,8 @@ pub(crate) struct LineOrigin {
     /// the OFFSET of the following original text is shifted by `mcall - mend`.
     /// Zero means unknown (no adjustment).
     pub mcall: u32,
+    /// One-based index into the map's exact same-line expansion columns.
+    pub columns: u32,
 }
 
 impl LineOrigin {
@@ -63,6 +64,7 @@ impl LineOrigin {
             mfirst: false,
             mend: 0,
             mcall: 0,
+            columns: 0,
         }
     }
 }
@@ -76,16 +78,32 @@ struct Seg {
     step: Option<u32>,
 }
 
+/// One expansion and its invocation, in character columns on the same line.
+#[derive(Debug, Clone)]
+pub(crate) struct MacroColumn {
+    pub start: u32,
+    pub end: u32,
+    pub source_start: u32,
+    pub source_end: u32,
+    pub mac: u32,
+}
+
 /// Maps each line of one preprocessed text to its origin.
 #[derive(Debug, Clone, Default)]
 pub struct LineMap {
     pub files: Vec<MapFile>,
     macros: Vec<String>,
     segs: Vec<Seg>,
+    columns: Vec<Vec<MacroColumn>>,
 }
 
 impl LineMap {
-    pub(crate) fn new(files: Vec<MapFile>, macros: Vec<String>, origins: &[LineOrigin]) -> Self {
+    pub(crate) fn new(
+        files: Vec<MapFile>,
+        macros: Vec<String>,
+        origins: &[LineOrigin],
+        columns: Vec<Vec<MacroColumn>>,
+    ) -> Self {
         let mut segs: Vec<Seg> = Vec::new();
         for (i, o) in origins.iter().enumerate() {
             let i = i as u32;
@@ -120,6 +138,7 @@ impl LineMap {
             files,
             macros,
             segs,
+            columns,
         }
     }
 
@@ -181,6 +200,29 @@ impl LineMap {
             included_from: self.include_chain(o.file),
             fallback_text: None,
         };
+        if let Some(columns) = o
+            .columns
+            .checked_sub(1)
+            .and_then(|index| self.columns.get(index as usize))
+        {
+            // §22.5: each expansion maps to its own invocation; plain text
+            // between or after expansions keeps its original source column.
+            let count = columns.partition_point(|column| column.start <= out_col);
+            if let Some(column) = count.checked_sub(1).map(|index| &columns[index]) {
+                if out_col < column.end {
+                    let name = self.macros[column.mac as usize - 1].clone();
+                    loc.col = o.col + column.source_start + 1;
+                    loc.len = name.chars().count() as u32 + 1;
+                    loc.macro_name = Some(name);
+                } else {
+                    loc.col = (o.col as i64 + out_col as i64 + column.source_end as i64
+                        - column.end as i64
+                        + 1)
+                    .max(1) as u32;
+                }
+            }
+            return Some(loc);
+        }
         // Canonical macro-text predicate on the expansion's first line: a
         // token is macro text only while its column lies within the
         // substituted run [mcol, mcol+mend). Ordinary tokens before the call
@@ -191,7 +233,9 @@ impl LineMap {
         // to the macro, so `logic [`W-1:0] data;` misreported `data` (which
         // comes after the expansion) at the invocation column.
         let in_macro_text = o.mac != 0
-            && (!o.mfirst || (out_col >= o.mcol && (o.mend == 0 || out_col < o.mcol + o.mend)));
+            && (!o.mfirst
+                || (out_col >= o.mcol
+                    && ((o.mend == 0 && o.mcall == 0) || out_col < o.mcol + o.mend)));
         if in_macro_text {
             // Macro text: point at the invocation (text left of it on the
             // expansion's first line is still the original).
@@ -211,11 +255,10 @@ impl LineMap {
             // original offset is `out_col + (mcall as i64 - mend as i64)`.
             // Without this the token keeps its preprocessed column, which is
             // wrong when the expansion shrank/grew (`` `W `` -> `8` moves
-            // `data` left by one). Only the FIRST expansion on the line is
-            // modelled; exotic multi-macro lines degrade to the unadjusted
-            // column, which is still far better than the old misattribute.
+            // `data` left by one). Several same-line expansions use the
+            // exact columns above; this is the single-expansion path.
             let mid = o.mcol + o.mend;
-            if o.mac != 0 && o.mfirst && o.mend != 0 && out_col >= mid && o.mcall != 0 {
+            if o.mac != 0 && o.mfirst && out_col >= mid && o.mcall != 0 {
                 let shift = o.mcall as i64 - o.mend as i64;
                 loc.col = (o.col as i64 + out_col as i64 + shift + 1).max(0) as u32;
             }
