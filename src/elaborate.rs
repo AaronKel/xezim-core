@@ -19527,16 +19527,21 @@ fn const_eval_user_call(
         .and_then(|k| funcs.get(k))
         .or_else(|| funcs.get(&fname))
         .cloned()?;
-    let mut argv = Vec::with_capacity(args.len());
-    for a in args {
-        let av = const_eval_i64_with_params(a, params)?;
-        argv.push(Value::from_u64(av as u64, 32));
-    }
     let mut shell = ElaboratedModule::new(String::new());
     if let Some(p) = params {
         shell.parameters = p.clone();
     }
     shell.functions = FuncTable::from_map((*funcs).clone());
+    let mut argv = Vec::with_capacity(args.len());
+    for a in args {
+        let folded = substitute_const_fn_calls(a, &shell.parameters, &shell, 0)?;
+        if expr_has_call(&folded) || !is_const_expr(&folded, &shell.parameters) {
+            return None;
+        }
+        // §13.4.3: actuals retain width, signedness, realness and X/Z until
+        // conversion to the formal; an i64/32-bit bridge loses those values.
+        argv.push(eval_const_expr_val(&folded, &shell.parameters));
+    }
     eval_const_user_function(&fd, &argv, &shell.parameters, &shell, 0)
 }
 
@@ -38019,15 +38024,9 @@ fn substitute_const_fn_calls(
                 argv.push(eval_const_expr_val(&sa, params));
             }
             let v = eval_const_user_function(&fd, &argv, params, elab, depth)?;
-            // A REAL result substitutes as a REAL literal — `to_i64` dropped
-            // the fraction and the realness (`localparam D = f_div(5)` with a
-            // real function read 0/2 instead of 2.5).
-            if v.is_real {
-                Expression::new(ExprKind::Number(NumberLiteral::Real(v.to_f64())), expr.span)
-            } else {
-                let iv = v.to_i64()?;
-                make_i64_literal(iv, expr.span)
-            }
+            // §13.4.1: preserve the declared return width and signedness,
+            // including wide and four-state results used by another call.
+            const_value_literal(&v, expr.span)?
         }
         ExprKind::Binary { op, left, right } => rebuild(ExprKind::Binary {
             op: *op,
