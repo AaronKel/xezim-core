@@ -3107,12 +3107,25 @@ fn resolve_instance_binds(
         }
         let mut targets = Vec::new();
         if b.target_path.is_empty() {
-            targets.extend(
-                hosts
-                    .iter()
-                    .filter(|(_, def)| *def == b.target_module.name)
-                    .map(|(p, _)| p.clone()),
-            );
+            // §23.11: a single identifier can name an instance as well as a
+            // module/interface type. Lexical instance lookup takes priority,
+            // including when an unrelated type has the same spelling.
+            let instance = ancestors
+                .iter()
+                .filter(|parent| !parent.is_empty())
+                .map(|parent| format!("{parent}.{}", b.target_module.name))
+                .chain(std::iter::once(b.target_module.name.clone()))
+                .find(|candidate| hosts.iter().any(|(host, _)| host == candidate));
+            if let Some(instance) = instance {
+                targets.push(instance);
+            } else {
+                targets.extend(
+                    hosts
+                        .iter()
+                        .filter(|(_, def)| *def == b.target_module.name)
+                        .map(|(p, _)| p.clone()),
+                );
+            }
         } else {
             for path in std::iter::once(&b.target_path).chain(b.extra_paths.iter()) {
                 let mut joined = String::new();
