@@ -484,9 +484,7 @@ impl Parser {
                     if self.pos > before {
                         return Some(Description::PackageItem(PackageItem::Net(net)));
                     }
-                    while !self.at(TokenKind::Eof)
-                        && !self.at(TokenKind::Semicolon)
-                    {
+                    while !self.at(TokenKind::Eof) && !self.at(TokenKind::Semicolon) {
                         self.bump();
                     }
                     self.expect(TokenKind::Semicolon);

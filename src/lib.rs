@@ -2195,21 +2195,29 @@ fn parse_and_elaborate(
                 // `$unit::<name>` (see the variable injection below) — rewrite
                 // the injected body to reference THAT, or the subroutine would
                 // silently read/write the module's shadow instead.
-                let mut shadowed_unit_vars: std::collections::HashMap<String, String> = top_level_vars
-                    .iter()
-                    .flat_map(|d| d.declarators.iter())
-                    .filter(|v| local_decl_names.contains(&v.name.name))
-                    .map(|v| {
-                        (
-                            v.name.name.clone(),
-                            sv_parser::unit_scope_name(&v.name.name),
-                        )
-                    })
-                    .collect();
-                shadowed_unit_vars.extend(
-                    top_level_nets.iter().flat_map(|d| &d.declarators)
+                let mut shadowed_unit_vars: std::collections::HashMap<String, String> =
+                    top_level_vars
+                        .iter()
+                        .flat_map(|d| d.declarators.iter())
                         .filter(|v| local_decl_names.contains(&v.name.name))
-                        .map(|v| (v.name.name.clone(), sv_parser::unit_scope_name(&v.name.name))),
+                        .map(|v| {
+                            (
+                                v.name.name.clone(),
+                                sv_parser::unit_scope_name(&v.name.name),
+                            )
+                        })
+                        .collect();
+                shadowed_unit_vars.extend(
+                    top_level_nets
+                        .iter()
+                        .flat_map(|d| &d.declarators)
+                        .filter(|v| local_decl_names.contains(&v.name.name))
+                        .map(|v| {
+                            (
+                                v.name.name.clone(),
+                                sv_parser::unit_scope_name(&v.name.name),
+                            )
+                        }),
                 );
                 let subst_body = |items: &[ast::stmt::Statement],
                                   ports: &[ast::decl::FunctionPort]|
@@ -2368,16 +2376,19 @@ fn parse_and_elaborate(
                         }
                         if let Some(init) = &mut decl.init {
                             let stmt = ast::stmt::Statement::new(
-                                ast::stmt::StatementKind::Expr(init.clone()), init.span,
+                                ast::stmt::StatementKind::Expr(init.clone()),
+                                init.span,
                             );
                             if let ast::stmt::StatementKind::Expr(expr) =
-                                elaborate::substitute_bare_idents_stmt(&stmt, &shadowed_unit_vars).kind
+                                elaborate::substitute_bare_idents_stmt(&stmt, &shadowed_unit_vars)
+                                    .kind
                             {
                                 *init = expr;
                             }
                         }
                     }
-                    m.items.insert(0, ast::decl::ModuleItem::NetDeclaration(net));
+                    m.items
+                        .insert(0, ast::decl::ModuleItem::NetDeclaration(net));
                 }
             }
         }

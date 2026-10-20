@@ -191,8 +191,7 @@ impl LineMap {
         // to the macro, so `logic [`W-1:0] data;` misreported `data` (which
         // comes after the expansion) at the invocation column.
         let in_macro_text = o.mac != 0
-            && (!o.mfirst
-                || (out_col >= o.mcol && (o.mend == 0 || out_col < o.mcol + o.mend)));
+            && (!o.mfirst || (out_col >= o.mcol && (o.mend == 0 || out_col < o.mcol + o.mend)));
         if in_macro_text {
             // Macro text: point at the invocation (text left of it on the
             // expansion's first line is still the original).

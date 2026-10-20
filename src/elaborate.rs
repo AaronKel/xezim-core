@@ -6530,9 +6530,7 @@ fn check_module_use_before_decl(module: &Definition) -> Vec<String> {
             K::ForeachTail { body, .. }
             | K::Forever { body }
             | K::ForeverTail { body }
-            | K::RsAction { body } => {
-                check_stmt_uses(body, declared_at, dsf, locals, visited, out)
-            }
+            | K::RsAction { body } => check_stmt_uses(body, declared_at, dsf, locals, visited, out),
             K::SeqBlock { stmts, .. } | K::ParBlock { stmts, .. } => {
                 // §6.21: names declared anywhere in the block are visible
                 // throughout it; publish them before checking the body.
@@ -6551,7 +6549,11 @@ fn check_module_use_before_decl(module: &Definition) -> Vec<String> {
             K::TimingControl { stmt, .. } => {
                 check_stmt_uses(stmt, declared_at, dsf, locals, visited, out)
             }
-            K::If { then_stmt, else_stmt, .. } => {
+            K::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
                 check_stmt_uses(then_stmt, declared_at, dsf, locals, visited, out);
                 if let Some(el) = else_stmt {
                     check_stmt_uses(el, declared_at, dsf, locals, visited, out);
@@ -6562,14 +6564,10 @@ fn check_module_use_before_decl(module: &Definition) -> Vec<String> {
                     check_stmt_uses(&it.stmt, declared_at, dsf, locals, visited, out);
                 }
             }
-            K::While { body, .. }
-            | K::DoWhile { body, .. }
-            | K::Repeat { body, .. } => {
+            K::While { body, .. } | K::DoWhile { body, .. } | K::Repeat { body, .. } => {
                 check_stmt_uses(body, declared_at, dsf, locals, visited, out)
             }
-            K::Wait { stmt, .. } => {
-                check_stmt_uses(stmt, declared_at, dsf, locals, visited, out)
-            }
+            K::Wait { stmt, .. } => check_stmt_uses(stmt, declared_at, dsf, locals, visited, out),
             K::RandCase { items } => {
                 for (_w, s) in items {
                     check_stmt_uses(s, declared_at, dsf, locals, visited, out);
@@ -6707,7 +6705,12 @@ fn check_module_use_before_decl(module: &Definition) -> Vec<String> {
             ModuleItem::ContinuousAssign(ca) => {
                 for (lhs, _rhs) in &ca.assignments {
                     probe_lvalue(
-                        lhs, &declared_at, &declared_so_far, &empty, &mut visited, &mut out,
+                        lhs,
+                        &declared_at,
+                        &declared_so_far,
+                        &empty,
+                        &mut visited,
+                        &mut out,
                     );
                 }
             }
@@ -6806,27 +6809,17 @@ fn check_module_use_before_decl(module: &Definition) -> Vec<String> {
                 _ => {}
             }
             match it {
-                ModuleItem::GenerateRegion(g) => walk_items(
-                    &g.items,
-                    declared_at,
-                    &dsf,
-                    locals,
-                    visited,
-                    out,
-                ),
+                ModuleItem::GenerateRegion(g) => {
+                    walk_items(&g.items, declared_at, &dsf, locals, visited, out)
+                }
                 ModuleItem::GenerateIf(g) => {
                     for (_c, items) in &g.branches {
                         walk_items(items, declared_at, &dsf, locals, visited, out)
                     }
                 }
-                ModuleItem::GenerateFor(g) => walk_items(
-                    &g.items,
-                    declared_at,
-                    &dsf,
-                    locals,
-                    visited,
-                    out,
-                ),
+                ModuleItem::GenerateFor(g) => {
+                    walk_items(&g.items, declared_at, &dsf, locals, visited, out)
+                }
                 ModuleItem::GenerateCase(g) => {
                     for arm in &g.arms {
                         walk_items(&arm.items, declared_at, &dsf, locals, visited, out)
@@ -6838,20 +6831,44 @@ fn check_module_use_before_decl(module: &Definition) -> Vec<String> {
     }
     for gitem in module.items() {
         match gitem {
-            ModuleItem::GenerateRegion(g) => {
-                walk_items(&g.items, &declared_at, &declared_so_far, &empty, &mut visited, &mut out)
-            }
+            ModuleItem::GenerateRegion(g) => walk_items(
+                &g.items,
+                &declared_at,
+                &declared_so_far,
+                &empty,
+                &mut visited,
+                &mut out,
+            ),
             ModuleItem::GenerateIf(g) => {
                 for (_c, items) in &g.branches {
-                    walk_items(items, &declared_at, &declared_so_far, &empty, &mut visited, &mut out)
+                    walk_items(
+                        items,
+                        &declared_at,
+                        &declared_so_far,
+                        &empty,
+                        &mut visited,
+                        &mut out,
+                    )
                 }
             }
-            ModuleItem::GenerateFor(g) => {
-                walk_items(&g.items, &declared_at, &declared_so_far, &empty, &mut visited, &mut out)
-            }
+            ModuleItem::GenerateFor(g) => walk_items(
+                &g.items,
+                &declared_at,
+                &declared_so_far,
+                &empty,
+                &mut visited,
+                &mut out,
+            ),
             ModuleItem::GenerateCase(g) => {
                 for arm in &g.arms {
-                    walk_items(&arm.items, &declared_at, &declared_so_far, &empty, &mut visited, &mut out)
+                    walk_items(
+                        &arm.items,
+                        &declared_at,
+                        &declared_so_far,
+                        &empty,
+                        &mut visited,
+                        &mut out,
+                    )
                 }
             }
             _ => {}
@@ -29579,7 +29596,11 @@ fn collect_effective_items_scoped(
                     if arm.values.is_empty() {
                         continue;
                     }
-                    if arm.values.iter().any(|v| eval_generate_const(v, params) == sel) {
+                    if arm
+                        .values
+                        .iter()
+                        .any(|v| eval_generate_const(v, params) == sel)
+                    {
                         chosen = Some(arm);
                         break;
                     }

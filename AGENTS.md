@@ -162,8 +162,8 @@ change and match the surrounding style.
 3. Fix it here in `src/elaborate.rs` or `xezim-parser`; keep it localized.
 4. `cargo test` here, then run the focused test in `xezim`
    (`cargo test --test <group> <name>`), then `cargo test --no-fail-fast` and
-   `cargo test --features jit --no-fail-fast` there (exactly what xezim's CI
-   runs).
+   the two JIT smoke tests selected in `../xezim/.github/workflows/test.yml`
+   there. The full JIT regression is available for manual runs.
 5. Re-verify determinism (`+seed=1` twice, diff output) for anything touching
    hash/RNG order.
 
@@ -177,7 +177,7 @@ citing the LRM § → document any new flag/env knob in the `xezim` README.
   observable through the simulator) **with an LRM § citation** in its doc
   comment.
 - `cargo test` green here; the corresponding `xezim` suite green
-  (`cargo test --no-fail-fast` **and** `cargo test --features jit --no-fail-fast`).
+  (`cargo test --no-fail-fast` and the two JIT smoke tests in its CI workflow).
 - Serialized-format fields changed? Bump `XEZIM_BYTECODE_MAGIC`'s version byte
   and the version-ladder comment.
 - Determinism preserved; no `std` hash/RNG order leaks.

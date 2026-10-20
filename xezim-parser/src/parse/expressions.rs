@@ -632,7 +632,8 @@ impl Parser {
                             if self.eat(TokenKind::LBrace).is_some() {
                                 let mut constraints = Vec::new();
                                 while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                                    constraints.push(self.parse_constraint_item(ConstraintPos::BlockItem));
+                                    constraints
+                                        .push(self.parse_constraint_item(ConstraintPos::BlockItem));
                                 }
                                 self.expect(TokenKind::RBrace);
                                 call_expr = Expression::new(

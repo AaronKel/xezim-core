@@ -1624,8 +1624,9 @@ impl Preprocessor {
                     let (mcol, name) = this.first_user_macro(text)?;
                     // Extent of the first expansion: ordinary tokens following
                     // the call on the same line keep their own column (#398).
-                    let (mend, mcall) =
-                        this.first_macro_extent(text, out_line, mcol).unwrap_or((0, 0));
+                    let (mend, mcall) = this
+                        .first_macro_extent(text, out_line, mcol)
+                        .unwrap_or((0, 0));
                     Some(LineOrigin {
                         mac: this.macro_index(name),
                         mcol,
@@ -1863,10 +1864,7 @@ impl Preprocessor {
     /// macros after the first, or a call running to the line end); callers
     /// then keep the historical whole-tail-is-macro behaviour for `mend`.
     fn first_macro_extent(&self, in_line: &str, out_line: &str, mcol: u32) -> Option<(u32, u32)> {
-        let mbytes = in_line
-            .char_indices()
-            .nth(mcol as usize)
-            .map(|(i, _)| i)?;
+        let mbytes = in_line.char_indices().nth(mcol as usize).map(|(i, _)| i)?;
         let call_len = Self::macro_call_len(in_line, mbytes);
         if call_len == 0 {
             return None;
@@ -1881,7 +1879,10 @@ impl Preprocessor {
         let at = rest.find(after_call)?;
         // mend is a count of chars from the invocation backtick to where the
         // ordinary text resumes; mcall is the input call's char length.
-        Some((rest[..at].chars().count() as u32, in_line[mbytes..mbytes + call_len].chars().count() as u32))
+        Some((
+            rest[..at].chars().count() as u32,
+            in_line[mbytes..mbytes + call_len].chars().count() as u32,
+        ))
     }
 
     /// Index of `name` in the line map's macro table, plus one.

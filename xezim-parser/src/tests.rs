@@ -587,7 +587,6 @@ fn bind_root_hierarchy_paths() {
     }
 }
 
-
 /// §25.9: a module-scope `virtual interface` declaration must report a
 /// diagnostic instead of hanging. Previously `virtual interface vif;` shipped
 /// the still-keyword `virtual` into `parse_identifier_starting_item`, whose
@@ -602,7 +601,10 @@ fn module_virtual_interface_spelling_does_not_loop() {
     // Malformed: `vif` is mistaken for the interface type, leaving no
     // declarator for the `;`.
     let result = parse("module top; virtual interface vif; endmodule");
-    assert!(!result.errors.is_empty(), "expected a diagnostic, not a hang");
+    assert!(
+        !result.errors.is_empty(),
+        "expected a diagnostic, not a hang"
+    );
 
     // Valid §25.9 spellings parse clean.
     for src in [
@@ -615,8 +617,6 @@ fn module_virtual_interface_spelling_does_not_loop() {
         assert!(result.errors.is_empty(), "{src}: {:?}", result.errors);
     }
 }
-
-
 
 fn class_constraint_items(result: &crate::ParseResult) -> Vec<crate::ast::decl::ConstraintItem> {
     use crate::ast::decl::ClassItem;
@@ -677,8 +677,9 @@ fn constraint_set_lbrace_is_block() {
     assert_eq!(inner.len(), 2);
 }
 
-
-fn implication_constraint_items(result: &crate::ParseResult) -> Vec<crate::ast::decl::ConstraintItem> {
+fn implication_constraint_items(
+    result: &crate::ParseResult,
+) -> Vec<crate::ast::decl::ConstraintItem> {
     use crate::ast::decl::ClassItem;
     let Some(Description::Class(class)) = result.source.descriptions.first() else {
         panic!("not a class")
@@ -760,7 +761,6 @@ fn constraint_implication_inside_parens_is_logimplies() {
     assert_eq!(*op, BinaryOp::LogImplies);
 }
 
-
 /// §A.2.5: `packed_dimension ::= [ constant_range ] | unsized_dimension`, so
 /// `bit [8]` is not legal. It is named once and recovered as `[7:0]`, instead
 /// of the `expect(Colon)` cascade that also fails on the same `]`.
@@ -804,7 +804,6 @@ fn unpacked_dimension_size_is_legal() {
     let result = parse("module m; bit x [8]; endmodule");
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 }
-
 
 /// The first expression statement of the first method in the first class.
 fn class_method_expr(result: &crate::ParseResult) -> &crate::ast::expr::Expression {
@@ -897,7 +896,6 @@ fn array_method_with_filter_is_not_randomize() {
     assert!(!text.contains("RandomizeWith"), "{text}");
 }
 
-
 /// A compiler directive is not a statement — the A.6 statement grammar has no
 /// directive production. A protected envelope inside a nested block ends just
 /// before the if-block's `end`; dispatching `` `endprotect `` to
@@ -924,4 +922,48 @@ fn protected_envelope_in_function_keeps_the_endfunction() {
 fn protected_envelope_in_fork_keeps_the_join() {
     let result = parse("module m; initial fork `protect x = 1; `endprotect join endmodule");
     assert!(result.errors.is_empty(), "{:?}", result.errors);
+}
+
+/// §18.5.3: operator recursion retains the constraint implication separator.
+#[test]
+fn constraint_operator_boundary_neighbors() {
+    for head in [
+        "a ? b : d",
+        "a && b",
+        "a ? (b -> d) : b",
+        "(a ? b : d)",
+        "a ? b : (d ? a : b)",
+    ] {
+        let source =
+            format!("class c; rand bit a,b,d; constraint k {{ {head} -> {{ d == 1; }} }} endclass");
+        let result = parse(&source);
+        assert!(result.errors.is_empty(), "{source}: {:?}", result.errors);
+        let items = class_constraint_items(&result);
+        assert!(
+            matches!(
+                items[0],
+                crate::ast::decl::ConstraintItem::Implication { .. }
+            ),
+            "{items:?}"
+        );
+    }
+}
+
+/// §18.5.2: a concatenation followed by an operator remains an expression.
+#[test]
+fn constraint_concatenation_operator_neighbors() {
+    for tail in ["<-> a", "== 2'b01", "!= 2'b00", "inside {1,2}", "|| a"] {
+        let source =
+            format!("class c; rand bit a,b,d; constraint k {{ if (a) {{b,d}} {tail}; }} endclass");
+        let result = parse(&source);
+        assert!(result.errors.is_empty(), "{source}: {:?}", result.errors);
+        let items = class_constraint_items(&result);
+        let crate::ast::decl::ConstraintItem::IfElse { then_item, .. } = &items[0] else {
+            panic!("{items:?}")
+        };
+        assert!(
+            !matches!(**then_item, crate::ast::decl::ConstraintItem::Block(_)),
+            "{then_item:?}"
+        );
+    }
 }
