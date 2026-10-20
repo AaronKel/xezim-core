@@ -2046,11 +2046,13 @@ impl Rw<'_> {
                 exprs.iter_mut().for_each(|x| self.expr(x));
             }
             ExprKind::Tagged { inner, .. } => self.opt_box(inner),
-            ExprKind::SvaClocked {
-                clock, iff, body, ..
-            } => {
-                self.expr(clock);
-                self.opt_box(iff);
+            ExprKind::SvaClocked { events, body } => {
+                for event in events {
+                    self.expr(&mut event.expr);
+                    if let Some(g) = &mut event.iff {
+                        self.expr(g);
+                    }
+                }
                 self.expr(body);
             }
             ExprKind::ShallowCopy { source } => self.expr(source),

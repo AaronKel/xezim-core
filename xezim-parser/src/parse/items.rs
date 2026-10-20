@@ -362,8 +362,13 @@ impl Parser {
                 Self::expr_idents(right, out);
             }
             ExprKind::MemberAccess { expr, .. } => Self::expr_idents(expr, out),
-            ExprKind::SvaClocked { clock, body, .. } => {
-                Self::expr_idents(clock, out);
+            ExprKind::SvaClocked { events, body } => {
+                for event in events {
+                    Self::expr_idents(&event.expr, out);
+                    if let Some(g) = &event.iff {
+                        Self::expr_idents(g, out);
+                    }
+                }
                 Self::expr_idents(body, out);
             }
             _ => {}
@@ -595,12 +600,12 @@ impl Parser {
                     Self::sva_rename_ident(r, from, to);
                 }
             }
-            ExprKind::SvaClocked {
-                clock, iff, body, ..
-            } => {
-                Self::sva_rename_ident(clock, from, to);
-                if let Some(g) = iff {
-                    Self::sva_rename_ident(g, from, to);
+            ExprKind::SvaClocked { events, body } => {
+                for event in events {
+                    Self::sva_rename_ident(&mut event.expr, from, to);
+                    if let Some(g) = &mut event.iff {
+                        Self::sva_rename_ident(g, from, to);
+                    }
                 }
                 Self::sva_rename_ident(body, from, to);
             }
@@ -2455,7 +2460,7 @@ impl Parser {
                 // LRM §16.6 — capture the property body when it matches
                 // the common `[@(<event>)] [disable iff (<expr>)] <expr>;`
                 // shape. Re-uses the assertion parser's clock-event capture
-                // (an `SvaClocked { clock, body }` wrapper). Properties not
+                // (an `SvaClocked { events, body }` wrapper). Properties not
                 // matching this shape fall back to the legacy token-skip
                 // path so the parser stays resilient.
                 let bstart = self.current().span.start;
@@ -2515,11 +2520,9 @@ impl Parser {
                             body
                         };
                         Some(match clock {
-                            Some((clk, clk_edge, clk_iff)) => Expression::new(
+                            Some(events) => Expression::new(
                                 ExprKind::SvaClocked {
-                                    clock: Box::new(clk),
-                                    edge: clk_edge,
-                                    iff: clk_iff.map(Box::new),
+                                    events,
                                     body: Box::new(body),
                                 },
                                 self.span_from(bstart),
@@ -2564,7 +2567,7 @@ impl Parser {
                 let body_expr = if self.at(TokenKind::At) {
                     let bstart = self.current().span.start;
                     self.bump();
-                    let (clk, clk_edge, clk_iff) = self.parse_sva_clock_event();
+                    let events = self.parse_sva_clock_event();
                     self.in_sva_seq = true;
                     let mut body = self.parse_expression();
                     self.in_sva_seq = false;
@@ -2575,9 +2578,7 @@ impl Parser {
                     let body = Self::sva_wrap_locals(std::mem::take(&mut decls), body);
                     Some(Expression::new(
                         ExprKind::SvaClocked {
-                            clock: Box::new(clk),
-                            edge: clk_edge,
-                            iff: clk_iff.map(Box::new),
+                            events,
                             body: Box::new(body),
                         },
                         self.span_from(bstart),

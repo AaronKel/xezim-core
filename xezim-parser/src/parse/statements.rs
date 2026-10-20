@@ -1927,72 +1927,79 @@ impl Parser {
                 self.expect(TokenKind::RParen);
                 return EventControl::ParenStar;
             }
-            let mut events = Vec::new();
-            loop {
-                let estart = self.current().span.start;
-                let edge = match self.current_kind() {
-                    TokenKind::KwPosedge => {
-                        self.bump();
-                        Some(Edge::Posedge)
-                    }
-                    TokenKind::KwNegedge => {
-                        self.bump();
-                        Some(Edge::Negedge)
-                    }
-                    TokenKind::KwEdge => {
-                        self.bump();
-                        Some(Edge::Edge)
-                    }
-                    _ => None,
-                };
-                // LRM §9.4.2.3 `@(posedge clk iff guard)`. `parse_expression`
-                // treats `iff` as a low-precedence binary operator
-                // (`BinaryOp::Iff`), so it slurps the whole tail into
-                // `Binary(Iff, clk, guard)` and the dedicated `KwIff` eat
-                // below never fires. Peel that back out into the `iff` field
-                // so the edge expression is just the signal (otherwise the
-                // signal is buried inside a Binary node and the sensitivity
-                // list comes up empty — the `@` never suspends). The explicit
-                // `KwIff` eat is kept as a fallback in case expression
-                // precedence ever stops treating `iff` as an operator.
-                let parsed = self.parse_expression();
-                let (expr, iff) = match parsed.kind {
-                    ExprKind::Binary {
-                        op: BinaryOp::Iff,
-                        left,
-                        right,
-                    } => (*left, Some(*right)),
-                    other => {
-                        let expr = Expression {
-                            kind: other,
-                            span: parsed.span,
-                            cached_width: std::cell::Cell::new(None),
-                        };
-                        let iff = if self.eat(TokenKind::KwIff).is_some() {
-                            Some(self.parse_expression())
-                        } else {
-                            None
-                        };
-                        (expr, iff)
-                    }
-                };
-                events.push(EventExpr {
-                    edge,
-                    expr,
-                    iff,
-                    span: self.span_from(estart),
-                });
-                if self.eat(TokenKind::KwOr).is_some() || self.eat(TokenKind::Comma).is_some() {
-                    continue;
-                }
-                break;
-            }
+            let events = self.parse_event_expression_list();
             self.expect(TokenKind::RParen);
             EventControl::EventExpr(events)
         } else {
             let expr = self.parse_hierarchical_identifier_expr();
             EventControl::HierIdentifier(expr)
         }
+    }
+
+    /// §9.4.2 / A.6.5: flatten parenthesized unions into event terms,
+    /// retaining a separate edge and iff for each term.
+    pub(super) fn parse_event_expression_list(&mut self) -> Vec<EventExpr> {
+        let mut events = self.parse_event_expression_term();
+        while self.eat(TokenKind::KwOr).is_some() || self.eat(TokenKind::Comma).is_some() {
+            events.extend(self.parse_event_expression_term());
+        }
+        events
+    }
+
+    pub(super) fn parse_event_expression_term(&mut self) -> Vec<EventExpr> {
+        let start = self.current().span.start;
+        // A parenthesized event expression can contain edge keywords and
+        // unions. A parenthesized arithmetic expression must still reach
+        // the expression parser, including operators after its closing ')'.
+        if self.at(TokenKind::LParen) {
+            let saved = self.pos;
+            let diagnostics = self.diagnostics.len();
+            self.bump();
+            let group = self.parse_event_expression_list();
+            let closed = self.eat(TokenKind::RParen).is_some();
+            if closed
+                && self.diagnostics.len() == diagnostics
+                && (group.len() > 1 || group.iter().any(|e| e.edge.is_some() || e.iff.is_some()))
+            {
+                return group;
+            }
+            self.pos = saved;
+            self.diagnostics.truncate(diagnostics);
+        }
+        let edge = match self.current_kind() {
+            TokenKind::KwPosedge => {
+                self.bump();
+                Some(Edge::Posedge)
+            }
+            TokenKind::KwNegedge => {
+                self.bump();
+                Some(Edge::Negedge)
+            }
+            TokenKind::KwEdge => {
+                self.bump();
+                Some(Edge::Edge)
+            }
+            _ => None,
+        };
+        let parsed = self.parse_expression();
+        let (expr, iff) = match parsed.kind {
+            ExprKind::Binary {
+                op: BinaryOp::Iff,
+                left,
+                right,
+            } => (*left, Some(*right)),
+            other => {
+                let expr = Expression::new(other, parsed.span);
+                let iff = self.eat(TokenKind::KwIff).map(|_| self.parse_expression());
+                (expr, iff)
+            }
+        };
+        vec![EventExpr {
+            edge,
+            expr,
+            iff,
+            span: self.span_from(start),
+        }]
     }
 
     pub(super) fn parse_assertion_statement(&mut self) -> AssertionStatement {
@@ -2091,12 +2098,10 @@ impl Parser {
             None
         };
         self.eat(TokenKind::Semicolon);
-        let expr = if let Some((clk, edge, iff)) = clk_event {
+        let expr = if let Some(events) = clk_event {
             Expression::new(
                 ExprKind::SvaClocked {
-                    clock: Box::new(clk),
-                    edge,
-                    iff: iff.map(Box::new),
+                    events,
                     body: Box::new(body),
                 },
                 self.span_from(start),
@@ -2127,13 +2132,7 @@ impl Parser {
     /// explicit clock, `disable iff`, ranges, repetition, sampled-value
     /// functions, implication) returns `None` and keeps the assertion form.
     fn lower_expect(a: &AssertionStatement, span: crate::ast::Span) -> Option<Statement> {
-        let ExprKind::SvaClocked {
-            clock,
-            edge,
-            iff,
-            body,
-        } = &a.expr.kind
-        else {
+        let ExprKind::SvaClocked { events, body } = &a.expr.kind else {
             return None;
         };
         let mut steps: Vec<(u64, Expression)> = Vec::new();
@@ -2141,19 +2140,9 @@ impl Parser {
         if !Self::expect_steps(body, &mut steps, &mut pending) || pending != 0 || steps.is_empty() {
             return None;
         }
-        let edge = match edge {
-            0 => Some(Edge::Posedge),
-            1 => Some(Edge::Negedge),
-            _ => None,
-        };
         let stmt = |kind: StatementKind| Statement::new(kind, span);
         let wait = stmt(StatementKind::TimingControl {
-            control: TimingControl::Event(EventControl::EventExpr(vec![EventExpr {
-                edge,
-                expr: (**clock).clone(),
-                iff: iff.as_deref().cloned(),
-                span,
-            }])),
+            control: TimingControl::Event(EventControl::EventExpr(events.clone())),
             stmt: Box::new(stmt(StatementKind::Null)),
         });
         let pass = a

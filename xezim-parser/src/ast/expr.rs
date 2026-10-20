@@ -139,17 +139,10 @@ pub enum ExprKind {
         tag: Identifier,
         inner: Option<Box<Expression>>,
     },
-    /// LRM §16.5: SVA property body wrapped by a clocking event,
-    /// e.g. `@(posedge clk) a |=> b`. `clock` is the trigger; `body`
-    /// is the predicate. The executor evaluates this only at the
-    /// clocking event and tracks `|=>` / `##N` cycle-delay deferral
-    /// state across firings.
-    /// `@(<edge> clock [iff guard]) body` (§16.5): `edge` is 0 posedge,
-    /// 1 negedge, 2 any edge.
+    /// §16.5 / §9.4.2: a property sampled on the union of its clocking
+    /// event terms. Each term keeps its own edge and optional iff guard.
     SvaClocked {
-        clock: Box<Expression>,
-        edge: u8,
-        iff: Option<Box<Expression>>,
+        events: Vec<super::stmt::EventExpr>,
         body: Box<Expression>,
     },
     /// LRM §8.8: the shallow-copy constructor `new <handle>` (parentheseless

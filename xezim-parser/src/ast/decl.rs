@@ -431,12 +431,12 @@ fn let_subst(e: &mut Expression, map: &std::collections::HashMap<String, Express
                 let_subst(x, map);
             }
         }
-        ExprKind::SvaClocked {
-            clock, iff, body, ..
-        } => {
-            let_subst(clock, map);
-            if let Some(x) = iff {
-                let_subst(x, map);
+        ExprKind::SvaClocked { events, body } => {
+            for event in events {
+                let_subst(&mut event.expr, map);
+                if let Some(guard) = &mut event.iff {
+                    let_subst(guard, map);
+                }
             }
             let_subst(body, map);
         }

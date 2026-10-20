@@ -2842,49 +2842,20 @@ impl Parser {
         }
     }
 
-    /// §16.5 clocking event after `@`: `(posedge clk)`, `(negedge clk iff g)`,
-    /// `(clk)` or a bare `clk`. Returns `(clock, edge, iff)` with edge 0
-    /// posedge (also the default), 1 negedge, 2 any edge.
-    pub(super) fn parse_sva_clock_event(&mut self) -> (Expression, u8, Option<Expression>) {
-        let paren = self.eat(TokenKind::LParen).is_some();
-        let edge: u8 = if self.eat(TokenKind::KwPosedge).is_some() {
-            0
-        } else if self.eat(TokenKind::KwNegedge).is_some() {
-            1
-        } else if self.eat(TokenKind::KwEdge).is_some() {
-            2
+    /// §16.5 / Annex A.6.5: assertions use the same event-expression
+    /// grammar as procedural event controls, including or/comma lists.
+    pub(super) fn parse_sva_clock_event(&mut self) -> Vec<crate::ast::stmt::EventExpr> {
+        let previous = self.in_sva_seq;
+        self.in_sva_seq = false;
+        let events = if self.eat(TokenKind::LParen).is_some() {
+            let events = self.parse_event_expression_list();
+            self.expect(TokenKind::RParen);
+            events
         } else {
-            // §9.4.2 / §16.5: an event expression without an edge
-            // (`@(clk)`, `@clk`) fires on any change of its value, not
-            // on the rising edge only.
-            2
+            self.parse_event_expression_term()
         };
-        let parsed = self.parse_expression();
-        // `clk iff g` arrives as `Binary(Iff, clk, g)`: peel it apart.
-        let (clock, iff) = match parsed.kind {
-            ExprKind::Binary {
-                op: BinaryOp::Iff,
-                left,
-                right,
-            } => (*left, Some(*right)),
-            other => {
-                let clock = Expression {
-                    kind: other,
-                    span: parsed.span,
-                    cached_width: std::cell::Cell::new(None),
-                };
-                let iff = if self.eat(TokenKind::KwIff).is_some() {
-                    Some(self.parse_expression())
-                } else {
-                    None
-                };
-                (clock, iff)
-            }
-        };
-        if paren {
-            let _ = self.eat(TokenKind::RParen);
-        }
-        (clock, edge, iff)
+        self.in_sva_seq = previous;
+        events
     }
 
     /// Wrap a sequence in a marker the assertion engine recognises

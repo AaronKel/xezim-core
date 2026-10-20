@@ -25766,12 +25766,12 @@ fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
             for_each_sub_expr(filter, f);
         }
         ExprKind::RandomizeWith { call, .. } => for_each_sub_expr(call, f),
-        ExprKind::SvaClocked {
-            clock, iff, body, ..
-        } => {
-            for_each_sub_expr(clock, f);
-            if let Some(g) = iff {
-                for_each_sub_expr(g, f);
+        ExprKind::SvaClocked { events, body } => {
+            for event in events {
+                for_each_sub_expr(&event.expr, f);
+                if let Some(g) = &event.iff {
+                    for_each_sub_expr(g, f);
+                }
             }
             for_each_sub_expr(body, f);
         }
@@ -41604,39 +41604,48 @@ fn rewrite_expr_impl(
         // would keep references to formal `in_a`/`in_b` after the
         // port-substitution pass, causing the sva site to read
         // non-existent signals.
-        ExprKind::SvaClocked {
-            clock,
-            edge,
-            iff,
-            body,
-        } => {
-            let clock = rewrite_expr_impl(clock, prefix, port_map, local_names, interface_map);
-            // §17.2: `@clk` on a checker event formal bound to `posedge x`
-            // (carried as `$__posedge(x)`, see the port-actual parser)
-            // clocks on that edge of `x`.
-            let (clock, edge) = match &clock.kind {
-                ExprKind::SystemCall { name, args } if *edge == 2 && args.len() == 1 => {
-                    match name.as_str() {
-                        "$__posedge" => (args[0].clone(), 0u8),
-                        "$__negedge" => (args[0].clone(), 1u8),
-                        "$__edge" => (args[0].clone(), 2u8),
-                        _ => (clock.clone(), *edge),
-                    }
-                }
-                _ => (clock.clone(), *edge),
-            };
-            ExprKind::SvaClocked {
-                clock: Box::new(clock),
-                edge,
-                iff: iff.as_ref().map(|g| {
-                    Box::new(rewrite_expr_impl(
-                        g,
+        ExprKind::SvaClocked { events, body } => {
+            let events = events
+                .iter()
+                .map(|event| {
+                    let mut expr = rewrite_expr_impl(
+                        &event.expr,
                         prefix,
                         port_map,
                         local_names,
                         interface_map,
-                    ))
-                }),
+                    );
+                    let mut edge = event.edge;
+                    // §17.2: a checker event formal carries its actual edge as
+                    // a marker call; retain that edge on every event-list term.
+                    if edge.is_none() {
+                        if let ExprKind::SystemCall { name, args } = &expr.kind {
+                            if args.len() == 1 {
+                                let actual = match name.as_str() {
+                                    "$__posedge" => Some(Edge::Posedge),
+                                    "$__negedge" => Some(Edge::Negedge),
+                                    "$__edge" => Some(Edge::Edge),
+                                    _ => None,
+                                };
+                                if actual.is_some() {
+                                    edge = actual;
+                                    expr = args[0].clone();
+                                }
+                            }
+                        }
+                    }
+                    EventExpr {
+                        expr,
+                        edge,
+                        iff: event.iff.as_ref().map(|g| {
+                            rewrite_expr_impl(g, prefix, port_map, local_names, interface_map)
+                        }),
+                        span: event.span,
+                    }
+                })
+                .collect();
+            ExprKind::SvaClocked {
+                events,
                 body: Box::new(rewrite_expr_impl(
                     body,
                     prefix,
