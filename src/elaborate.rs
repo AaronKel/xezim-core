@@ -1126,6 +1126,8 @@ pub struct ElaboratedClass {
     /// independent.
     #[serde(default)]
     pub queue_properties: HashMap<String, (u32, Option<u32>)>,
+    /// §7.10: queue declarations among queue/dynamic-array properties.
+    pub queue_property_names: HashSet<String>,
     /// Initializer expressions for scalar properties (`int x = EXPR;`). Held so
     /// they can be re-evaluated at instantiation against the live parameter
     /// table — `elaborate_class` runs before package params are bound, so a
@@ -1965,6 +1967,7 @@ fn elaborate_class_in_scope(
     let mut assoc_key_types: HashMap<String, String> = HashMap::default();
     let mut assoc_index_props: HashMap<String, (u32, bool)> = HashMap::default();
     let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
+    let mut queue_property_names = HashSet::default();
     let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
     let mut param_sized_props: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
@@ -2042,6 +2045,12 @@ fn elaborate_class_in_scope(
                     } else {
                         decl.dimensions.clone()
                     };
+                    if matches!(
+                        effective_dims.first(),
+                        Some(UnpackedDimension::Queue { .. })
+                    ) {
+                        queue_property_names.insert(decl.name.name.clone());
+                    }
                     // `mem[N]` parses as an ASSOCIATIVE dimension keyed by
                     // "type N" (a bare identifier before `]` reads as a type).
                     // When `N` is a known constant and NOT a typedef, rewrite
@@ -2901,6 +2910,7 @@ fn elaborate_class_in_scope(
         assoc_key_types,
         assoc_index_props,
         queue_properties,
+        queue_property_names,
         property_inits,
         static_collections,
         static_assoc_key_types,
@@ -3311,6 +3321,11 @@ pub struct ElaboratedModule {
     /// enough to enumerate a scope's children. Drives the VPI object model.
     #[serde(default)]
     pub instances: Vec<ElabInstance>,
+    /// §23.11: bind directives selected for each elaborated host path.
+    pub resolved_binds: HashMap<String, Vec<crate::ast::decl::BindDirective>>,
+    /// Active declarations collected in their elaborated lexical scopes.
+    #[serde(skip)]
+    pub bind_sites: Vec<(String, crate::ast::decl::BindDirective)>,
     /// Out-of-class constraint definitions: `(class_name, constraint_name)`.
     #[serde(default)]
     pub out_of_class_constraints: HashSet<(String, String)>,
@@ -3741,6 +3756,8 @@ impl ElaboratedModule {
             interconnect_nets: HashSet::default(),
             elab_diagnostics: Vec::new(),
             instances: Vec::new(),
+            resolved_binds: HashMap::default(),
+            bind_sites: Vec::new(),
             out_of_class_constraints: HashSet::default(),
             timeunit_exp: default_timeunit_exp(),
             timeprecision_exp: default_timeunit_exp(),
@@ -18946,6 +18963,30 @@ pub fn const_eval_i64_with_params(
     expr: &Expression,
     params: Option<&HashMap<String, Value>>,
 ) -> Option<i64> {
+    // §23.8: hierarchical constants retain their complete path. Looking up
+    // only the leaf can select an unrelated same-named parameter.
+    fn constant_path(e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => Some(
+                h.path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            ),
+            ExprKind::MemberAccess { expr, member } => {
+                Some(format!("{}.{}", constant_path(expr)?, member.name))
+            }
+            _ => None,
+        }
+    }
+    if matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() > 1)
+        || matches!(&expr.kind, ExprKind::MemberAccess { .. })
+    {
+        if let Some(value) = params.and_then(|p| p.get(&constant_path(expr)?)) {
+            return value.to_i64();
+        }
+    }
     match &expr.kind {
         // §25.5 interface-port parameter (`c.DEPTH`) — dotted key seeded at
         // child inlining; parses as MemberAccess.
@@ -28436,6 +28477,17 @@ fn substitute_in_module_item(
     interface_map: &HashMap<String, String>,
 ) -> ModuleItem {
     match item {
+        ModuleItem::Bind(b) => {
+            let mut b = b.clone();
+            for path in std::iter::once(&mut b.target_path).chain(b.extra_paths.iter_mut()) {
+                for segment in path {
+                    for index in &mut segment.selects {
+                        *index = rewrite_expr(index, "", port_map, local_names, interface_map);
+                    }
+                }
+            }
+            ModuleItem::Bind(b)
+        }
         // §27.4: each generated assertion and its actions see the
         // iteration's implicit genvar localparam, like other processes.
         ModuleItem::AssertionItem(a) => {
@@ -28705,6 +28757,13 @@ fn gen_scope_name(label: Option<&String>, ordinal: u32) -> String {
 fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str) {
     for item in items.iter_mut() {
         match item {
+            ModuleItem::Bind(b) => {
+                b.gen_scope = if b.gen_scope.is_empty() {
+                    scope.to_string()
+                } else {
+                    format!("{}.{}", scope, b.gen_scope)
+                };
+            }
             ModuleItem::ModuleInstantiation(inst) => {
                 for hi in &mut inst.instances {
                     hi.name.name = format!("{}.{}", scope, hi.name.name);
@@ -28825,82 +28884,6 @@ fn cat2(a: &str, b: &str) -> String {
     s.push_str(a);
     s.push_str(b);
     s
-}
-
-/// §23.11 / §27: materialize generated instance names for a bind's one
-/// specialized host. Other generate items still elaborate in their scopes.
-pub(crate) fn bind_generated_instances(
-    items: &[ModuleItem],
-    params: &HashMap<String, Value>,
-) -> Vec<ModuleItem> {
-    fn remove_instances(items: &mut Vec<ModuleItem>) {
-        items.retain(|item| !matches!(item, ModuleItem::ModuleInstantiation(_)));
-        for item in items {
-            match item {
-                ModuleItem::GenerateRegion(g) => remove_instances(&mut g.items),
-                ModuleItem::GenerateFor(g) => remove_instances(&mut g.items),
-                ModuleItem::GenerateIf(g) => {
-                    for (_, body) in &mut g.branches {
-                        remove_instances(body);
-                    }
-                }
-                ModuleItem::GenerateCase(g) => {
-                    for arm in &mut g.arms {
-                        remove_instances(&mut arm.items);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut result = items.to_vec();
-    remove_instances(&mut result);
-    result.extend(
-        collect_effective_items(items, params)
-            .into_iter()
-            .filter(|item| matches!(item, ModuleItem::ModuleInstantiation(_))),
-    );
-    result
-}
-
-/// Value overrides for the next module on a bind's instance spine.
-pub(crate) fn bind_parameter_overrides(
-    child: Definition,
-    inst: &ModuleInstantiation,
-    params: &HashMap<String, Value>,
-) -> HashMap<String, Value> {
-    let names: Vec<_> = child
-        .params()
-        .iter()
-        .chain(child.items().iter().filter_map(|item| {
-            if let ModuleItem::ParameterDeclaration(p) = item {
-                Some(p)
-            } else {
-                None
-            }
-        }))
-        .filter(|p| !p.local)
-        .flat_map(|p| match &p.kind {
-            ParameterKind::Data { assignments, .. } => assignments
-                .iter()
-                .map(|a| a.name.name.clone())
-                .collect::<Vec<_>>(),
-            ParameterKind::Type { assignments } => {
-                assignments.iter().map(|a| a.name.name.clone()).collect()
-            }
-        })
-        .collect();
-    let mut out = HashMap::default();
-    for (i, conn) in inst.params.iter().flatten().enumerate() {
-        let (name, value) = match conn {
-            ParamConnection::Named { name, value } => (Some(&name.name), value.as_ref()),
-            ParamConnection::Ordered(value) => (names.get(i), value.as_ref()),
-        };
-        if let (Some(name), Some(ParamValue::Expr(e))) = (name, value) {
-            out.insert(name.clone(), eval_const_expr_val(e, params));
-        }
-    }
-    out
 }
 
 fn collect_effective_items(
@@ -31389,8 +31372,28 @@ fn inline_module_items(
     // queries in its own constant expressions (generate conditions, widths,
     // the parameter overrides it passes to its children).
     let _decl_shapes = install_decl_shapes(source_def);
-    let prepared_source =
+    let mut prepared_source =
         prepare_module_items(source_def, definitions, local_params, &elab.typedefs, cache);
+    // §23.11/§27: only active generate branches contribute declarations.
+    for item in &prepared_source.effective_items {
+        if let ModuleItem::Bind(b) = item {
+            elab.bind_sites.push((
+                format!("{}{}", prefix, b.gen_scope)
+                    .trim_end_matches('.')
+                    .to_string(),
+                b.clone(),
+            ));
+        }
+    }
+    if let Some(binds) = elab.resolved_binds.get(prefix.trim_end_matches('.')) {
+        let prepared = Rc::make_mut(&mut prepared_source);
+        prepared.effective_items.extend(
+            binds
+                .iter()
+                .rev()
+                .map(|b| ModuleItem::ModuleInstantiation(b.instantiation.clone())),
+        );
+    }
     // §23.10: names of THIS module's own sub-instances. A port connection
     // naming a SIBLING instance (`h_leaf lf(li.mp);` where `li` is the same
     // module's interface instance) is not in `local_names`, so the inlining

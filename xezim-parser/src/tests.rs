@@ -563,3 +563,26 @@ fn bind_generate_target_selects() {
         }
     }
 }
+
+/// §23.8/§23.11: absolute bind paths start at the root hierarchy scope.
+#[test]
+fn bind_root_hierarchy_paths() {
+    for directive in [
+        "bind $root.top.m monitor b();",
+        "bind $root.top.bank[2].m monitor b();",
+        "bind mem : $root.top.m monitor b();",
+        "bind mem : $root.top.m[0], $root.top.m[1] monitor b();",
+        "bind $root.top.bank[SEL-1].m monitor b();",
+    ] {
+        let result = parse(directive);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let Some(Description::Bind(bind)) = result.source.descriptions.first() else {
+            panic!("missing bind")
+        };
+        assert_eq!(bind.target_path[0].name.name, "$root");
+        assert_eq!(bind.target_path[1].name.name, "top");
+        for path in &bind.extra_paths {
+            assert_eq!(path[0].name.name, "$root");
+        }
+    }
+}

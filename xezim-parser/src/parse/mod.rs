@@ -206,6 +206,7 @@ impl Parser {
                     target_module: target,
                     target_path,
                     extra_paths,
+                    gen_scope: String::new(),
                     instantiation,
                     span,
                 });
@@ -239,7 +240,19 @@ impl Parser {
     fn parse_bind_path(&mut self) -> Vec<crate::ast::expr::HierPathSegment> {
         let mut path = Vec::new();
         loop {
-            let name = self.parse_identifier();
+            // §23.11/§23.8: an absolute bind path may start at $root.
+            let name = if path.is_empty()
+                && self.at(TokenKind::SystemIdentifier)
+                && self.current().text == "$root"
+            {
+                let token = self.bump();
+                crate::ast::Identifier {
+                    name: "$root".into(),
+                    span: token.span,
+                }
+            } else {
+                self.parse_identifier()
+            };
             let mut selects = Vec::new();
             while self.eat(TokenKind::LBracket).is_some() {
                 selects.push(self.parse_expression());

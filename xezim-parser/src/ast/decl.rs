@@ -158,6 +158,9 @@ pub struct BindDirective {
     /// the first). Empty otherwise.
     #[cfg_attr(feature = "serde", serde(default))]
     pub extra_paths: Vec<Vec<super::expr::HierPathSegment>>,
+    /// §27: elaborated generate scope containing this declaration.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub gen_scope: String,
     /// The instantiation appended into every instance of `target_module`.
     pub instantiation: ModuleInstantiation,
     pub span: Span,

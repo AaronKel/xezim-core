@@ -163,7 +163,9 @@ pub use value::Value;
 /// more than one place renamed to `pkg::name` (§26.3).
 /// \x23 = \x22 + dynamic-outer associative class property dimensions (§7.4.5).
 /// \x24 = \x23 + constant selects in bind target paths (§23.11).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x24";
+/// \x25 = \x24 + resolved instance binds and bind declaration generate scope (§23.11),
+/// and class queue declaration kinds (§7.10).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x25";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
