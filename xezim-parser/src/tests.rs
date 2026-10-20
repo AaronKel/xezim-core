@@ -1,6 +1,45 @@
 use crate::ast::{Description, decl::ModuleItem};
 use crate::parse;
 
+/// §25.9 / §26.2: virtual-interface variables are package data declarations,
+/// including the optional `interface` keyword, type arguments and modports.
+#[test]
+fn package_virtual_interface_declarations() {
+    for declaration in [
+        "virtual bus_if v;",
+        "virtual interface bus_if v;",
+        "virtual bus_if.mp v;",
+        "virtual interface bus_if #(8).mp v;",
+        "virtual bus_if v = null;",
+        "virtual bus_if v, other;",
+        "virtual bus_if v[2];",
+        "virtual bus_if v[];",
+        "virtual bus_if v[$];",
+        "virtual bus_if v[string];",
+        "var virtual bus_if v;",
+    ] {
+        let result = parse(&format!("package p; {declaration} endpackage"));
+        assert!(
+            result.errors.is_empty(),
+            "{declaration}: {:?}",
+            result.errors
+        );
+        let Some(Description::Package(package)) = result.source.descriptions.first() else {
+            panic!("missing package for {declaration}");
+        };
+        let crate::ast::decl::PackageItem::Data(data) = &package.items[0] else {
+            panic!("missing data declaration for {declaration}");
+        };
+        assert!(matches!(
+            data.data_type,
+            crate::ast::types::DataType::Interface { .. }
+        ));
+        assert_eq!(data.declarators[0].name.name, "v");
+    }
+    let result = parse("package p; virtual class base; endclass endpackage");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+}
+
 /// §16.10: assertion-local variable declarations, including typedef and
 /// packed local types, are kept with the body as `$sva_local` declarations.
 #[test]

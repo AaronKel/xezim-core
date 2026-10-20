@@ -1381,10 +1381,9 @@ impl Parser {
                     let task = self.parse_task_declaration();
                     Some(PackageItem::Task(task))
                 } else {
-                    // This shouldn't happen at package level in valid SV, but let's be safe.
-                    self.error("expected 'class', 'function', or 'task' after 'virtual'");
-                    self.bump();
-                    self.parse_package_item()
+                    // §25.9 / §26.2: a package may own a virtual-interface
+                    // variable; its instance binding is assigned at runtime.
+                    Some(PackageItem::Data(self.parse_data_declaration()))
                 }
             }
             _ if self.is_data_type_keyword()

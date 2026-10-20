@@ -26979,6 +26979,14 @@ fn inline_instantiations_inner(
                         // it at time 0 (enum members are already in scope, having
                         // been processed from this same package's typedefs).
                         crate::ast::decl::PackageItem::Data(dd) => {
+                            // §26.3: keep each package variable's own type even
+                            // when its bare name is shared or shadowed.
+                            for decl in &dd.declarators {
+                                elab.var_decl_types.insert(
+                                    format!("{}::{}", name, decl.name.name),
+                                    dd.data_type.clone(),
+                                );
+                            }
                             // §8.25: a package-level class variable keeps its
                             // specialization (`C #(byte) v;`) for `v = new`,
                             // as a module-level one does.
