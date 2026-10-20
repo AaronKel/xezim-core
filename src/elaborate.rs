@@ -8328,10 +8328,16 @@ pub fn elaborate_module_with_defs(
                             // `output p; wire p = 1'b1;` undriven (z).
                             if let Some(init_expr) = &decl.init {
                                 let decl_dly = net_decl_assign_delay(nd, &elab.parameters);
+                                let decl_rhs = net_declaration_driver(
+                                    nd,
+                                    &decl.name.name,
+                                    init_expr,
+                                    &mut elab,
+                                );
                                 elab.continuous_assigns.push(ContinuousAssignment {
                                     origin: Some((init_expr.span, String::new())),
                                     lhs: make_ident_expr(&decl.name.name),
-                                    rhs: init_expr.clone(),
+                                    rhs: decl_rhs,
                                     delay: decl_dly.0,
                                     rhs_parent_scoped: false,
                                     delay_fall: decl_dly.1,
@@ -8548,10 +8554,12 @@ pub fn elaborate_module_with_defs(
                     // Wire with initializer → continuous assign (not constant eval)
                     if let Some(init_expr) = &decl.init {
                         let decl_dly = net_decl_assign_delay(nd, &elab.parameters);
+                        let decl_rhs =
+                            net_declaration_driver(nd, &decl.name.name, init_expr, &mut elab);
                         elab.continuous_assigns.push(ContinuousAssignment {
                             origin: Some((init_expr.span, String::new())),
                             lhs: make_ident_expr(&decl.name.name),
-                            rhs: init_expr.clone(),
+                            rhs: decl_rhs,
                             delay: decl_dly.0,
                             rhs_parent_scoped: false,
                             delay_fall: decl_dly.1,
@@ -15708,10 +15716,11 @@ fn elaborate_items_numbered(
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     if let Some(init_expr) = &decl.init {
                         let decl_dly = net_decl_assign_delay(nd, &elab.parameters);
+                        let decl_rhs = net_declaration_driver(nd, &decl.name.name, init_expr, elab);
                         elab.continuous_assigns.push(ContinuousAssignment {
                             origin: Some((init_expr.span, String::new())),
                             lhs: make_ident_expr(&decl.name.name),
-                            rhs: init_expr.clone(),
+                            rhs: decl_rhs,
                             delay: decl_dly.0,
                             rhs_parent_scoped: false,
                             delay_fall: decl_dly.1,
@@ -18489,6 +18498,38 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64)
 /// §10.3.1 / §10.3.3: a net declaration assignment with a delay
 /// (`wire #2 w = a;`, `wire #(1,3) w = a;`) drives the net through that
 /// delay, like `assign #2 w = a;`: (rise, fall, turn-off) ticks.
+/// §10.3.1 / §28.12: declaration assignments carry the declared drive
+/// strength through resolution, just like an explicit continuous assignment.
+fn net_declaration_driver(
+    nd: &crate::ast::decl::NetDeclaration,
+    name: &str,
+    init: &Expression,
+    elab: &mut ElaboratedModule,
+) -> Expression {
+    let Some(strength) = &nd.strength else {
+        return init.clone();
+    };
+    let mut s1 = String::new();
+    let mut s0 = String::new();
+    for token in strength.split(',').map(str::trim) {
+        if token.ends_with('1') {
+            s1 = token.to_string();
+        }
+        if token.ends_with('0') {
+            s0 = token.to_string();
+        }
+    }
+    elab.net_strengths.insert(name.to_string(), (s1, s0));
+    match strength_marker(strength) {
+        Some((marker, code)) => make_syscall(
+            marker,
+            vec![init.clone(), strength_code_literal(code, init.span)],
+            init.span,
+        ),
+        None => init.clone(),
+    }
+}
+
 fn net_decl_assign_delay(
     nd: &crate::ast::decl::NetDeclaration,
     params: &HashMap<String, Value>,

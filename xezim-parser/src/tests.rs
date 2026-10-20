@@ -967,3 +967,26 @@ fn constraint_concatenation_operator_neighbors() {
         );
     }
 }
+
+/// §10.3.1: declaration drive strengths survive parsing into elaboration.
+#[test]
+fn net_declaration_strength_pairs_survive_parsing() {
+    for pair in [
+        "weak1,weak0",
+        "strong1,strong0",
+        "pull1,pull0",
+        "supply1,supply0",
+        "strong1,weak0",
+    ] {
+        let source = format!("module top; wire ({pair}) w=1'b1; endmodule");
+        let result = parse(&source);
+        assert!(result.errors.is_empty(), "{source}: {:?}", result.errors);
+        let Description::Module(module) = &result.source.descriptions[0] else {
+            panic!("module")
+        };
+        let crate::ast::decl::ModuleItem::NetDeclaration(net) = &module.items[0] else {
+            panic!("net")
+        };
+        assert_eq!(net.strength.as_deref(), Some(pair));
+    }
+}
