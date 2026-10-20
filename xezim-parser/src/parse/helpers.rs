@@ -6,6 +6,65 @@ use crate::diagnostics::Diagnostic;
 use crate::lexer::token::{Token, TokenKind};
 
 impl Parser {
+    /// §22.5.1: preserve the preprocessor's undefined-macro diagnostic while
+    /// recovering a whole invocation, rather than parsing its commas as code.
+    pub(super) fn recover_undefined_macro(&mut self) -> bool {
+        if !self.at(TokenKind::Directive)
+            || crate::preprocessor::COMPILER_DIRECTIVES
+                .contains(&self.current().text.trim_start_matches('`'))
+        {
+            return false;
+        }
+        let invocation = self.bump();
+        if self.eat(TokenKind::LParen).is_some() {
+            // Balanced arguments are opaque tokens: commas, strings and even
+            // statement bodies belong to the macro, not to the surrounding SV.
+            let mut nesting = 1;
+            let closing = self.tokens[self.pos..].iter().position(|token| {
+                match token.kind {
+                    TokenKind::LParen => nesting += 1,
+                    TokenKind::RParen => nesting -= 1,
+                    _ => {}
+                }
+                nesting == 0
+            });
+            if let Some(offset) = closing {
+                for _ in 0..=offset {
+                    self.bump();
+                }
+                return true;
+            }
+            let mut depth = 1;
+            while depth != 0
+                && !self.at_any(&[
+                    TokenKind::Eof,
+                    TokenKind::KwEnd,
+                    TokenKind::KwJoin,
+                    TokenKind::KwJoin_any,
+                    TokenKind::KwJoin_none,
+                    TokenKind::KwEndfunction,
+                    TokenKind::KwEndtask,
+                    TokenKind::KwEndmodule,
+                    TokenKind::KwEndclass,
+                    TokenKind::Semicolon,
+                ])
+            {
+                match self.bump().kind {
+                    TokenKind::LParen => depth += 1,
+                    TokenKind::RParen => depth -= 1,
+                    _ => {}
+                }
+            }
+            if depth != 0 {
+                self.diagnostics.push(Diagnostic::error(
+                    "unterminated undefined macro argument list".to_string(),
+                    invocation.span,
+                ));
+            }
+        }
+        true
+    }
+
     pub(super) fn current(&self) -> &Token {
         &self.tokens[self.pos.min(self.tokens.len() - 1)]
     }

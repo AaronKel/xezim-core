@@ -3044,6 +3044,9 @@ impl Parser {
                 Some(ModuleItem::Null)
             }
             TokenKind::Directive => {
+                if self.recover_undefined_macro() {
+                    return Some(ModuleItem::Null);
+                }
                 self.bump();
                 self.parse_module_item()
             }
@@ -4906,6 +4909,9 @@ impl Parser {
 
         match self.current_kind() {
             TokenKind::Directive => {
+                if self.recover_undefined_macro() {
+                    return ClassItem::Empty;
+                }
                 self.bump();
                 self.parse_class_item()
             }

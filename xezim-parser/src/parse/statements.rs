@@ -69,6 +69,10 @@ impl Parser {
 
         match self.current_kind() {
             TokenKind::Directive => {
+                if self.recover_undefined_macro() {
+                    self.eat(TokenKind::Semicolon);
+                    return Statement::new(StatementKind::Null, self.span_from(start));
+                }
                 self.bump();
                 self.parse_statement()
             }

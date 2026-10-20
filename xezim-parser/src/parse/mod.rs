@@ -437,7 +437,9 @@ impl Parser {
             }
             TokenKind::KwTask => Some(Description::PackageItem(self.parse_package_item().unwrap())),
             TokenKind::Directive => {
-                self.bump();
+                if !self.recover_undefined_macro() {
+                    self.bump();
+                }
                 self.parse_description()
             }
             // Stray top-level `;` — e.g. `endmodule;` (an empty
