@@ -2163,115 +2163,8 @@ fn parse_and_elaborate(
     // overridden default too.
     let mut param_override_hits = apply_param_overrides(&mut definitions, None)?;
 
-    // §23.11: a `bind` written as a module item (not at compilation-unit
-    // scope) is applied identically. Lift every `ModuleItem::Bind` out of the
-    // module bodies (replacing it with `Null` so it is not re-processed as a
-    // real instantiation) and fold it into `top_level_binds`.
-    let mut inmodule_binds: Vec<ast::decl::BindDirective> = Vec::new();
-    for def in definitions.values_mut() {
-        let items = match def {
-            SourceDefinition::Module(m) => &m.items,
-            SourceDefinition::Interface(i) => &i.items,
-            _ => continue,
-        };
-        if !items
-            .iter()
-            .any(|it| matches!(it, ast::decl::ModuleItem::Bind(_)))
-        {
-            continue;
-        }
-        let items = match def {
-            SourceDefinition::Module(m) => &mut Rc::make_mut(m).items,
-            SourceDefinition::Interface(i) => &mut Rc::make_mut(i).items,
-            _ => continue,
-        };
-        for it in items.iter_mut() {
-            if let ast::decl::ModuleItem::Bind(b) = it {
-                inmodule_binds.push(b.clone());
-                *it = ast::decl::ModuleItem::Null;
-            }
-        }
-    }
-    top_level_binds.extend(inmodule_binds);
-
-    // IEEE 1800-2023 §23.11: apply each `bind` by appending the bound
-    // instantiation to its target module's items. This runs before
-    // top_level_functions/tasks/nettypes injection so a bound monitor module
-    // sees the same top-level helpers as native modules.
-    // A bind whose target is a hierarchical INSTANCE path attaches to that
-    // one instance only: the definitions along the path spine are cloned
-    // under "__bind<N>" names bottom-up and each parent's instantiation is
-    // rewritten to the clone, so sibling instances of the same definitions
-    // (decoys) never see the bound module.
-    // Module-name binds FIRST: a path bind clones its target definition, so
-    // every module-wide bound instantiation must already be in the base
-    // definition or the specialized instance would miss it (the reference
-    // applies module binds to path-specialized instances too).
-    let mut bind_spec_counter = 0usize;
-    // Item count of each bind host before its first module-name bind.
-    let mut bind_host_len: crate::hasher::HashMap<String, usize> = Default::default();
-    // A bind whose target definition is not in `definitions` YET is deferred,
-    // not dropped: `-v`/`-y` library modules are adopted further below
-    // (`resolve_library_modules`), so a bind reaching THROUGH a library module
-    // — `bind tb.u_lib_inst.u_sub chk c();` where `u_lib_inst`'s type lives in
-    // a `-v` file — resolved against a half-populated map and was silently
-    // ignored. Exactly the same source passes when the library file is given
-    // as an ordinary source, which is what made this look like a path bug.
-    // Both passes below record their failures; the retry after library
-    // adoption re-runs only those, and only IT reports a diagnostic.
-    let mut deferred_module_binds: Vec<&ast::decl::BindDirective> = Vec::new();
-    let mut deferred_path_binds: Vec<(&ast::decl::BindDirective, Vec<ast::expr::HierPathSegment>)> =
-        Vec::new();
-    for b in &top_level_binds {
-        if b.target_path.len() >= 2 {
-            continue;
-        }
-        let tname = b.target_module.name.clone();
-        let Some(def) = definitions.get_mut(&tname) else {
-            deferred_module_binds.push(b);
-            continue;
-        };
-        push_bound_instantiation(def, b, &mut bind_host_len);
-    }
-    for b in &top_level_binds {
-        if b.target_path.len() >= 2 {
-            for p in std::iter::once(&b.target_path).chain(b.extra_paths.iter()) {
-                if !apply_instance_bind(&mut definitions, b, p, &mut bind_spec_counter, true) {
-                    deferred_path_binds.push((b, p.clone()));
-                }
-            }
-        } else if !b.target_path.is_empty() {
-            // Colon form with a SINGLE-segment instance name: an instance of
-            // <target_module> directly in the top module. Resolve it under
-            // every top-level module definition that instantiates it.
-            for extra in std::iter::once(&b.target_path).chain(b.extra_paths.iter()) {
-                let full = extra.clone();
-                if !apply_instance_bind(&mut definitions, b, &full, &mut bind_spec_counter, true) {
-                    deferred_path_binds.push((b, full));
-                }
-            }
-        }
-    }
-    // The effective-timescale walk ran BEFORE bind application, so the
-    // "__bind<N>" specialization clones have no entries — copy the base
-    // definition's (a missing entry silently defaults the clone's timescale
-    // and shifts every #delay inside it).
-    if bind_spec_counter > 0 {
-        let spec_names: Vec<String> = definitions
-            .keys()
-            .filter(|k| bind_spec_base(k) != k.as_str())
-            .cloned()
-            .collect();
-        for nm in spec_names {
-            let base = bind_spec_base(&nm).to_string();
-            if let Some(v) = eff_ts.get(&base).copied() {
-                eff_ts.insert(nm.clone(), v);
-            }
-            if let Some(v) = module_timescale_exp.get(&base).copied() {
-                module_timescale_exp.insert(nm.clone(), v);
-            }
-        }
-    }
+    // §23.11: retain module/generate bind declarations in their lexical
+    // scopes. Targets are resolved after the ordinary hierarchy is elaborated.
     if !top_level_functions.is_empty()
         || !top_level_tasks.is_empty()
         || !top_level_nettypes.is_empty()
@@ -2466,7 +2359,13 @@ fn parse_and_elaborate(
         definitions.keys().cloned().collect();
     let lib_cli = library_cli_cell().lock().unwrap().clone();
     if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
-        resolve_library_modules(&mut definitions, include_dirs, lib_defines, &lib_cli)?;
+        resolve_library_modules(
+            &mut definitions,
+            include_dirs,
+            lib_defines,
+            &lib_cli,
+            &top_level_binds,
+        )?;
         let lib_hits = apply_param_overrides(&mut definitions, Some(&explicit_def_names))?;
         for (h, n) in param_override_hits.iter_mut().zip(lib_hits) {
             *h += n;
@@ -2508,27 +2407,6 @@ fn parse_and_elaborate(
     }
 
     warn_unapplied_param_overrides(&param_override_hits);
-
-    // §23.11 + §23.3.2: apply the binds deferred above. Their targets may
-    // only have become visible with the `-v`/`-y` library modules adopted
-    // just now; anything STILL unresolvable is a genuine bad path and reports
-    // here (the first pass stays quiet so a library-provided target does not
-    // produce a spurious warning).
-    for b in deferred_module_binds.drain(..) {
-        let tname = b.target_module.name.clone();
-        if !definitions
-            .get_mut(&tname)
-            .is_some_and(|def| push_bound_instantiation(def, b, &mut bind_host_len))
-        {
-            eprintln!(
-                "[elab] bind target module '{}' is not a module definition; bind ignored",
-                tname
-            );
-        }
-    }
-    for (b, p) in deferred_path_binds.drain(..) {
-        apply_instance_bind(&mut definitions, b, &p, &mut bind_spec_counter, false);
-    }
 
     // §6.18 + §3.12.1: a $unit typedef's DIMENSIONS are evaluated in the
     // scope where the typedef is DECLARED — the compilation unit — not where
@@ -2783,6 +2661,9 @@ fn parse_and_elaborate(
         for m in definitions.values() {
             collect_instantiated_modules(m.items(), &mut instantiated);
         }
+        for bind in &top_level_binds {
+            instantiated.insert(bind.instantiation.module_name.name.clone());
+        }
         let mut candidates: Vec<String> = definitions
             .keys()
             .filter(|n| {
@@ -2917,6 +2798,36 @@ fn parse_and_elaborate(
             ));
         }
     };
+    // §3.12.1/§6.20/§23.11: evaluate the compilation unit's bind
+    // constants with ordinary typed parameter elaboration, before a top's
+    // declarations can shadow them.
+    let unit_bind_params = if top_level_binds.is_empty() {
+        crate::hasher::HashMap::default()
+    } else {
+        let mut unit = make_multi_top_wrapper(&[]);
+        unit.name.name = "__xezim_bind_unit".into();
+        unit.items.extend(
+            top_level_params
+                .iter()
+                .cloned()
+                .map(ast::decl::ModuleItem::ParameterDeclaration),
+        );
+        unit.items.extend(
+            top_level_functions
+                .iter()
+                .cloned()
+                .map(ast::decl::ModuleItem::FunctionDeclaration),
+        );
+        elaborate::elaborate_module_with_defs(
+            elaborate::Definition::Module(&unit),
+            &params,
+            Some(&def_refs),
+            &top_level_imports,
+            &top_level_lets,
+            &[],
+        )?
+        .parameters
+    };
     let mut phase_t = std::time::Instant::now();
     let mut elab = elaborate::elaborate_module_with_defs(
         elab_def,
@@ -2943,7 +2854,38 @@ fn parse_and_elaborate(
         elab.timeprecision_exp = p;
     }
 
-    elaborate::inline_instantiations(&mut elab, &def_refs)?;
+    // §23.11: bind selection uses the finished hierarchy and declaration
+    // scope. Re-elaborate only designs with newly resolved bindings; ordinary
+    // designs retain their single elaboration pass. This also permits binds
+    // into hierarchy introduced by an earlier bind.
+    for pass in 0..64 {
+        elaborate::inline_instantiations(&mut elab, &def_refs)?;
+        if !resolve_instance_binds(&mut elab, &top_level_binds, &unit_bind_params)? {
+            break;
+        }
+        if pass == 63 {
+            return Err("bind hierarchy does not converge (§23.11)".into());
+        }
+        let binds = std::mem::take(&mut elab.resolved_binds);
+        let timescales = std::mem::take(&mut elab.module_timescale_exp);
+        let without_timescale = std::mem::take(&mut elab.modules_without_timescale);
+        let unit = elab.timeunit_exp;
+        let precision = elab.timeprecision_exp;
+        elab = elaborate::elaborate_module_with_defs(
+            elab_def,
+            &params,
+            Some(&def_refs),
+            &top_level_imports,
+            &top_level_lets,
+            &top_level_ooc_constraints,
+        )?;
+        elab.resolved_binds = binds;
+        elab.tick_s = tick_s;
+        elab.module_timescale_exp = timescales;
+        elab.modules_without_timescale = without_timescale;
+        elab.timeunit_exp = unit;
+        elab.timeprecision_exp = precision;
+    }
     elab_phase("inline instantiations", &mut phase_t);
     // Re-register any compilation-unit-scope CLASS whose name a module
     // clobbered in `definitions`/`def_refs` (§3.13 class/module name-space
@@ -3095,11 +3037,9 @@ fn parse_and_elaborate(
     Ok((definitions, elab))
 }
 
-/// Base definition name of a §23.11 per-instance-bind specialization clone:
-/// strips one trailing `__bind<digits>` suffix; ordinary names pass through.
-/// The simulator's §23.8 upward-name walk uses this so hierarchical
-/// references from inside a bound module still match the specialized host's
-/// original module name.
+/// Decode one suffix from legacy §23.11 specialization names. New binds
+/// retain their source definitions and use `resolved_binds` instead.
+/// Callers must first check for a real declaration with the complete name.
 pub fn bind_spec_base(name: &str) -> &str {
     if let Some(pos) = name.rfind("__bind") {
         let tail = &name[pos + 6..];
@@ -3110,229 +3050,156 @@ pub fn bind_spec_base(name: &str) -> &str {
     name
 }
 
-/// §23.11: add a module-name bind's instantiation to its target definition,
-/// after the host's own items. The target may be a module or an interface (a
-/// monitor BFM interface is the usual host of bound assertion interfaces);
-/// anything else is not a bind target. Several binds into one host elaborate
-/// in reverse bind order, as in the reference simulator, so each goes ahead
-/// of the ones bound before it.
-fn push_bound_instantiation(
-    def: &mut SourceDefinition,
-    b: &ast::decl::BindDirective,
-    host_len: &mut crate::hasher::HashMap<String, usize>,
-) -> bool {
-    let name = def.name();
-    let items = match def {
-        SourceDefinition::Module(m) => &mut Rc::make_mut(m).items,
-        SourceDefinition::Interface(i) => &mut Rc::make_mut(i).items,
-        _ => return false,
-    };
-    let at = *host_len.entry(name).or_insert(items.len());
-    items.insert(
-        at,
-        ast::decl::ModuleItem::ModuleInstantiation(b.instantiation.clone()),
+/// §23.11: select targets using effective hierarchy and lexical constants.
+fn resolve_instance_binds(
+    elab: &mut elaborate::ElaboratedModule,
+    unit_binds: &[ast::decl::BindDirective],
+    unit_params: &crate::hasher::HashMap<String, Value>,
+) -> Result<bool, String> {
+    let mut sites: Vec<_> = elab
+        .bind_sites
+        .iter()
+        .cloned()
+        .map(|(scope, b)| (scope, b, false))
+        .collect();
+    sites.extend(unit_binds.iter().cloned().map(|b| (String::new(), b, true)));
+    if sites.is_empty() {
+        return Ok(false);
+    }
+    let mut hosts = vec![(String::new(), elab.name.clone())];
+    hosts.extend(
+        elab.instances
+            .iter()
+            .map(|i| (i.path.clone(), i.def_name.clone())),
     );
-    true
-}
-
-/// §23.11 per-instance bind: `bind top.a.b.inst bound_mod m ();`.
-///
-/// Walks the definition tree along `target_path` (first segment must name a
-/// module DEFINITION — the top the path is rooted at), recording at each
-/// level which instantiation carries the next path segment. The target
-/// definition is cloned with the bound instantiation appended, then every
-/// definition on the spine (except the root, edited in place) is cloned with
-/// its child instantiation retargeted at the clone below — giving exactly one
-/// instance the bound module while all other instances of the same
-/// definitions keep the original, unbound definitions.
-///
-/// The clone names carry a reserved "__bind<N>" suffix; the simulator's §23.8
-/// upward-name walk strips it when matching a first segment against a module
-/// definition name, so `target_dut.sig` references from inside the bound
-/// module still resolve against the specialized host.
-fn apply_instance_bind(
-    definitions: &mut crate::hasher::HashMap<String, SourceDefinition>,
-    b: &ast::decl::BindDirective,
-    path: &[ast::expr::HierPathSegment],
-    counter: &mut usize,
-    quiet: bool,
-) -> bool {
-    let Some(first) = path.first() else {
-        return false;
-    };
-    let root = first.name.name.as_str();
-    if !matches!(definitions.get(root), Some(SourceDefinition::Module(_))) {
-        if !quiet {
-            eprintln!(
-                "[elab] bind target does not start at a module definition: '{root}'; bind ignored"
+    let mut changed = false;
+    let mut unresolved = Vec::new();
+    for (scope, b, unit_scope) in sites {
+        let mut constants = elab.parameters.clone();
+        if unit_scope {
+            // §3.12.1/§23.11: $unit declarations cannot inherit a top's
+            // same-named localparam when selecting their bind targets.
+            constants.retain(|name, _| name.contains('.') || name.contains("::"));
+            constants.extend(
+                unit_params
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
             );
         }
-        return false;
-    }
-    // Keep expanded parent copies private until the whole path resolves: a
-    // deferred library bind must not leave partially rewritten definitions.
-    let mut spine = Vec::new();
-    let mut cur = root.to_string();
-    let mut next = 1;
-    let mut overrides = crate::hasher::HashMap::default();
-    let mut root_params = None;
-    while next < path.len() {
-        let Some(SourceDefinition::Module(m)) = definitions.get(&cur) else {
-            return false;
-        };
-        let refs: crate::hasher::HashMap<_, _> = definitions
-            .iter()
-            .filter_map(|(name, def)| {
-                let def = match def {
-                    SourceDefinition::Module(m) => elaborate::Definition::Module(m),
-                    SourceDefinition::Interface(i) => elaborate::Definition::Interface(i),
-                    SourceDefinition::Package(p) => elaborate::Definition::Package(p),
-                    SourceDefinition::Typedef(t) => elaborate::Definition::Typedef(t),
-                    SourceDefinition::Class(c) => elaborate::Definition::Class(c),
-                    SourceDefinition::Program(p) => elaborate::Definition::Program(p),
-                    SourceDefinition::Udp(u) => elaborate::Definition::Udp(u),
-                };
-                Some((name.clone(), def))
-            })
-            .collect();
-        let params = match elaborate::elaborate_module_with_defs(
-            elaborate::Definition::Module(m),
-            &overrides,
-            Some(&refs),
-            &[],
-            &[],
-            &[],
-        ) {
-            Ok(elab) => elab.parameters,
-            Err(error) => {
-                if !quiet {
-                    eprintln!("[elab] bind target '{cur}': {error}; bind ignored");
+        // Qualified constants remain available; nearer lexical declarations
+        // replace bare names from enclosing scopes, never from the target.
+        for (key, value) in &elab.parameters {
+            constants.insert(format!("{}.{}", elab.name, key), value.clone());
+        }
+        let mut ancestors = vec![scope.as_str()];
+        let mut ancestor = scope.as_str();
+        while let Some((parent, _)) = ancestor.rsplit_once('.') {
+            ancestors.push(parent);
+            ancestor = parent;
+        }
+        for parent in ancestors.iter().rev() {
+            let prefix = format!("{parent}.");
+            for (key, value) in &elab.parameters {
+                if let Some(local) = key.strip_prefix(&prefix) {
+                    constants.insert(local.to_string(), value.clone());
                 }
-                return false;
             }
-        };
-        let indices = root_params.get_or_insert_with(|| params.clone());
-        let mut parent = (**m).clone();
-        parent.items = elaborate::bind_generated_instances(&parent.items, &params);
-        let mut name = String::new();
-        let mut found = None;
-        for (offset, seg) in path[next..].iter().enumerate() {
-            if !name.is_empty() {
-                name.push('.');
-            }
-            name.push_str(&seg.name.name);
-            for index in &seg.selects {
-                let Some(value) = elaborate::const_eval_i64_with_params(index, Some(indices))
-                else {
-                    if !quiet {
-                        eprintln!("[elab] bind index is not constant; bind ignored");
+        }
+        let mut targets = Vec::new();
+        if b.target_path.is_empty() {
+            targets.extend(
+                hosts
+                    .iter()
+                    .filter(|(_, def)| *def == b.target_module.name)
+                    .map(|(p, _)| p.clone()),
+            );
+        } else {
+            for path in std::iter::once(&b.target_path).chain(b.extra_paths.iter()) {
+                let mut joined = String::new();
+                for segment in path {
+                    if !joined.is_empty() {
+                        joined.push('.');
                     }
-                    return false;
-                };
-                use std::fmt::Write as _;
-                let _ = write!(name, "[{value}]");
-            }
-            if let Some(inst) = parent.items.iter().find_map(|item| match item {
-                ast::decl::ModuleItem::ModuleInstantiation(mi)
-                    if mi.instances.iter().any(|i| i.name.name == name) =>
-                {
-                    Some(mi)
+                    joined.push_str(&segment.name.name);
+                    for select in &segment.selects {
+                        let value = elaborate::const_eval_i64_with_params(select, Some(&constants))
+                            .ok_or_else(|| {
+                                format!(
+                                    "nonconstant bind target index in '{}' (§23.11)",
+                                    b.target_module.name
+                                )
+                            })?;
+                        use std::fmt::Write as _;
+                        let _ = write!(joined, "[{value}]");
+                    }
                 }
-                _ => None,
+                let absolute = joined.strip_prefix("$root.").unwrap_or(&joined);
+                let rooted = absolute.strip_prefix(&format!("{}.", elab.name));
+                let mut candidates = Vec::new();
+                if absolute == elab.name {
+                    candidates.push(String::new());
+                }
+                if let Some(p) = rooted {
+                    candidates.push(p.to_string());
+                }
+                if joined.starts_with("$root.") {
+                    candidates.push(absolute.to_string());
+                } else {
+                    for parent in &ancestors {
+                        if !parent.is_empty() {
+                            candidates.push(format!("{parent}.{joined}"));
+                        }
+                    }
+                    candidates.push(joined.clone());
+                }
+                if let Some(target) = candidates
+                    .into_iter()
+                    .find(|p| hosts.iter().any(|(host, _)| host == p))
+                {
+                    targets.push(target);
+                }
+            }
+        }
+        if targets.is_empty() && !b.target_path.is_empty() {
+            unresolved.push(
+                b.target_path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            );
+        }
+        targets.sort();
+        targets.dedup();
+        for target in targets {
+            let bound = elab.resolved_binds.entry(target).or_default();
+            if !bound.iter().any(|previous| {
+                previous.span == b.span
+                    && previous.instantiation.module_name.name == b.instantiation.module_name.name
+                    && previous.gen_scope == b.gen_scope
+                    && previous
+                        .instantiation
+                        .instances
+                        .iter()
+                        .map(|i| &i.name.name)
+                        .eq(b.instantiation.instances.iter().map(|i| &i.name.name))
             }) {
-                found = Some((offset + 1, inst.clone()));
-                break;
+                bound.push(b.clone());
+                changed = true;
             }
         }
-        let Some((consumed, inst)) = found else {
-            if !quiet {
-                eprintln!("[elab] no bind target instance '{name}' in '{cur}'; bind ignored");
-            }
-            return false;
-        };
-        let child = inst.module_name.name.clone();
-        if let Some(child_def) = refs.get(&child) {
-            overrides = elaborate::bind_parameter_overrides(*child_def, &inst, &params);
-        }
-        spine.push((parent, name, child.clone()));
-        cur = child;
-        next += consumed;
     }
-    // Clone the TARGET definition with the bound instantiation appended.
-    let n = *counter;
-    *counter += 1;
-    let target_def = cur;
-    let spec_of = |base: &str| format!("{base}__bind{n}");
-    let bound = ast::decl::ModuleItem::ModuleInstantiation(b.instantiation.clone());
-    let tclone = match definitions.get(&target_def) {
-        Some(SourceDefinition::Module(tm)) => {
-            let mut tclone = (**tm).clone();
-            tclone.name.name = spec_of(&target_def);
-            tclone.items.push(bound);
-            SourceDefinition::Module(Rc::new(tclone))
+    if !changed {
+        unresolved.sort();
+        unresolved.dedup();
+        for target in unresolved {
+            log_eprintln(&format!(
+                "[elab] no bind target instance '{}'; bind ignored",
+                target
+            ));
         }
-        // The bound host may be an interface instance.
-        Some(SourceDefinition::Interface(ti)) => {
-            let mut tclone = (**ti).clone();
-            tclone.name.name = spec_of(&target_def);
-            tclone.items.push(bound);
-            SourceDefinition::Interface(Rc::new(tclone))
-        }
-        _ => return false,
-    };
-    definitions.insert(spec_of(&target_def), tclone);
-    // Rewrite parents bottom-up. Retargeting an instantiation that declares
-    // several comma-listed instances must split the named one out, so the
-    // siblings keep the original definition.
-    let mut child_spec = spec_of(&target_def);
-    for (level, (parent, inst_name, child_def)) in spine.iter().enumerate().rev() {
-        let is_root = level == 0;
-        let mut pclone = parent.clone();
-        if !is_root {
-            pclone.name.name = spec_of(&parent.name.name);
-        }
-        let mut done = false;
-        let mut new_items: Vec<ast::decl::ModuleItem> = Vec::with_capacity(pclone.items.len());
-        for it in pclone.items.into_iter() {
-            match it {
-                ast::decl::ModuleItem::ModuleInstantiation(mut mi)
-                    if !done
-                        && mi.module_name.name == *child_def
-                        && mi.instances.iter().any(|i| i.name.name == *inst_name) =>
-                {
-                    done = true;
-                    if mi.instances.len() == 1 {
-                        mi.module_name.name = child_spec.clone();
-                        new_items.push(ast::decl::ModuleItem::ModuleInstantiation(mi));
-                    } else {
-                        let pos = mi
-                            .instances
-                            .iter()
-                            .position(|i| i.name.name == *inst_name)
-                            .unwrap();
-                        let picked = mi.instances.remove(pos);
-                        let split = ast::decl::ModuleInstantiation {
-                            module_name: ast::Identifier {
-                                name: child_spec.clone(),
-                                span: mi.module_name.span,
-                            },
-                            params: mi.params.clone(),
-                            instances: vec![picked],
-                            span: mi.span,
-                        };
-                        new_items.push(ast::decl::ModuleItem::ModuleInstantiation(mi));
-                        new_items.push(ast::decl::ModuleItem::ModuleInstantiation(split));
-                    }
-                }
-                other => new_items.push(other),
-            }
-        }
-        pclone.items = new_items;
-        let key = pclone.name.name.clone();
-        definitions.insert(key.clone(), SourceDefinition::Module(Rc::new(pclone)));
-        child_spec = key;
     }
-    true
+    Ok(changed)
 }
 
 fn collect_instantiated_modules(
@@ -3341,6 +3208,9 @@ fn collect_instantiated_modules(
 ) {
     for item in items {
         match item {
+            ast::decl::ModuleItem::Bind(b) => {
+                set.insert(b.instantiation.module_name.name.clone());
+            }
             ast::decl::ModuleItem::ModuleInstantiation(mi) => {
                 set.insert(mi.module_name.name.clone());
             }
@@ -3419,6 +3289,7 @@ fn resolve_library_modules(
     include_dirs: &[String],
     lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
     lib_cli: &LibraryCli,
+    unit_binds: &[ast::decl::BindDirective],
 ) -> Result<(), String> {
     // Remember this pass's preprocessing context so --dump-merged-sv can
     // re-preprocess ADOPTED files identically (see preprocess_adopted_lib).
@@ -3718,6 +3589,11 @@ fn resolve_library_modules(
     // reachable from the explicitly-compiled design, transitively (a pulled-in
     // library module may itself instantiate further library modules).
     let mut seed = std::collections::HashSet::new();
+    seed.extend(
+        unit_binds
+            .iter()
+            .map(|b| b.instantiation.module_name.name.clone()),
+    );
     // Instantiated-name -> referring definition names. This is what turns an
     // opaque "module 'X' not found" into an actionable note: it names WHICH
     // module's body references X, so a user can check whether that reference
