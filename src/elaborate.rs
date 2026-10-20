@@ -33111,6 +33111,20 @@ fn inline_module_items(
                                                 || !frozen.contains(&assign.name.name)
                                             {
                                                 if let Some(init) = &assign.init {
+                                                    // §7.2.1: later body constants can select a
+                                                    // field of this parameter while their own
+                                                    // initializers are being folded.
+                                                    if let Some(fields) = flatten_struct_fields(
+                                                        data_type,
+                                                        local_map,
+                                                        &elab_ro.typedefs,
+                                                        &elab_ro.typedef_types,
+                                                    ) {
+                                                        tls_register_struct_layout(
+                                                            &assign.name.name,
+                                                            &fields,
+                                                        );
+                                                    }
                                                     // §13.4.3 const-function calls.
                                                     let subbed_init;
                                                     let init: &Expression = if expr_has_call(init) {
