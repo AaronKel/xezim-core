@@ -28995,7 +28995,11 @@ fn collect_effective_items_scoped(
                 let limit = 10000;
                 let mut iters = 0;
                 while iters < limit {
-                    local_params.insert(gf.var.clone(), Value::from_u64(i as u64, 32));
+                    // §27.4: generated instances use the same signed genvar
+                    // value as the direct elaboration path.
+                    let mut gv = Value::from_u64(i as u64 as u32 as u64, 32);
+                    gv.is_signed = true;
+                    local_params.insert(gf.var.clone(), gv);
                     let cond_val = eval_const_expr(&gf.cond, &local_params);
                     if cond_val == 0 {
                         break;
@@ -43761,5 +43765,47 @@ mod logged_map_tests {
             }
         }
         assert_eq!(checked, 3);
+    }
+}
+
+#[cfg(test)]
+mod generated_instance_tests {
+    use super::*;
+
+    /// §27.4: instance expansion retains negative genvars and terminates
+    /// descending loops at zero, just like direct generate elaboration.
+    #[test]
+    fn signed_genvar_instance_expansion() {
+        for (loop_header, expected) in [
+            (
+                "g=-2;g<1;g++",
+                vec!["bank[-2].m", "bank[-1].m", "bank[0].m"],
+            ),
+            (
+                "g=1;g>=-1;g--",
+                vec!["bank[1].m", "bank[0].m", "bank[-1].m"],
+            ),
+        ] {
+            let result = sv_parser::parse(&format!(
+                "module top; for(genvar {loop_header}) begin: bank mem m(); end endmodule"
+            ));
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            let crate::ast::Description::Module(module) = &result.source.descriptions[0] else {
+                panic!("missing top");
+            };
+            let items = collect_effective_items(&module.items, &HashMap::default());
+            let names: Vec<_> = items
+                .iter()
+                .flat_map(|item| match item {
+                    ModuleItem::ModuleInstantiation(mi) => mi
+                        .instances
+                        .iter()
+                        .map(|i| i.name.name.as_str())
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                })
+                .collect();
+            assert_eq!(names, expected);
+        }
     }
 }
