@@ -6468,8 +6468,12 @@ fn check_module_use_before_decl(module: &Definition) -> Vec<String> {
             return;
         }
         let raw = base.path[0].name.name.as_str();
-        let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
-        probe_name(name, declared_at, dsf, locals, visited, out);
+        // §3.12.1: an explicitly qualified compilation-unit target is a
+        // different object from a same-named declaration in this module.
+        if crate::sv_parser::strip_unit_scope_name(raw).is_some() {
+            return;
+        }
+        probe_name(raw, declared_at, dsf, locals, visited, out);
     }
 
     /// Recursive statement walker that also tracks block-local variable
