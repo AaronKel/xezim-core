@@ -73,6 +73,20 @@ impl Parser {
                         self.span_from(s),
                     );
                 }
+            } else if self.at(TokenKind::LParen) {
+                // §10.4.2 / §25.9: a function returning an interface can
+                // be the receiver of an assignment target. Keep its postfix
+                // chain here so `get_v().data <= x` remains an NBA rather
+                // than a discarded relational expression.
+                let s = lval.span.start;
+                let args = self.parse_call_args();
+                lval = Expression::new(
+                    ExprKind::Call {
+                        func: Box::new(lval),
+                        args,
+                    },
+                    self.span_from(s),
+                );
             } else if self.at(TokenKind::Dot) {
                 let s = self.current().span.start;
                 self.bump();

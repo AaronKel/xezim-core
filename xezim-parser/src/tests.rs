@@ -1,6 +1,32 @@
 use crate::ast::{Description, decl::ModuleItem};
 use crate::parse;
 
+/// §10.4.2 / §25.9: calls within an NBA target do not turn `<=` into a
+/// relational expression. A comparison inside an argument remains one.
+#[test]
+fn nonblocking_assignment_through_returned_receiver() {
+    for target in [
+        "get_v().data",
+        "p::get_v().data[0]",
+        "h.get_v().data[3:0]",
+        "get_v().data[i +: 2]",
+        "get_obj().nested.get_v().data",
+    ] {
+        let result = parse(&format!("module m; initial {target} <= 1; endmodule"));
+        assert!(result.errors.is_empty(), "{target}: {:?}", result.errors);
+        let ast = format!("{:?}", result.source);
+        assert!(ast.contains("NonblockingAssign"), "{target}: {ast}");
+        assert!(ast.contains("Call {"), "{target}: receiver call missing");
+    }
+    let result = parse("module m; initial use_value(get_v().data <= 1); endmodule");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let ast = format!("{:?}", result.source);
+    assert!(
+        !ast.contains("NonblockingAssign") && ast.contains("Leq"),
+        "{ast}"
+    );
+}
+
 /// §25.9 / §26.2: virtual-interface variables are package data declarations,
 /// including the optional `interface` keyword, type arguments and modports.
 #[test]
