@@ -5702,6 +5702,7 @@ impl Parser {
                                     | TokenKind::LogAnd
                                     | TokenKind::LogOr
                                     | TokenKind::LogImplies
+                                    | TokenKind::LogEquiv
                                     | TokenKind::BitAnd
                                     | TokenKind::BitOr
                                     | TokenKind::BitXor

@@ -514,7 +514,7 @@ impl Parser {
                     } else {
                         self.parse_prefix()
                     };
-                    let rhs = self.parse_expr_bp(r_bp);
+                    let rhs = self.parse_expr_bp_ctx(r_bp, no_arrow);
                     let delayed = Expression::new(
                         ExprKind::Binary {
                             op: BinaryOp::HashHash,
@@ -534,7 +534,7 @@ impl Parser {
                     continue;
                 }
 
-                let rhs = self.parse_expr_bp(r_bp);
+                let rhs = self.parse_expr_bp_ctx(r_bp, no_arrow);
                 lhs = Expression::new(
                     ExprKind::Binary {
                         op,
@@ -555,7 +555,7 @@ impl Parser {
                 self.bump();
                 let then_expr = self.parse_expr_bp(0);
                 self.expect(TokenKind::Colon);
-                let else_expr = self.parse_expr_bp(l_bp);
+                let else_expr = self.parse_expr_bp_ctx(l_bp, no_arrow);
                 lhs = Expression::new(
                     ExprKind::Conditional {
                         condition: Box::new(lhs),
