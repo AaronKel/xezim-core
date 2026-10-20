@@ -33936,11 +33936,25 @@ fn inline_module_items(
                     m
                 };
 
-                // §7.2.1: STRUCT-typed header parameters of this instance —
+                // §7.2.1: struct-typed header and generated body parameters —
                 // register the field layout under the SCOPED name so runtime
                 // member selects (`C.a` inside the instance → "c0.C" + field
                 // slice) resolve; without it they read x.
-                for p_decl in sub_mod.params() {
+                for p_decl in
+                    sub_mod
+                        .params()
+                        .iter()
+                        .chain(
+                            prepared_sub
+                                .effective_items
+                                .iter()
+                                .filter_map(|item| match item {
+                                    ModuleItem::ParameterDeclaration(pd)
+                                    | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
+                                    _ => None,
+                                }),
+                        )
+                {
                     if let ParameterKind::Data {
                         data_type,
                         assignments,
