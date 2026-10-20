@@ -28827,6 +28827,82 @@ fn cat2(a: &str, b: &str) -> String {
     s
 }
 
+/// §23.11 / §27: materialize generated instance names for a bind's one
+/// specialized host. Other generate items still elaborate in their scopes.
+pub(crate) fn bind_generated_instances(
+    items: &[ModuleItem],
+    params: &HashMap<String, Value>,
+) -> Vec<ModuleItem> {
+    fn remove_instances(items: &mut Vec<ModuleItem>) {
+        items.retain(|item| !matches!(item, ModuleItem::ModuleInstantiation(_)));
+        for item in items {
+            match item {
+                ModuleItem::GenerateRegion(g) => remove_instances(&mut g.items),
+                ModuleItem::GenerateFor(g) => remove_instances(&mut g.items),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, body) in &mut g.branches {
+                        remove_instances(body);
+                    }
+                }
+                ModuleItem::GenerateCase(g) => {
+                    for arm in &mut g.arms {
+                        remove_instances(&mut arm.items);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut result = items.to_vec();
+    remove_instances(&mut result);
+    result.extend(
+        collect_effective_items(items, params)
+            .into_iter()
+            .filter(|item| matches!(item, ModuleItem::ModuleInstantiation(_))),
+    );
+    result
+}
+
+/// Value overrides for the next module on a bind's instance spine.
+pub(crate) fn bind_parameter_overrides(
+    child: Definition,
+    inst: &ModuleInstantiation,
+    params: &HashMap<String, Value>,
+) -> HashMap<String, Value> {
+    let names: Vec<_> = child
+        .params()
+        .iter()
+        .chain(child.items().iter().filter_map(|item| {
+            if let ModuleItem::ParameterDeclaration(p) = item {
+                Some(p)
+            } else {
+                None
+            }
+        }))
+        .filter(|p| !p.local)
+        .flat_map(|p| match &p.kind {
+            ParameterKind::Data { assignments, .. } => assignments
+                .iter()
+                .map(|a| a.name.name.clone())
+                .collect::<Vec<_>>(),
+            ParameterKind::Type { assignments } => {
+                assignments.iter().map(|a| a.name.name.clone()).collect()
+            }
+        })
+        .collect();
+    let mut out = HashMap::default();
+    for (i, conn) in inst.params.iter().flatten().enumerate() {
+        let (name, value) = match conn {
+            ParamConnection::Named { name, value } => (Some(&name.name), value.as_ref()),
+            ParamConnection::Ordered(value) => (names.get(i), value.as_ref()),
+        };
+        if let (Some(name), Some(ParamValue::Expr(e))) = (name, value) {
+            out.insert(name.clone(), eval_const_expr_val(e, params));
+        }
+    }
+    out
+}
+
 fn collect_effective_items(
     items: &[ModuleItem],
     params: &HashMap<String, Value>,

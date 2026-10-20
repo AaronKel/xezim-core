@@ -158,44 +158,22 @@ impl Parser {
         self.diagnostics.extend(errs);
     }
 
-    /// Parse the simple `bind <target> <bind_mod> <inst>(<ports>);` form
-    /// (IEEE 1800-2023 §23.11). The `bind` keyword must already have been
-    /// consumed. Used at both compilation-unit scope (→ `Description::Bind`)
-    /// and as a module item (→ `ModuleItem::Bind`). On a shape the heuristic
-    /// doesn't handle (instance selector, multi-target, etc.) it rewinds and
-    /// swallows to the next `;`, returning `None`.
+    /// §23.11: bind targets retain constant selects until elaboration, at
+    /// both compilation-unit and module scope.
     pub(super) fn try_bind_directive(&mut self) -> Option<crate::ast::decl::BindDirective> {
         let start_byte = self.current().span.start;
         let restart = self.pos;
-        let target = self.parse_identifier();
-        // §23.11 bind_target_instance: a dotted instance path selects ONE
-        // instance instead of every instance of a module. The colon form
-        // (`bind <mod> : <path> [, <path>]* <binder> ...`) lists explicit
-        // target instances of that module.
-        let mut target_path: Vec<crate::ast::Identifier> = Vec::new();
-        let mut extra_paths: Vec<Vec<crate::ast::Identifier>> = Vec::new();
-        if self.at(TokenKind::Dot) {
-            target_path.push(target.clone());
-            while self.eat(TokenKind::Dot).is_some() {
-                target_path.push(self.parse_identifier());
+        let first = self.parse_bind_path();
+        let target = first.first()?.name.clone();
+        let mut target_path = Vec::new();
+        let mut extra_paths = Vec::new();
+        if self.eat(TokenKind::Colon).is_some() {
+            target_path = self.parse_bind_path();
+            while self.eat(TokenKind::Comma).is_some() {
+                extra_paths.push(self.parse_bind_path());
             }
-        } else if self.at(TokenKind::Colon) {
-            self.bump();
-            loop {
-                let mut path: Vec<crate::ast::Identifier> = Vec::new();
-                path.push(self.parse_identifier());
-                while self.eat(TokenKind::Dot).is_some() {
-                    path.push(self.parse_identifier());
-                }
-                if target_path.is_empty() {
-                    target_path = path;
-                } else {
-                    extra_paths.push(path);
-                }
-                if self.eat(TokenKind::Comma).is_none() {
-                    break;
-                }
-            }
+        } else if first.len() > 1 || !first[0].selects.is_empty() {
+            target_path = first;
         }
         let bind_mod = self.parse_identifier();
         // `bind dut harness #(.N(N)) v_h (.*);` — the parameter value
@@ -256,6 +234,23 @@ impl Parser {
             }
         }
         None
+    }
+
+    fn parse_bind_path(&mut self) -> Vec<crate::ast::expr::HierPathSegment> {
+        let mut path = Vec::new();
+        loop {
+            let name = self.parse_identifier();
+            let mut selects = Vec::new();
+            while self.eat(TokenKind::LBracket).is_some() {
+                selects.push(self.parse_expression());
+                self.expect(TokenKind::RBracket);
+            }
+            path.push(crate::ast::expr::HierPathSegment { name, selects });
+            if self.eat(TokenKind::Dot).is_none() {
+                break;
+            }
+        }
+        path
     }
 
     fn parse_description(&mut self) -> Option<Description> {

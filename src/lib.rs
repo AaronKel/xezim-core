@@ -162,7 +162,8 @@ pub use value::Value;
 /// \x22 = \x21 + ClassExtends.scopes, and package type names declared in
 /// more than one place renamed to `pkg::name` (§26.3).
 /// \x23 = \x22 + dynamic-outer associative class property dimensions (§7.4.5).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x23";
+/// \x24 = \x23 + constant selects in bind target paths (§23.11).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x24";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -2217,7 +2218,7 @@ fn parse_and_elaborate(
     // Both passes below record their failures; the retry after library
     // adoption re-runs only those, and only IT reports a diagnostic.
     let mut deferred_module_binds: Vec<&ast::decl::BindDirective> = Vec::new();
-    let mut deferred_path_binds: Vec<(&ast::decl::BindDirective, Vec<ast::Identifier>)> =
+    let mut deferred_path_binds: Vec<(&ast::decl::BindDirective, Vec<ast::expr::HierPathSegment>)> =
         Vec::new();
     for b in &top_level_binds {
         if b.target_path.len() >= 2 {
@@ -3150,59 +3151,110 @@ fn push_bound_instantiation(
 fn apply_instance_bind(
     definitions: &mut crate::hasher::HashMap<String, SourceDefinition>,
     b: &ast::decl::BindDirective,
-    path: &[ast::Identifier],
+    path: &[ast::expr::HierPathSegment],
     counter: &mut usize,
     quiet: bool,
 ) -> bool {
-    let segs: Vec<&str> = path.iter().map(|i| i.name.as_str()).collect();
-    let root = segs[0];
+    let Some(first) = path.first() else {
+        return false;
+    };
+    let root = first.name.name.as_str();
     if !matches!(definitions.get(root), Some(SourceDefinition::Module(_))) {
         if !quiet {
             eprintln!(
-                "[elab] bind target path '{}' does not start at a module definition; bind ignored",
-                segs.join(".")
+                "[elab] bind target does not start at a module definition: '{root}'; bind ignored"
             );
         }
         return false;
     }
-    // Resolve the spine: (parent_def_name, instance_name, child_def_name).
-    let mut spine: Vec<(String, String, String)> = Vec::new();
+    // Keep expanded parent copies private until the whole path resolves: a
+    // deferred library bind must not leave partially rewritten definitions.
+    let mut spine = Vec::new();
     let mut cur = root.to_string();
-    for seg in &segs[1..] {
+    let mut next = 1;
+    let mut overrides = crate::hasher::HashMap::default();
+    let mut root_params = None;
+    while next < path.len() {
         let Some(SourceDefinition::Module(m)) = definitions.get(&cur) else {
-            // Not necessarily fatal on the FIRST pass: the definition may be
-            // a `-v`/`-y` library module that has not been adopted yet (see
-            // the deferred retry after `resolve_library_modules`).
+            return false;
+        };
+        let refs: crate::hasher::HashMap<_, _> = definitions
+            .iter()
+            .filter_map(|(name, def)| {
+                let def = match def {
+                    SourceDefinition::Module(m) => elaborate::Definition::Module(m),
+                    SourceDefinition::Interface(i) => elaborate::Definition::Interface(i),
+                    SourceDefinition::Package(p) => elaborate::Definition::Package(p),
+                    SourceDefinition::Typedef(t) => elaborate::Definition::Typedef(t),
+                    SourceDefinition::Class(c) => elaborate::Definition::Class(c),
+                    SourceDefinition::Program(p) => elaborate::Definition::Program(p),
+                    SourceDefinition::Udp(u) => elaborate::Definition::Udp(u),
+                };
+                Some((name.clone(), def))
+            })
+            .collect();
+        let params = match elaborate::elaborate_module_with_defs(
+            elaborate::Definition::Module(m),
+            &overrides,
+            Some(&refs),
+            &[],
+            &[],
+            &[],
+        ) {
+            Ok(elab) => elab.parameters,
+            Err(error) => {
+                if !quiet {
+                    eprintln!("[elab] bind target '{cur}': {error}; bind ignored");
+                }
+                return false;
+            }
+        };
+        let indices = root_params.get_or_insert_with(|| params.clone());
+        let mut parent = (**m).clone();
+        parent.items = elaborate::bind_generated_instances(&parent.items, &params);
+        let mut name = String::new();
+        let mut found = None;
+        for (offset, seg) in path[next..].iter().enumerate() {
+            if !name.is_empty() {
+                name.push('.');
+            }
+            name.push_str(&seg.name.name);
+            for index in &seg.selects {
+                let Some(value) = elaborate::const_eval_i64_with_params(index, Some(indices))
+                else {
+                    if !quiet {
+                        eprintln!("[elab] bind index is not constant; bind ignored");
+                    }
+                    return false;
+                };
+                use std::fmt::Write as _;
+                let _ = write!(name, "[{value}]");
+            }
+            if let Some(inst) = parent.items.iter().find_map(|item| match item {
+                ast::decl::ModuleItem::ModuleInstantiation(mi)
+                    if mi.instances.iter().any(|i| i.name.name == name) =>
+                {
+                    Some(mi)
+                }
+                _ => None,
+            }) {
+                found = Some((offset + 1, inst.clone()));
+                break;
+            }
+        }
+        let Some((consumed, inst)) = found else {
             if !quiet {
-                eprintln!(
-                    "[elab] bind target path '{}': '{}' is not a module; bind ignored",
-                    segs.join("."),
-                    cur
-                );
+                eprintln!("[elab] no bind target instance '{name}' in '{cur}'; bind ignored");
             }
             return false;
         };
-        let child = m.items.iter().find_map(|it| match it {
-            ast::decl::ModuleItem::ModuleInstantiation(mi)
-                if mi.instances.iter().any(|i| i.name.name == **seg) =>
-            {
-                Some(mi.module_name.name.clone())
-            }
-            _ => None,
-        });
-        let Some(child) = child else {
-            if !quiet {
-                eprintln!(
-                    "[elab] bind target path '{}': no instance '{}' in module '{}'; bind ignored",
-                    segs.join("."),
-                    seg,
-                    cur
-                );
-            }
-            return false;
-        };
-        spine.push((cur.clone(), (*seg).to_string(), child.clone()));
+        let child = inst.module_name.name.clone();
+        if let Some(child_def) = refs.get(&child) {
+            overrides = elaborate::bind_parameter_overrides(*child_def, &inst, &params);
+        }
+        spine.push((parent, name, child.clone()));
         cur = child;
+        next += consumed;
     }
     // Clone the TARGET definition with the bound instantiation appended.
     let n = *counter;
@@ -3233,12 +3285,9 @@ fn apply_instance_bind(
     let mut child_spec = spec_of(&target_def);
     for (level, (parent, inst_name, child_def)) in spine.iter().enumerate().rev() {
         let is_root = level == 0;
-        let Some(SourceDefinition::Module(pm)) = definitions.get(parent) else {
-            return false;
-        };
-        let mut pclone = (**pm).clone();
+        let mut pclone = parent.clone();
         if !is_root {
-            pclone.name.name = spec_of(parent);
+            pclone.name.name = spec_of(&parent.name.name);
         }
         let mut done = false;
         let mut new_items: Vec<ast::decl::ModuleItem> = Vec::with_capacity(pclone.items.len());

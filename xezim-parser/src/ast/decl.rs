@@ -152,12 +152,12 @@ pub struct BindDirective {
     /// dotted path (first segment = a top-level module name). Empty for the
     /// plain by-module-name form; `target_module` then holds the module.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub target_path: Vec<Identifier>,
+    pub target_path: Vec<super::expr::HierPathSegment>,
     /// §23.11 colon form `bind <mod> : <inst>, <inst>, ... <binder> ...`:
     /// additional target-instance paths beyond `target_path` (which holds
     /// the first). Empty otherwise.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub extra_paths: Vec<Vec<Identifier>>,
+    pub extra_paths: Vec<Vec<super::expr::HierPathSegment>>,
     /// The instantiation appended into every instance of `target_module`.
     pub instantiation: ModuleInstantiation,
     pub span: Span,

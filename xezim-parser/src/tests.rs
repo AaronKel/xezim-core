@@ -543,3 +543,23 @@ fn type_keyword_specialization_keeps_signing() {
         "{text}"
     );
 }
+
+/// §23.11: selected segments retain constant expressions in either bind form.
+#[test]
+fn bind_generate_target_selects() {
+    for directive in [
+        "bind top.bank[1-1].w.m mif mi();",
+        "bind mem : top.bank[0].w.m, top.bank[1].w.m mif mi();",
+    ] {
+        let result = parse(directive);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let Some(Description::Bind(bind)) = result.source.descriptions.first() else {
+            panic!("missing bind");
+        };
+        assert_eq!(bind.target_path.len(), 4);
+        assert_eq!(bind.target_path[1].selects.len(), 1);
+        if !bind.extra_paths.is_empty() {
+            assert_eq!(bind.extra_paths[0][1].selects.len(), 1);
+        }
+    }
+}
