@@ -1806,6 +1806,7 @@ fn parse_and_elaborate(
     let mut top_level_dpi_exports: Vec<ast::decl::DPIExport> = Vec::new();
     let mut top_level_params: Vec<ast::decl::ParameterDeclaration> = Vec::new();
     let mut top_level_vars: Vec<ast::decl::DataDeclaration> = Vec::new();
+    let mut top_level_nets: Vec<ast::decl::NetDeclaration> = Vec::new();
     // §19.3 $unit-scope covergroups, injected into every module like the
     // $unit subroutines.
     let mut top_level_covergroups: Vec<ast::decl::CovergroupDeclaration> = Vec::new();
@@ -2126,32 +2127,10 @@ fn parse_and_elaborate(
             ast::Description::PackageItem(ast::decl::PackageItem::Data(d)) => {
                 top_level_vars.push(d);
             }
-            // §6.7 a NET declaration at compilation-unit scope (`wire x;`,
-            // `wire x2[2], y2[2];`). `wire x;` and `int a;` are both accepted
-            // at $unit, so a net must be accepted too, not "unexpected". Hoist
-            // it alongside $unit variables (its declarators carry the same
-            // name/dimensions), so in-module references resolve and it
-            // shadows/coexists exactly like a $unit variable would.
+            // §6.7 / §10.3.1: keep net kind, strengths, delays and continuous
+            // declaration assignments when hoisting compilation-unit storage.
             ast::Description::PackageItem(ast::decl::PackageItem::Net(n)) => {
-                use crate::ast::stmt::VarDeclarator;
-                let declarators = n
-                    .declarators
-                    .iter()
-                    .map(|nd| VarDeclarator {
-                        name: nd.name.clone(),
-                        dimensions: nd.dimensions.clone(),
-                        init: nd.init.clone(),
-                        span: nd.span,
-                    })
-                    .collect();
-                top_level_vars.push(ast::decl::DataDeclaration {
-                    const_kw: false,
-                    var_kw: false,
-                    lifetime: None,
-                    data_type: n.data_type.clone(),
-                    declarators,
-                    span: n.span,
-                });
+                top_level_nets.push(n);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Covergroup(cg)) => {
                 top_level_covergroups.push(cg);
@@ -2197,6 +2176,7 @@ fn parse_and_elaborate(
         || !top_level_nettypes.is_empty()
         || !top_level_params.is_empty()
         || !top_level_vars.is_empty()
+        || !top_level_nets.is_empty()
         || !top_level_covergroups.is_empty()
         || !top_level_dpi_imports.is_empty()
         || !top_level_dpi_exports.is_empty()
@@ -2214,7 +2194,7 @@ fn parse_and_elaborate(
                 // `$unit::<name>` (see the variable injection below) — rewrite
                 // the injected body to reference THAT, or the subroutine would
                 // silently read/write the module's shadow instead.
-                let shadowed_unit_vars: std::collections::HashMap<String, String> = top_level_vars
+                let mut shadowed_unit_vars: std::collections::HashMap<String, String> = top_level_vars
                     .iter()
                     .flat_map(|d| d.declarators.iter())
                     .filter(|v| local_decl_names.contains(&v.name.name))
@@ -2225,6 +2205,11 @@ fn parse_and_elaborate(
                         )
                     })
                     .collect();
+                shadowed_unit_vars.extend(
+                    top_level_nets.iter().flat_map(|d| &d.declarators)
+                        .filter(|v| local_decl_names.contains(&v.name.name))
+                        .map(|v| (v.name.name.clone(), sv_parser::unit_scope_name(&v.name.name))),
+                );
                 let subst_body = |items: &[ast::stmt::Statement],
                                   ports: &[ast::decl::FunctionPort]|
                  -> Option<Vec<ast::stmt::Statement>> {
@@ -2371,6 +2356,27 @@ fn parse_and_elaborate(
                         m.items
                             .insert(0, ast::decl::ModuleItem::DataDeclaration(dd));
                     }
+                }
+                // §3.12.1: unit nets remain distinct from module-local
+                // declarations, and their driver expressions use unit scope.
+                for net in top_level_nets.iter().rev() {
+                    let mut net = net.clone();
+                    for decl in &mut net.declarators {
+                        if local_decl_names.contains(&decl.name.name) {
+                            decl.name.name = sv_parser::unit_scope_name(&decl.name.name);
+                        }
+                        if let Some(init) = &mut decl.init {
+                            let stmt = ast::stmt::Statement::new(
+                                ast::stmt::StatementKind::Expr(init.clone()), init.span,
+                            );
+                            if let ast::stmt::StatementKind::Expr(expr) =
+                                elaborate::substitute_bare_idents_stmt(&stmt, &shadowed_unit_vars).kind
+                            {
+                                *init = expr;
+                            }
+                        }
+                    }
+                    m.items.insert(0, ast::decl::ModuleItem::NetDeclaration(net));
                 }
             }
         }
