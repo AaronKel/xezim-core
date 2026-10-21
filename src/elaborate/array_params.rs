@@ -159,7 +159,14 @@ pub(super) fn register(
     let width = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
     let full_name = format!("{prefix}{name}");
     register_shape(elab, &full_name, &shape, width);
-    elab.var_decl_types.insert(full_name, data_type.clone());
+    // §6.20.2: aggregate parameter elements use whole Value storage.
+    // An unpacked variable type would route their member reads to separate
+    // field signals, which this constant representation does not allocate.
+    if !matches!(resolve_typedef_chain(data_type, &elab.typedef_types),
+        DataType::Struct(s) if !s.packed)
+    {
+        elab.var_decl_types.insert(full_name, data_type.clone());
+    }
     for (name, value) in values {
         let name = format!("{prefix}{name}");
         params_insert_traced(&mut elab.parameters, line!(), name.clone(), value.clone());
