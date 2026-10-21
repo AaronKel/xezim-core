@@ -13,6 +13,7 @@ use crate::hasher::HashSet;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+pub(crate) mod array_params;
 mod interface_arrays;
 pub mod interface_ports;
 mod module_class_scope;
@@ -4765,6 +4766,21 @@ fn overlay_pkg_params(
         };
         for a in assignments {
             let key = format!("{}::{}", p.name.name, a.name.name);
+            // §26.3: later package passes need the same bounded visibility
+            // for array elements as for scalar parameters.
+            if !a.dimensions.is_empty() {
+                let prefix = format!("{key}[");
+                let values: Vec<_> = elab
+                    .parameters
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(&prefix))
+                    .map(|(name, value)| (name[p.name.name.len() + 2..].to_string(), value.clone()))
+                    .collect();
+                for (name, value) in values {
+                    saved.push((name.clone(), elab.parameters.get(&name).cloned()));
+                    params_insert_traced(&mut elab.parameters, line!(), name, value);
+                }
+            }
             if let Some(v) = elab.parameters.get(&key).cloned() {
                 saved.push((
                     a.name.name.clone(),
@@ -4988,6 +5004,23 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                             data_type,
                             &params_snapshot,
                         ) {
+                            // §26.3: later declarations in this package can
+                            // use its own array without a qualification. Keep
+                            // that visibility within the bounded overlay.
+                            let head = format!("{scoped_name}[");
+                            let own: Vec<_> = elab
+                                .parameters
+                                .iter()
+                                .filter(|(name, _)| name.starts_with(&head))
+                                .map(|(name, value)| {
+                                    (name[p.name.name.len() + 2..].to_string(), value.clone())
+                                })
+                                .collect();
+                            for (name, value) in own {
+                                pkg_overlay
+                                    .push((name.clone(), elab.parameters.get(&name).cloned()));
+                                params_insert_traced(&mut elab.parameters, line!(), name, value);
+                            }
                             continue;
                         }
                     }
@@ -7695,6 +7728,14 @@ pub fn elaborate_module_with_defs(
                             DataType::Implicit { dimensions, .. } if dimensions.is_empty()
                         );
                         for assign in assignments {
+                            if register_visible_array_param(
+                                &mut elab,
+                                &p.name.name,
+                                assign,
+                                data_type,
+                            ) {
+                                continue;
+                            }
                             register_packed_array_elem_w(
                                 &assign.name.name,
                                 data_type,
@@ -19728,7 +19769,11 @@ fn const_eval_user_call(
 /// either as a multi-segment Ident or as a MemberAccess, so enumerate the
 /// `::` and `.` spellings (bare leaf last, matching the existing bare-leaf
 /// fallback for Ident bases).
-fn const_index_base_keys(e: &Expression, out: &mut Vec<String>) {
+fn const_index_base_keys(
+    e: &Expression,
+    params: Option<&HashMap<String, Value>>,
+    out: &mut Vec<String>,
+) {
     match &e.kind {
         ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
             let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
@@ -19736,18 +19781,28 @@ fn const_index_base_keys(e: &Expression, out: &mut Vec<String>) {
                 out.push(segs.join("::"));
                 out.push(segs.join("."));
             }
-            if let Some(last) = segs.last() {
+            if segs.len() == 1
+                && let Some(last) = segs.last()
+            {
                 out.push((*last).to_string());
             }
         }
         ExprKind::MemberAccess { expr, member } => {
             let mut subs = Vec::new();
-            const_index_base_keys(expr, &mut subs);
+            const_index_base_keys(expr, params, &mut subs);
             for s in subs {
                 out.push(format!("{}::{}", s, member.name));
                 out.push(format!("{}.{}", s, member.name));
             }
         }
+        ExprKind::Index { expr, index } => {
+            if let Some(index) = const_eval_i64_with_params(index, params) {
+                let mut bases = Vec::new();
+                const_index_base_keys(expr, params, &mut bases);
+                out.extend(bases.into_iter().map(|base| format!("{base}[{index}]")));
+            }
+        }
+        ExprKind::Paren(inner) => const_index_base_keys(inner, params, out),
         _ => {}
     }
 }
@@ -19841,7 +19896,7 @@ pub fn const_eval_i64_with_params(
             // to the full value evaluator).
             if let Some(idx) = const_eval_i64_with_params(index, params) {
                 let mut keys = Vec::new();
-                const_index_base_keys(base, &mut keys);
+                const_index_base_keys(base, params, &mut keys);
                 for k in &keys {
                     if let Some(v) = params.and_then(|p| p.get(&format!("{}[{}]", k, idx))) {
                         return v.to_i64();
@@ -22637,6 +22692,54 @@ fn alias_pkg_param(elab: &mut ElaboratedModule, pkg: &str, name: &str, v: &Value
     }
 }
 
+/// §26.2.2 / §26.3: an imported array retains its element environment and
+/// shape under both the visible declaration name and the qualified name.
+fn register_visible_array_param(
+    elab: &mut ElaboratedModule,
+    pkg: &str,
+    assign: &ParamAssignment,
+    data_type: &DataType,
+) -> bool {
+    if assign.dimensions.is_empty() {
+        return false;
+    }
+    let mut params = elab.parameters.clone();
+    // The initializer and bounds belong to the exporting package, even
+    // when only this array is imported into a scope with scalar homonyms.
+    let prefix = format!("{pkg}::");
+    let own: Vec<_> = params
+        .iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix(&prefix)
+                .map(|key| (key.to_string(), value.clone()))
+        })
+        .collect();
+    params.extend(own);
+    if !register_array_param(
+        elab,
+        "",
+        &assign.name.name,
+        &assign.dimensions,
+        assign.init.as_ref(),
+        None,
+        data_type,
+        &params,
+    ) {
+        return false;
+    }
+    register_array_param(
+        elab,
+        "",
+        &format!("{pkg}::{}", assign.name.name),
+        &assign.dimensions,
+        assign.init.as_ref(),
+        None,
+        data_type,
+        &params,
+    );
+    true
+}
+
 fn struct_typedef_self_reference(
     target: &str,
     dt: &DataType,
@@ -23316,141 +23419,17 @@ fn register_array_param(
     data_type: &DataType,
     params: &HashMap<String, Value>,
 ) -> bool {
-    let dims = normalize_unpacked_dims(dims, params, &elab.typedef_types);
-    // §6.20.2 MULTI-DIMENSIONAL unpacked parameter array
-    // (`localparam int UA [0:1][0:1] = '{'{1,2},'{3,4}}`). Only the FIRST
-    // dimension was consulted, so the inner dimension vanished and every
-    // element read 0. Recurse per outer index over the matching sub-pattern.
-    if dims.len() > 1 {
-        let Some(outer) = const_dim_indices(&dims[..1], params) else {
-            return false;
-        };
-        let Some(init) = init else { return false };
-        let items: Vec<&Expression> = match &init.kind {
-            ExprKind::Concatenation(v) => v.iter().collect(),
-            ExprKind::AssignmentPattern(items) => items.iter().map(|i| i.expr()).collect(),
-            _ => return false,
-        };
-        if items.len() != outer.len() {
-            return false;
-        }
-        for (i, it) in outer.iter().zip(items) {
-            let sub = format!("{}[{}]", name, i);
-            if !register_array_param(
-                elab,
-                prefix,
-                &sub,
-                &dims[1..],
-                Some(it),
-                None,
-                data_type,
-                params,
-            ) {
-                return false;
-            }
-        }
-        // Register the 2-D shape too: name validation and the runtime
-        // element-select path both key off it. (Simulator::new rebuilds this
-        // storage, so its elaboration-value restore must run AFTER the 2-D
-        // loop — see the ordering note there.)
-        if dims.len() == 2 {
-            if let Some(inner) = const_dim_indices(&dims[1..2], params) {
-                let ew = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
-                let (o0, o1) = (outer[0], outer[outer.len() - 1]);
-                let (i0, i1) = (inner[0], inner[inner.len() - 1]);
-                elab.arrays_2d
-                    .insert(cat2(&prefix, &name), ((o0, o1), (i0, i1), ew));
-            }
-        }
-        return true;
-    }
-    let Some(idxs) = const_dim_indices(&dims, params) else {
-        return false;
-    };
-    let n = idxs.len();
-    if n == 0 {
-        return false;
-    }
-    let elem_w = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
-    let mut vals: Vec<Value> = Vec::new();
-    if let Some(p) = override_val {
-        if (p.width as usize) < n * elem_w as usize {
-            return false;
-        }
-        for i in 0..n {
-            let off = (n - 1 - i) * elem_w as usize;
-            let mut v = Value::zero(elem_w);
-            for b in 0..elem_w as usize {
-                v.set_bit(b, p.get_bit(off + b));
-            }
-            vals.push(v);
-        }
-    } else if let Some(init) = init {
-        let items: Vec<&Expression> = match &init.kind {
-            ExprKind::Concatenation(v) => v.iter().collect(),
-            ExprKind::AssignmentPattern(items) => items.iter().map(|i| i.expr()).collect(),
-            _ => return false,
-        };
-        if items.len() != n {
-            return false;
-        }
-        // §10.9.2: an ELEMENT of an unpacked array parameter may itself be
-        // an assignment pattern, and the element type supplies the layout.
-        // `eval_const_expr_val` has no type context for a bare `'{...}`, so a
-        // `localparam cfg_t A [3] = '{'{4,2},..}` used to evaluate every
-        // element to 0. The scalar form (`localparam cfg_t C = '{..}`) already
-        // went through these two packers; the array element path did not.
-        for it in items {
-            let v =
-                pack_struct_const_value(data_type, it, params, &elab.typedefs, &elab.typedef_types)
-                    .or_else(|| {
-                        pack_packed_vector_pattern(data_type, it, params, &elab.typedef_types)
-                    })
-                    .map(|v| v.resize(elem_w))
-                    .unwrap_or_else(|| eval_init_for_width(it, params, elem_w));
-            vals.push(v);
-        }
-    } else {
-        return false;
-    }
-    // §6.20.2 / §10.7: each element is an assignment to the element type —
-    // it takes that type's signedness (`logic [3:0] A[2] = '{-1, 17}` is
-    // 15, 1, not -1), and a 2-state element holds no X/Z.
-    let signed = is_type_signed_resolved(data_type, &elab.typedef_types);
-    let two_state = is_type_two_state_resolved(data_type, &elab.typedef_types);
-    for v in vals.iter_mut().filter(|v| !v.is_real) {
-        v.is_signed = signed;
-        if two_state {
-            *v = v.to_two_state();
-        }
-    }
-    let full = cat2(&prefix, &name);
-    // Needed so `A[i]` is an ELEMENT select, not a bit-select of a scalar.
-    // Simulator::new seeds each element from the signal written just below.
-    elab.arrays.insert(full, (0, n as i64 - 1, elem_w));
-    for (i, v) in idxs.iter().zip(vals) {
-        let sn = format!("{}{}[{}]", prefix, name, i);
-        // Also into the parameter env under the ELEMENT name, so a CONSTANT
-        // context (`localparam A1 = A[1];`) can resolve the element — the
-        // const-eval Index arm consults `params` by "name[idx]".
-        params_insert_traced(&mut elab.parameters, line!(), sn.clone(), v.clone());
-        signals_insert_traced(
-            &mut elab.signals,
-            line!(),
-            sn.clone(),
-            Signal {
-                is_const: true,
-                name: sn,
-                width: elem_w,
-                is_signed: signed,
-                is_real: false,
-                direction: None,
-                value: v,
-                type_name: None,
-            },
-        );
-    }
-    true
+    array_params::register(
+        elab,
+        prefix,
+        name,
+        dims,
+        init,
+        override_val,
+        data_type,
+        params,
+        params,
+    )
 }
 
 /// `base.member` as a hierarchical IDENTIFIER when `base` is a whole-net
@@ -25234,17 +25213,35 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         // Falls back to a single-bit select for plain vectors.
         ExprKind::Index { expr: base, index } => {
             let base_val = eval_const_expr_val(base, params);
-            let idx = eval_const_expr_val(index, params).to_u64().unwrap_or(0);
+            let index_value = eval_const_expr_val(index, params);
+            let signed_index = index_value.to_i64();
+            let idx = index_value.to_u64().unwrap_or(0);
             // §26.3: a SCOPED base (`pkg::LIM[3]`, `inst.mod.A[2]`) —
             // `register_array_param` stores package array elements under
             // the qualified `pkg::LIM[i]` key. Try the qualified spellings
             // before the bare-leaf lookup below.
             {
                 let mut keys = Vec::new();
-                const_index_base_keys(base, &mut keys);
+                const_index_base_keys(base, Some(params), &mut keys);
                 for k in &keys {
-                    if let Some(ev) = params.get(&format!("{}[{}]", k, idx)) {
+                    if let Some(ev) =
+                        signed_index.and_then(|i| params.get(&format!("{}[{}]", k, i)))
+                    {
                         return ev.clone();
+                    }
+                    // §7.4.6: an invalid array index reads the element's
+                    // default; it must not select an unrelated bare name.
+                    if let Some(value) = array_params::default_value(k) {
+                        // A scalar homonym in another instance must keep
+                        // its packed-select semantics. Array overrides may
+                        // retain a packed aggregate alongside their elements.
+                        let prefix = format!("{k}[");
+                        if k.contains("::")
+                            || !params.contains_key(k)
+                            || params.keys().any(|name| name.starts_with(&prefix))
+                        {
+                            return value;
+                        }
                     }
                 }
             }
@@ -25252,7 +25249,10 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 let nm = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                 // §6.20.2: element of an unpacked-array parameter — stored in
                 // the env under "name[idx]" by register_array_param.
-                if let Some(ev) = params.get(&format!("{}[{}]", nm, idx)) {
+                if h.path.len() == 1
+                    && let Some(ev) =
+                        signed_index.and_then(|i| params.get(&format!("{}[{}]", nm, i)))
+                {
                     return ev.clone();
                 }
                 if let Some(elem_w) = PACKED_ELEM_W_TLS.with(|c| c.borrow().get(nm).copied()) {
@@ -27598,6 +27598,11 @@ fn inline_instantiations_inner(
                                     );
                                     let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
                                     for assign in assignments {
+                                        if register_visible_array_param(
+                                            elab, name, assign, data_type,
+                                        ) {
+                                            continue;
+                                        }
                                         let width = if is_implicit {
                                             assign
                                                 .init
@@ -33316,6 +33321,48 @@ fn inline_module_items(
                                     } = &pd.kind
                                     {
                                         for assign in assignments {
+                                            // §6.20.2: seed each typed element
+                                            // before folding dependent body constants.
+                                            if !assign.dimensions.is_empty() {
+                                                let override_expr =
+                                                    ovr_exprs.get(&assign.name.name);
+                                                let init = override_expr.or(assign.init.as_ref());
+                                                let init_params = if override_expr.is_some() {
+                                                    scoped_eval_params
+                                                } else {
+                                                    &*local_map
+                                                };
+                                                let packed = if override_expr.is_some_and(|e| {
+                                                    !matches!(
+                                                        e.kind,
+                                                        ExprKind::AssignmentPattern(_)
+                                                            | ExprKind::Concatenation(_)
+                                                    )
+                                                }) || (override_expr.is_none()
+                                                    && frozen.contains(&assign.name.name))
+                                                {
+                                                    local_map.get(&assign.name.name)
+                                                } else {
+                                                    None
+                                                };
+                                                if let Some(values) = array_params::elements(
+                                                    elab_ro,
+                                                    &assign.name.name,
+                                                    &assign.dimensions,
+                                                    init,
+                                                    packed,
+                                                    data_type,
+                                                    local_map,
+                                                    init_params,
+                                                ) {
+                                                    for (name, value) in values {
+                                                        changed |=
+                                                            local_map.get(&name) != Some(&value);
+                                                        local_map.insert(name, value);
+                                                    }
+                                                    continue;
+                                                }
+                                            }
                                             // A body localparam may have been
                                             // computed in an earlier round against
                                             // a STALE local-typedef width (its
@@ -34152,15 +34199,32 @@ fn inline_module_items(
                             continue;
                         }
                         let snapshot = sub_local_params.clone();
-                        register_array_param(
+                        let override_expr = ovr_exprs.get(&assign.name.name);
+                        let init = override_expr.or(assign.init.as_ref());
+                        let packed = if override_expr.is_some_and(|e| {
+                            !matches!(
+                                e.kind,
+                                ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
+                            )
+                        }) {
+                            snapshot.get(&assign.name.name)
+                        } else {
+                            None
+                        };
+                        array_params::register(
                             elab,
                             &inst_prefix,
                             &assign.name.name,
                             &assign.dimensions,
-                            assign.init.as_ref(),
-                            None,
+                            init,
+                            packed,
                             data_type,
                             &snapshot,
+                            if override_expr.is_some() {
+                                scoped_eval_params
+                            } else {
+                                &snapshot
+                            },
                         );
                     }
                 }
@@ -43925,6 +43989,18 @@ fn process_import(
                             {
                                 for assign in assignments {
                                     if &assign.name.name == sym_name {
+                                        if register_visible_array_param(
+                                            elab, pkg_name, assign, data_type,
+                                        ) {
+                                            elab.note_decl_site(
+                                                &assign.name.name,
+                                                assign.name.span,
+                                                &format!("imported from package '{}'", pkg_name),
+                                                false,
+                                            );
+                                            found = true;
+                                            continue;
+                                        }
                                         let mut width = resolve_type_width(
                                             data_type,
                                             Some(&elab.parameters),
@@ -44333,6 +44409,17 @@ fn process_import(
                                 let is_real = is_type_real(data_type);
                                 let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
                                 for assign in assignments {
+                                    if register_visible_array_param(
+                                        elab, pkg_name, assign, data_type,
+                                    ) {
+                                        elab.note_decl_site(
+                                            &assign.name.name,
+                                            assign.name.span,
+                                            &format!("imported from package '{}'", pkg_name),
+                                            false,
+                                        );
+                                        continue;
+                                    }
                                     let signed = pkg_param_is_signed(
                                         data_type,
                                         assign.init.as_ref(),

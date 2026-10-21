@@ -1586,6 +1586,9 @@ fn parse_and_elaborate(
     ),
     String,
 > {
+    // Array defaults are needed through the final bind/parameter passes,
+    // including elaboration of the compilation-unit and top scopes.
+    let _array_param_scope = elaborate::array_params::scope();
     // Effective per-module timescale, unifying `\`timescale` directives (from
     // the preprocessor) with in-body `timeunit`/`timeprecision` declarations
     // (§3.14.2). A `timeunit` decl was previously ignored here, so its module's
