@@ -13,6 +13,7 @@ use crate::hasher::HashSet;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+mod interface_arrays;
 mod module_class_scope;
 pub(crate) mod relaxed_static;
 
@@ -19686,31 +19687,50 @@ fn const_eval_user_call(
     eval_const_user_function(&fd, &argv, &shell.parameters, &shell, 0)
 }
 
+/// Full spelling of a hierarchical constant, including constant instance
+/// indices. Interface-array parameters must retain every selected instance.
+fn const_parameter_path(
+    expr: &Expression,
+    params: Option<&HashMap<String, Value>>,
+) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Ident(h) => {
+            let mut path = String::new();
+            for (i, segment) in h.path.iter().enumerate() {
+                if i > 0 {
+                    path.push('.');
+                }
+                path.push_str(&segment.name.name);
+                for select in &segment.selects {
+                    let index = const_eval_i64_with_params(select, params)?;
+                    path.push_str(&format!("[{index}]"));
+                }
+            }
+            Some(path)
+        }
+        ExprKind::MemberAccess { expr, member } => Some(format!(
+            "{}.{}",
+            const_parameter_path(expr, params)?,
+            member.name
+        )),
+        ExprKind::Index { expr, index } => Some(format!(
+            "{}[{}]",
+            const_parameter_path(expr, params)?,
+            const_eval_i64_with_params(index, params)?
+        )),
+        ExprKind::Paren(inner) => const_parameter_path(inner, params),
+        _ => None,
+    }
+}
+
 pub fn const_eval_i64_with_params(
     expr: &Expression,
     params: Option<&HashMap<String, Value>>,
 ) -> Option<i64> {
-    // §23.8: hierarchical constants retain their complete path. Looking up
-    // only the leaf can select an unrelated same-named parameter.
-    fn constant_path(e: &Expression) -> Option<String> {
-        match &e.kind {
-            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => Some(
-                h.path
-                    .iter()
-                    .map(|s| s.name.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join("."),
-            ),
-            ExprKind::MemberAccess { expr, member } => {
-                Some(format!("{}.{}", constant_path(expr)?, member.name))
-            }
-            _ => None,
-        }
-    }
     if matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() > 1)
         || matches!(&expr.kind, ExprKind::MemberAccess { .. })
     {
-        if let Some(value) = params.and_then(|p| p.get(&constant_path(expr)?)) {
+        if let Some(value) = params.and_then(|p| p.get(&const_parameter_path(expr, params)?)) {
             return value.to_i64();
         }
     }
@@ -19761,13 +19781,9 @@ pub fn const_eval_i64_with_params(
                 .then(|| format!("{}::{}", hier.path[hier.path.len() - 2].name.name, name));
             // §25.5: interface-port parameter (`c.DEPTH`) — seeded under its
             // dotted spelling at child inlining; try it before the bare name.
-            let dotted = (hier.path.len() >= 2).then(|| {
-                hier.path
-                    .iter()
-                    .map(|s| s.name.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(".")
-            });
+            let dotted = (hier.path.len() >= 2)
+                .then(|| const_parameter_path(expr, params))
+                .flatten();
             scoped
                 .as_deref()
                 .and_then(|k| params.and_then(|p| p.get(k)))
@@ -24347,13 +24363,9 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             // §25.5: a parameter reached through an interface PORT formal
             // (`c.DEPTH`) is seeded into the child's param map under its
             // dotted spelling — try that before the bare-name fallback.
-            let dotted = (hier.path.len() >= 2).then(|| {
-                hier.path
-                    .iter()
-                    .map(|s| s.name.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(".")
-            });
+            let dotted = (hier.path.len() >= 2)
+                .then(|| const_parameter_path(expr, Some(params)))
+                .flatten();
             scoped
                 .as_deref()
                 .and_then(|k| params.get(k).cloned())
@@ -25063,6 +25075,11 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         // packed layout. Enables black-parrot's
         // `localparam icache_sets_p = proc_param_lp.icache_sets`.
         ExprKind::MemberAccess { expr: base, member } => {
+            if let Some(value) =
+                const_parameter_path(expr, Some(params)).and_then(|path| params.get(&path))
+            {
+                return value.clone();
+            }
             // §8.23 / §8.25.1: a class-scoped constant (`cls::N`,
             // `pkg::cls::N`, `cls#(4)::N`).
             if let Some(v) = class_scoped_const(base, &member.name, params) {
@@ -30558,6 +30575,17 @@ fn iface_conn_path(
                 }
                 Some(out)
             }
+            ExprKind::RangeSelect {
+                expr: base,
+                kind: RangeKind::Constant,
+                left,
+                right,
+            } => {
+                let b = walk(base, params)?;
+                let l = const_eval_i64_with_params(left, Some(params))?;
+                let r = const_eval_i64_with_params(right, Some(params))?;
+                Some(format!("{}[{}:{}]", b, l, r))
+            }
             ExprKind::Index { expr: base, index } => {
                 let b = walk(base, params)?;
                 let idx = const_eval_i64_with_params(index, Some(params))?;
@@ -33848,6 +33876,11 @@ fn inline_module_items(
                 // every width resolution see them instead of a silent 0.
                 // (Requires the interface instance to appear before this
                 // child in source order — the overwhelmingly common layout.)
+                interface_arrays::register_views(
+                    &mut sub_interface_map,
+                    sub_mod.ports(),
+                    &sub_local_params,
+                );
                 for (formal, bound) in sub_interface_map.iter() {
                     let bound_prefix = format!("{}.", bound);
                     let seeds: Vec<(String, Value)> = elab
@@ -41191,6 +41224,21 @@ fn rewrite_expr_impl(
             }
             let name = &hier.path[0].name.name;
             if let Some(if_prefix) = interface_map.get(name) {
+                if let Some(view) = interface_arrays::view(interface_map, name) {
+                    let mut selected = hier.clone();
+                    for segment in &mut selected.path {
+                        for index in &mut segment.selects {
+                            *index = rewrite_expr_impl(
+                                index,
+                                prefix,
+                                port_map,
+                                local_names,
+                                interface_map,
+                            );
+                        }
+                    }
+                    return view.rewrite_hier(&selected, expr.span);
+                }
                 // §25.5.4: a modport EXPRESSION member (`.b(word[7:0])`)
                 // stands for an expression over the interface instance's
                 // signals — substitute it (registered by
@@ -41514,6 +41562,10 @@ fn rewrite_expr_impl(
                 .collect(),
         },
         ExprKind::Index { expr: base, index } => {
+            if let Some(view) = interface_arrays::bare_view(interface_map, base) {
+                let index = rewrite_expr_impl(index, prefix, port_map, local_names, interface_map);
+                return view.element(index, expr.span);
+            }
             MODPORT_SUBST_FLAG.with(|f| f.set(false));
             let nb = rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
             let from_modport = MODPORT_SUBST_FLAG.with(|f| f.replace(false));
@@ -41570,6 +41622,13 @@ fn rewrite_expr_impl(
             left,
             right,
         } => {
+            if *kind == RangeKind::Constant
+                && let Some(view) = interface_arrays::bare_view(interface_map, base)
+            {
+                let left = rewrite_expr_impl(left, prefix, port_map, local_names, interface_map);
+                let right = rewrite_expr_impl(right, prefix, port_map, local_names, interface_map);
+                return view.range(left, right, expr.span);
+            }
             let nb = rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
             let nl = rewrite_expr_impl(left, prefix, port_map, local_names, interface_map);
             let nr = rewrite_expr_impl(right, prefix, port_map, local_names, interface_map);
