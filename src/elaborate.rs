@@ -2394,6 +2394,28 @@ fn elaborate_class_in_scope(
                                 let en = format!("{}{}", decl.name.name, suffix);
                                 match &kind {
                                     CollDimKind::Assoc { string_key } => {
+                                        if let UnpackedDimension::Associative {
+                                            data_type, ..
+                                        } = &effective_dims[coll_split.unwrap()]
+                                        {
+                                            if let Some(kdt) = data_type.as_deref() {
+                                                if !string_key {
+                                                    let kw = typedefs_snapshot(|td| {
+                                                        resolve_type_width(kdt, class_params, td)
+                                                    });
+                                                    if kw > 0 {
+                                                        assoc_index_props.insert(
+                                                            en.clone(),
+                                                            (kw, is_type_signed(kdt)),
+                                                        );
+                                                    }
+                                                }
+                                                if let DataType::TypeReference { name, .. } = kdt {
+                                                    assoc_key_types
+                                                        .insert(en.clone(), name.name.name.clone());
+                                                }
+                                            }
+                                        }
                                         assoc_properties.insert(en, *string_key);
                                     }
                                     CollDimKind::Queue(cap) => {
@@ -9057,6 +9079,17 @@ pub fn elaborate_module_with_defs(
                                             .entry(name.clone())
                                             .or_insert_with(|| f.clone());
                                     }
+                                    let assoc_key_info = match qd {
+                                        UnpackedDimension::Associative { data_type, .. } => {
+                                            assoc_key_type_info(
+                                                data_type.as_deref(),
+                                                &elab.parameters,
+                                                &elab.typedefs,
+                                                &elab.typedef_types,
+                                            )
+                                        }
+                                        _ => (None, None),
+                                    };
                                     for suffix in index_tuples(&shape) {
                                         let en = format!("{}{}", name, suffix);
                                         if let Some(f) = &elem_fields {
@@ -9067,7 +9100,13 @@ pub fn elaborate_module_with_defs(
                                         if let Some(is_str) = assoc_key {
                                             // Associative elements are sparse: no
                                             // backing buffer, no `.size` shadow.
-                                            elab.associative_arrays.insert(en, is_str);
+                                            register_assoc_element_key_type(
+                                                &mut elab,
+                                                en,
+                                                is_str,
+                                                width,
+                                                &assoc_key_info,
+                                            );
                                             continue;
                                         }
                                         elab.dynamic_arrays.insert(en.clone());
@@ -16014,6 +16053,17 @@ fn elaborate_items_numbered(
                                             .entry(name.clone())
                                             .or_insert_with(|| f.clone());
                                     }
+                                    let assoc_key_info = match qd {
+                                        UnpackedDimension::Associative { data_type, .. } => {
+                                            assoc_key_type_info(
+                                                data_type.as_deref(),
+                                                &elab.parameters,
+                                                &elab.typedefs,
+                                                &elab.typedef_types,
+                                            )
+                                        }
+                                        _ => (None, None),
+                                    };
                                     for suffix in index_tuples(&shape) {
                                         let en = format!("{}{}", name, suffix);
                                         if let Some(f) = &elem_fields {
@@ -16024,7 +16074,13 @@ fn elaborate_items_numbered(
                                         if let Some(is_str) = assoc_key {
                                             // Associative elements are sparse: no
                                             // backing buffer, no `.size` shadow.
-                                            elab.associative_arrays.insert(en, is_str);
+                                            register_assoc_element_key_type(
+                                                elab,
+                                                en,
+                                                is_str,
+                                                width,
+                                                &assoc_key_info,
+                                            );
                                             continue;
                                         }
                                         elab.dynamic_arrays.insert(en.clone());
@@ -18742,6 +18798,28 @@ pub fn assoc_key_type_info(
         (kw > 0).then(|| (kw, is_type_signed_resolved(kdt, typedef_types))),
         tn,
     )
+}
+
+/// A fixed outer array's associative rows have the same declared key type
+/// as a standalone associative array (§7.8.4 / §12.7.3).
+fn register_assoc_element_key_type(
+    elab: &mut ElaboratedModule,
+    name: String,
+    string_key: bool,
+    width: u32,
+    key_info: &(Option<(u32, bool)>, Option<String>),
+) {
+    if let Some(index) = key_info.0 {
+        elab.assoc_index_widths.insert(name.clone(), index);
+    }
+    if let Some(key_type) = &key_info.1 {
+        elab.assoc_key_type_names
+            .insert(name.clone(), key_type.clone());
+    }
+    if width > 0 {
+        elab.assoc_elem_widths.insert(name.clone(), width);
+    }
+    elab.associative_arrays.insert(name, string_key);
 }
 
 /// Resolve the width of a data type.
@@ -35433,12 +35511,30 @@ fn inline_module_items(
                                                     })),
                                                     _ => None,
                                                 };
+                                                let assoc_key_info = match qd {
+                                                    UnpackedDimension::Associative {
+                                                        data_type,
+                                                        ..
+                                                    } => assoc_key_type_info(
+                                                        data_type.as_deref(),
+                                                        &sub_merged_params,
+                                                        &elab.typedefs,
+                                                        &elab.typedef_types,
+                                                    ),
+                                                    _ => (None, None),
+                                                };
                                                 for suffix in index_tuples(&shape) {
                                                     let en = format!("{}{}", sig_name, suffix);
                                                     if let Some(is_str) = assoc_key {
                                                         // Associative elements are sparse: no
                                                         // backing buffer, no `.size` shadow.
-                                                        elab.associative_arrays.insert(en, is_str);
+                                                        register_assoc_element_key_type(
+                                                            elab,
+                                                            en,
+                                                            is_str,
+                                                            width,
+                                                            &assoc_key_info,
+                                                        );
                                                         continue;
                                                     }
                                                     elab.dynamic_arrays.insert(en.clone());
