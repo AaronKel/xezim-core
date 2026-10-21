@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 mod interface_arrays;
+pub mod interface_ports;
 mod module_class_scope;
 pub(crate) mod relaxed_static;
 
@@ -3466,6 +3467,10 @@ pub struct ElaboratedModule {
     /// root.
     #[serde(default)]
     pub port_aliases: HashMap<String, String>,
+    /// §25.3 / §23.8: an interface port is a hierarchical alias of its
+    /// connected instance, including when reached from outside the module.
+    #[serde(default)]
+    pub interface_port_aliases: HashMap<String, String>,
     /// IEEE 1800-2023 §23.3.3: `(instance path, actual)` of every input port
     /// whose reads in the instance body were renamed to its actual. The port
     /// is a continuous assignment from the actual, so its time-0 value is an
@@ -3801,6 +3806,7 @@ impl ElaboratedModule {
             forward_typedef_names: HashSet::default(),
             events: HashSet::default(),
             port_aliases: HashMap::default(),
+            interface_port_aliases: HashMap::default(),
             input_port_actuals: Vec::new(),
             elided_port_hashes: Vec::new(),
             elided_port_count: 0,
@@ -33881,6 +33887,10 @@ fn inline_module_items(
                     sub_mod.ports(),
                     &sub_local_params,
                 );
+                for (formal, bound) in &sub_interface_map {
+                    elab.interface_port_aliases
+                        .insert(cat2(&inst_prefix, formal), bound.clone());
+                }
                 for (formal, bound) in sub_interface_map.iter() {
                     let bound_prefix = format!("{}.", bound);
                     let seeds: Vec<(String, Value)> = elab
