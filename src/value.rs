@@ -3114,7 +3114,9 @@ impl Value {
         }
         let amt = amount.to_u64().unwrap_or(0) as u32;
         if amount.has_xz() {
-            return Value::new(self.width);
+            let mut result = Value::new(self.width);
+            result.is_signed = true;
+            return result;
         }
         let sign = self.get_bit(self.width.saturating_sub(1) as usize);
         match &self.storage {
@@ -3133,7 +3135,19 @@ impl Value {
                             is_fill: false,
                         }
                     } else {
-                        Value::zero(self.width)
+                        // §11.4.10: an overshift replicates X/Z too and
+                        // retains the signed left operand's type.
+                        let mask = Self::mask(self.width);
+                        Value {
+                            storage: ValueStorage::Inline {
+                                val_bits: if sign == LogicBit::Z { mask } else { 0 },
+                                xz_bits: if sign.is_known() { 0 } else { mask },
+                            },
+                            width: self.width,
+                            is_signed: true,
+                            is_real: false,
+                            is_fill: false,
+                        }
                     };
                 }
                 let shifted_val = val_bits >> amt;
@@ -3145,6 +3159,20 @@ impl Value {
                         storage: ValueStorage::Inline {
                             val_bits: shifted_val | ext,
                             xz_bits: shifted_xz,
+                        },
+                        width: self.width,
+                        is_signed: true,
+                        is_real: false,
+                        is_fill: false,
+                    }
+                } else if !sign.is_known() && self.width > 0 {
+                    // §11.4.10: arithmetic filling copies the four-state
+                    // sign bit, rather than treating X/Z as known zero.
+                    let ext = Self::mask(self.width) & !Self::mask(self.width - amt);
+                    Value {
+                        storage: ValueStorage::Inline {
+                            val_bits: shifted_val | if sign == LogicBit::Z { ext } else { 0 },
+                            xz_bits: shifted_xz | ext,
                         },
                         width: self.width,
                         is_signed: true,
@@ -4629,6 +4657,58 @@ mod tests {
         assert_eq!(wide_result.get_bit(0), LogicBit::Zero);
         assert_eq!(wide_result.get_bit(1), LogicBit::One);
         assert!((2..67).all(|bit| wide_result.get_bit(bit) == LogicBit::One));
+    }
+
+    /// §11.4.10: both storage representations replicate all four sign states.
+    #[test]
+    fn arithmetic_shifts_match_four_state_sign_extension() {
+        use super::*;
+        for width in [1u32, 8, 31, 63, 64, 65, 127, 128, 129] {
+            for sign in [LogicBit::Zero, LogicBit::One, LogicBit::X, LogicBit::Z] {
+                for signed in [false, true] {
+                    let mut input = Value::zero(width);
+                    input.is_signed = signed;
+                    for i in 0..width as usize {
+                        input.set_bit(
+                            i,
+                            [LogicBit::Zero, LogicBit::One, LogicBit::X, LogicBit::Z][i % 4],
+                        );
+                    }
+                    input.set_bit((width - 1) as usize, sign);
+                    for amount in [0, 1, width - 1, width, width + 1, u32::MAX] {
+                        let result =
+                            input.arith_shift_right(&Value::from_u64(u64::from(amount), 32));
+                        assert_eq!(result.width, width);
+                        assert_eq!(
+                            result.is_signed, signed,
+                            "width={width} amount={amount} sign={sign}"
+                        );
+                        for i in 0..u64::from(width) {
+                            let source = i + u64::from(amount);
+                            let expected = if source < u64::from(width) {
+                                input.get_bit(source as usize)
+                            } else if signed {
+                                sign
+                            } else {
+                                LogicBit::Zero
+                            };
+                            assert_eq!(
+                                result.get_bit(i as usize),
+                                expected,
+                                "width={width} amount={amount} bit={i} sign={sign}"
+                            );
+                        }
+                    }
+                    for unknown in [LogicBit::X, LogicBit::Z] {
+                        let mut amount = Value::zero(8);
+                        amount.set_bit(0, unknown);
+                        let result = input.arith_shift_right(&amount);
+                        assert_eq!(result.is_signed, signed);
+                        assert!((0..width as usize).all(|i| result.get_bit(i) == LogicBit::X));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
