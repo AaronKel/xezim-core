@@ -2218,6 +2218,10 @@ fn elaborate_class_in_scope(
                                         l.max(r),
                                         width.max(1),
                                     ));
+                                    if l > r {
+                                        array_prop_decl_dims
+                                            .insert(decl.name.name.clone(), vec![(l, r)]);
+                                    }
                                 }
                             }
                             _ => {}
@@ -2726,11 +2730,19 @@ fn elaborate_class_in_scope(
                 // at construction (§8.25), and the class-scope read path
                 // materializes its own per-spec storage.
                 if !a.dimensions.is_empty() {
-                    if let Some((lo, hi)) =
-                        const_unpacked_bounds(&a.dimensions, unpacked_params)
-                    {
+                    if let Some((lo, hi)) = const_unpacked_bounds(&a.dimensions, class_params) {
                         let ew = resolve_type_width(data_type, Some(const_scope), None).max(1);
                         array_properties.insert(a.name.name.clone(), (lo, hi, ew));
+                        // §8.25: keep the declaration so both bounds and the
+                        // element type can be resolved for each specialization.
+                        property_types.insert(a.name.name.clone(), data_type.clone());
+                        param_sized_props.insert(a.name.name.clone(), a.dimensions.clone());
+                        if let Some((left, right)) =
+                            const_unpacked_decl_bounds(&a.dimensions, class_params)
+                            && left > right
+                        {
+                            array_prop_decl_dims.insert(a.name.name.clone(), vec![(left, right)]);
+                        }
                         if let Some(init) = &a.init {
                             property_inits.insert(a.name.name.clone(), init.clone());
                         }
@@ -2766,14 +2778,24 @@ fn elaborate_class_in_scope(
                     // (element read, `$size`, both `foreach` paths) already
                     // handles correctly.
                     if !a.dimensions.is_empty() {
-                        if let Some((lo, hi)) =
-                            const_unpacked_bounds(&a.dimensions, unpacked_params)
-                        {
+                        if let Some((lo, hi)) = const_unpacked_bounds(&a.dimensions, class_params) {
                             let ew = resolve_type_width(data_type, Some(const_scope), None).max(1);
                             array_properties.insert(a.name.name.clone(), (lo, hi, ew));
+                            // §8.25: keep the declaration so both bounds and the
+                            // element type can be resolved for each specialization.
+                            property_types.insert(a.name.name.clone(), data_type.clone());
+                            param_sized_props.insert(a.name.name.clone(), a.dimensions.clone());
+                            if let Some((left, right)) =
+                                const_unpacked_decl_bounds(&a.dimensions, class_params)
+                                && left > right
+                            {
+                                array_prop_decl_dims
+                                    .insert(a.name.name.clone(), vec![(left, right)]);
+                            }
                             if let Some(init) = &a.init {
                                 property_inits.insert(a.name.name.clone(), init.clone());
                             }
+
                             properties.insert(
                                 a.name.name.clone(),
                                 Signal {
@@ -19713,6 +19735,15 @@ fn const_unpacked_bounds(
     dims: &[UnpackedDimension],
     params: Option<&HashMap<String, Value>>,
 ) -> Option<(i64, i64)> {
+    let (left, right) = const_unpacked_decl_bounds(dims, params)?;
+    Some((left.min(right), left.max(right)))
+}
+
+/// §7.4.2 / §10.9.1: retain the left bound for positional array initializers.
+fn const_unpacked_decl_bounds(
+    dims: &[UnpackedDimension],
+    params: Option<&HashMap<String, Value>>,
+) -> Option<(i64, i64)> {
     match dims.first()? {
         UnpackedDimension::Expression { expr, .. } => {
             match const_eval_i64_with_params(expr, params) {
@@ -19723,7 +19754,7 @@ fn const_unpacked_bounds(
         UnpackedDimension::Range { left, right, .. } => {
             let l = const_eval_i64_with_params(left, params)?;
             let r = const_eval_i64_with_params(right, params)?;
-            Some((l.min(r), l.max(r)))
+            Some((l, r))
         }
         // `[N]` with a bare identifier is grammatically ambiguous: a TYPE name
         // makes it associative, a CONSTANT makes it a size. The parser cannot
