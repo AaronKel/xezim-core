@@ -1531,10 +1531,14 @@ fn warn_unapplied_param_overrides(hits: &[usize]) {
 /// parameters and genvars. Used to decide whether a compilation-unit (`$unit`)
 /// declaration is shadowed here (§3.12.1) — items nested in a generate region
 /// or a subroutine belong to an inner scope and are deliberately not counted.
-fn module_declared_names(m: &ast::module::ModuleDeclaration) -> std::collections::HashSet<String> {
+fn design_declared_names(
+    ports: &ast::module::PortList,
+    params: &[ast::decl::ParameterDeclaration],
+    items: &[ast::decl::ModuleItem],
+) -> std::collections::HashSet<String> {
     use ast::decl::{ModuleItem, ParameterKind};
     let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    match &m.ports {
+    match ports {
         ast::module::PortList::Ansi(ports) => {
             names.extend(ports.iter().map(|p| p.name.name.clone()));
         }
@@ -1543,12 +1547,12 @@ fn module_declared_names(m: &ast::module::ModuleDeclaration) -> std::collections
         }
         ast::module::PortList::Empty => {}
     }
-    for p in &m.params {
+    for p in params {
         if let ParameterKind::Data { assignments, .. } = &p.kind {
             names.extend(assignments.iter().map(|a| a.name.name.clone()));
         }
     }
-    for it in &m.items {
+    for it in items {
         match it {
             ModuleItem::PortDeclaration(pd) => {
                 names.extend(pd.declarators.iter().map(|d| d.name.name.clone()));
@@ -2190,12 +2194,28 @@ fn parse_and_elaborate(
         || !top_level_dpi_exports.is_empty()
     {
         for def in definitions.values_mut() {
-            if let SourceDefinition::Module(m) = def {
-                let m = Rc::make_mut(m);
+            // §3.12.1 / §13.4.3: programs and interfaces share compilation-
+            // unit declarations with modules, including constant functions.
+            if let Some((ports, params, items)) = match def {
+                SourceDefinition::Module(m) => {
+                    let m = Rc::make_mut(m);
+                    Some((&m.ports, &m.params, &mut m.items))
+                }
+                SourceDefinition::Program(p) => {
+                    let p = Rc::make_mut(p);
+                    Some((&p.ports, &p.params, &mut p.items))
+                }
+                SourceDefinition::Interface(i) => {
+                    let i = Rc::make_mut(i);
+                    Some((&i.ports, &i.params, &mut i.items))
+                }
+                _ => None,
+            } {
                 // What this module declares ITSELF, captured before anything is
                 // injected — a name in here shadows the $unit declaration of
                 // the same name (§3.12.1), see the variable injection below.
-                let local_decl_names: std::collections::HashSet<String> = module_declared_names(m);
+                let local_decl_names: std::collections::HashSet<String> =
+                    design_declared_names(ports, params, items);
                 // §3.12.1: a $unit subroutine's body resolves its free names
                 // in $UNIT scope. When this module SHADOWS a $unit variable,
                 // the shadowed copy is injected under the reserved
@@ -2260,19 +2280,17 @@ fn parse_and_elaborate(
                     if let Some(items) = subst_body(&f.items, &f.ports) {
                         f.items = items;
                     }
-                    m.items
-                        .insert(0, ast::decl::ModuleItem::FunctionDeclaration(f));
+                    items.insert(0, ast::decl::ModuleItem::FunctionDeclaration(f));
                 }
                 for t in top_level_tasks.iter().rev() {
                     let mut t = t.clone();
                     if let Some(items) = subst_body(&t.items, &t.ports) {
                         t.items = items;
                     }
-                    m.items.insert(0, ast::decl::ModuleItem::TaskDeclaration(t));
+                    items.insert(0, ast::decl::ModuleItem::TaskDeclaration(t));
                 }
                 for n in top_level_nettypes.iter().rev() {
-                    m.items
-                        .insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
+                    items.insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
                 }
                 for di in top_level_dpi_imports.iter().rev() {
                     // A module's own import of the same name shadows the
@@ -2281,7 +2299,7 @@ fn parse_and_elaborate(
                         ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
                         ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
                     };
-                    let own = m.items.iter().any(|it| {
+                    let own = items.iter().any(|it| {
                         matches!(it, ast::decl::ModuleItem::DPIImport(x)
                         if match &x.proto {
                             ast::decl::DPIProto::Function(fd) => fd.name.name.name == name,
@@ -2289,23 +2307,21 @@ fn parse_and_elaborate(
                         })
                     });
                     if !own {
-                        m.items
-                            .insert(0, ast::decl::ModuleItem::DPIImport(di.clone()));
+                        items.insert(0, ast::decl::ModuleItem::DPIImport(di.clone()));
                     }
                 }
                 for e in top_level_dpi_exports.iter() {
-                    m.items.push(ast::decl::ModuleItem::DPIExport(e.clone()));
+                    items.push(ast::decl::ModuleItem::DPIExport(e.clone()));
                 }
                 // A module's own covergroup of the same name shadows the
                 // $unit one.
                 for cg in top_level_covergroups.iter().rev() {
-                    let own = m.items.iter().any(|it| {
+                    let own = items.iter().any(|it| {
                         matches!(it, ast::decl::ModuleItem::CovergroupDeclaration(x)
                             if x.name.name == cg.name.name)
                     });
                     if !own {
-                        m.items
-                            .insert(0, ast::decl::ModuleItem::CovergroupDeclaration(cg.clone()));
+                        items.insert(0, ast::decl::ModuleItem::CovergroupDeclaration(cg.clone()));
                     }
                 }
                 // $unit-scope parameters become body localparams (constants):
@@ -2325,8 +2341,7 @@ fn parse_and_elaborate(
                             continue;
                         }
                     }
-                    m.items
-                        .insert(0, ast::decl::ModuleItem::LocalparamDeclaration(p));
+                    items.insert(0, ast::decl::ModuleItem::LocalparamDeclaration(p));
                 }
                 // $unit-scope variables (`string label = "X";`) become module
                 // signals so references — including from class methods
@@ -2346,8 +2361,7 @@ fn parse_and_elaborate(
                         .iter()
                         .any(|v| local_decl_names.contains(&v.name.name))
                     {
-                        m.items
-                            .insert(0, ast::decl::ModuleItem::DataDeclaration(d.clone()));
+                        items.insert(0, ast::decl::ModuleItem::DataDeclaration(d.clone()));
                         continue;
                     }
                     // `int a, b;` where only `b` is shadowed: split the
@@ -2363,14 +2377,12 @@ fn parse_and_elaborate(
                         for v in dd.declarators.iter_mut() {
                             v.name.name = sv_parser::unit_scope_name(&v.name.name);
                         }
-                        m.items
-                            .insert(0, ast::decl::ModuleItem::DataDeclaration(dd));
+                        items.insert(0, ast::decl::ModuleItem::DataDeclaration(dd));
                     }
                     if !plain.is_empty() {
                         let mut dd = d.clone();
                         dd.declarators = plain;
-                        m.items
-                            .insert(0, ast::decl::ModuleItem::DataDeclaration(dd));
+                        items.insert(0, ast::decl::ModuleItem::DataDeclaration(dd));
                     }
                 }
                 // §3.12.1: unit nets remain distinct from module-local
@@ -2394,8 +2406,7 @@ fn parse_and_elaborate(
                             }
                         }
                     }
-                    m.items
-                        .insert(0, ast::decl::ModuleItem::NetDeclaration(net));
+                    items.insert(0, ast::decl::ModuleItem::NetDeclaration(net));
                 }
             }
         }
