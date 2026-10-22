@@ -2357,7 +2357,7 @@ fn elaborate_class_in_scope(
                                             const_eval_i64_with_params(left, unpacked_params),
                                             const_eval_i64_with_params(right, unpacked_params),
                                         ) {
-                                            (Some(l), Some(r)) => Some((l.min(r), l.max(r))),
+                                            (Some(l), Some(r)) => Some((l, r)),
                                             _ => None,
                                         },
                                         UnpackedDimension::Expression { expr, .. } => {
@@ -2372,6 +2372,11 @@ fn elaborate_class_in_scope(
                                     .collect()
                             });
                         if let (Some(kind), Some(shape)) = (coll_elem_kind, outer_shape) {
+                            if shape.iter().any(|&(l, r)| l > r) {
+                                array_prop_decl_dims.insert(decl.name.name.clone(), shape.clone());
+                            }
+                            let shape: Vec<_> =
+                                shape.iter().map(|&(l, r)| (l.min(r), l.max(r))).collect();
                             // The OUTER shape still goes into the ordinary fixed-
                             // array maps: every existing consumer of a class
                             // property's shape ($size, foreach, %p, the randomizer)
@@ -9113,6 +9118,12 @@ pub fn elaborate_module_with_defs(
                                     sh.iter().all(|&(lo, hi)| hi >= lo && hi - lo < 4096)
                                 }) {
                                     let name = decl.name.name.clone();
+                                    if let Some(declared) =
+                                        declared_unpacked_dims(outer, &elab.parameters)
+                                    {
+                                        elab.unpacked_decl_dims
+                                            .insert(decl.name.name.clone(), declared);
+                                    }
                                     match shape.len() {
                                         1 => {
                                             elab.arrays.insert(
@@ -35735,6 +35746,13 @@ fn inline_module_items(
                                                 sh.iter()
                                                     .all(|&(lo, hi)| hi >= lo && hi - lo < 4096)
                                             }) {
+                                                if let Some(declared) = declared_unpacked_dims(
+                                                    outer,
+                                                    &sub_merged_params,
+                                                ) {
+                                                    elab.unpacked_decl_dims
+                                                        .insert(sig_name.clone(), declared);
+                                                }
                                                 match shape.len() {
                                                     1 => {
                                                         elab.arrays.insert(
