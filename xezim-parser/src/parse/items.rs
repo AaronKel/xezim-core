@@ -375,38 +375,95 @@ impl Parser {
         }
     }
 
-    /// §6.20.5: "parameter and localparam shall not be assigned a constant
-    /// expression that includes any specify parameters." Check this
-    /// `parameter`/`localparam` declaration's initializers against the
-    /// module specparams seen so far and report a diagnostic for any that
-    /// read one. (The reciprocal direction — a specparam referencing a
-    /// parameter/localparam — is LEGAL and is not checked here; the
-    /// `specparam` item arm never routes through this method.)
-    fn check_param_specparams(&mut self, decl: &ParameterDeclaration) {
-        if !crate::strict_checks() || self.specparams.is_empty() {
+    /// §6.20.5: check complete lexical scopes, including forward references.
+    /// A parser-global seen-name list leaks across modules and rejects legal
+    /// declarations after an unrelated module's specparam of the same name.
+    fn check_param_specparams(&mut self, params: &[ParameterDeclaration], items: &[ModuleItem]) {
+        if !crate::strict_checks() {
             return;
         }
-        if decl.specparam {
-            return;
-        }
-        let ParameterKind::Data { assignments, .. } = &decl.kind else {
-            return;
-        };
-        for a in assignments {
-            let Some(init) = &a.init else { continue };
-            let mut ids = Vec::new();
-            Self::expr_idents(init, &mut ids);
-            if let Some(sp) = ids
+        fn walk(
+            parser: &mut Parser,
+            params: &[ParameterDeclaration],
+            items: &[ModuleItem],
+            inherited: &[String],
+        ) {
+            let decls: Vec<_> = params
                 .iter()
-                .find(|n| self.specparams.iter().any(|s| s == *n))
-            {
-                self.error(format!(
-                    "parameter/localparam '{}' may not be initialized with the \
-                     specify parameter '{}' (IEEE 1800-2017 §6.20.5)",
-                    a.name.name, sp
-                ));
+                .chain(items.iter().filter_map(|item| match item {
+                    ModuleItem::ParameterDeclaration(pd)
+                    | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
+                    _ => None,
+                }))
+                .collect();
+            let mut local_names = Vec::new();
+            for pd in &decls {
+                match &pd.kind {
+                    ParameterKind::Data { assignments, .. } => {
+                        local_names.extend(assignments.iter().map(|a| a.name.name.clone()))
+                    }
+                    ParameterKind::Type { assignments } => {
+                        local_names.extend(assignments.iter().map(|a| a.name.name.clone()))
+                    }
+                }
+            }
+            for item in items {
+                if let ModuleItem::DataDeclaration(dd) = item {
+                    local_names.extend(dd.declarators.iter().map(|d| d.name.name.clone()));
+                }
+            }
+            let mut visible: Vec<String> = inherited
+                .iter()
+                .filter(|n| !local_names.contains(n))
+                .cloned()
+                .collect();
+            for pd in &decls {
+                if pd.specparam
+                    && let ParameterKind::Data { assignments, .. } = &pd.kind
+                {
+                    visible.extend(assignments.iter().map(|a| a.name.name.clone()));
+                }
+            }
+            if visible.is_empty() {
+                return;
+            }
+            for pd in decls {
+                if pd.specparam {
+                    continue;
+                }
+                let ParameterKind::Data { assignments, .. } = &pd.kind else {
+                    continue;
+                };
+                for a in assignments {
+                    let Some(init) = &a.init else { continue };
+                    let mut ids = Vec::new();
+                    Parser::expr_idents(init, &mut ids);
+                    if let Some(sp) = ids.iter().find(|n| visible.contains(n)) {
+                        parser.diagnostics.push(crate::diagnostics::Diagnostic::error(format!(
+                            "parameter/localparam '{}' may not be initialized with the specify parameter '{}' (IEEE 1800-2017 §6.20.5)",
+                            a.name.name, sp), init.span));
+                    }
+                }
+            }
+            for item in items {
+                match item {
+                    ModuleItem::GenerateRegion(g) => walk(parser, &[], &g.items, &visible),
+                    ModuleItem::GenerateFor(g) => walk(parser, &[], &g.items, &visible),
+                    ModuleItem::GenerateIf(g) => {
+                        for (_, items) in &g.branches {
+                            walk(parser, &[], items, &visible);
+                        }
+                    }
+                    ModuleItem::GenerateCase(g) => {
+                        for arm in &g.arms {
+                            walk(parser, &[], &arm.items, &visible);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
+        walk(self, params, items, &[]);
     }
 
     /// Does the statement read or write the bare name `name`?
@@ -699,6 +756,7 @@ impl Parser {
         let endlabel = self.parse_end_label_checked(&name.name);
         let loops = std::mem::replace(&mut self.plain_loop_vars, outer_loops);
         self.check_generate_loop_vars(&loops, &items);
+        self.check_param_specparams(&params, &items);
 
         ModuleDeclaration {
             attrs: Vec::new(),
@@ -1890,15 +1948,6 @@ impl Parser {
                     self.bump(); // ;
                     decl.local = true;
                     decl.specparam = true;
-                    // §6.20.5: record this specparam's names so a later
-                    // `parameter`/`localparam` initializer that reads one is
-                    // diagnosed. (A specparam MAY reference parameters or
-                    // other specparams.)
-                    if let ParameterKind::Data { assignments, .. } = &decl.kind {
-                        for a in assignments {
-                            self.specparams.push(a.name.name.clone());
-                        }
-                    }
                     Some(ModuleItem::LocalparamDeclaration(decl))
                 } else {
                     self.diagnostics.truncate(diag_len);
@@ -1938,12 +1987,10 @@ impl Parser {
             }
             TokenKind::KwParameter => {
                 let pd = self.parse_parameter_decl_stmt();
-                self.check_param_specparams(&pd);
                 Some(ModuleItem::ParameterDeclaration(pd))
             }
             TokenKind::KwLocalparam => {
                 let pd = self.parse_parameter_decl_stmt();
-                self.check_param_specparams(&pd);
                 Some(ModuleItem::LocalparamDeclaration(pd))
             }
             TokenKind::KwTypedef => Some(ModuleItem::TypedefDeclaration(

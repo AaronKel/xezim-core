@@ -169,7 +169,8 @@ pub use value::Value;
 /// \\x26 = \\x25 + compilation-unit net declarations in the serialized AST (§6.7).
 /// \\x27 = \\x26 + assertion clocking event lists (§16.5 / §9.4.2).
 /// \x28 = \x27 + hierarchical interface-port aliases (§25.3 / §23.8).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x28";
+/// \x29 = \x28 + retained specify-parameter declaration kind (§6.20.5).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x29";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
