@@ -2008,7 +2008,9 @@ fn elaborate_class_in_scope(
                 // recorded 32 bits wide however narrow its type.
                 let width =
                     typedefs_snapshot(|td| resolve_type_width(&p.data_type, class_params, td));
-                let is_signed = is_type_signed(&p.data_type);
+                // §6.20.3 / §6.18: a body type alias retains its signedness.
+                let is_signed = TYPEDEF_SHAPES_TLS
+                    .with(|types| is_type_signed_resolved(&p.data_type, &types.borrow().0));
                 let is_rand = p.qualifiers.contains(&ClassQualifier::Rand)
                     || p.qualifiers.contains(&ClassQualifier::Randc);
                 let is_randc = p.qualifiers.contains(&ClassQualifier::Randc);
@@ -4003,6 +4005,21 @@ impl<'a> Definition<'a> {
             | Definition::Typedef(_)
             | Definition::Udp(_) => &[],
         }
+    }
+
+    /// §6.20.3: body type parameters bind types like header parameters.
+    /// Body value parameters retain their separate fixpoint/override path.
+    fn params_and_body_types(&self) -> impl Iterator<Item = &ParameterDeclaration> {
+        self.params()
+            .iter()
+            .chain(self.items().iter().filter_map(|item| {
+                let (ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd)) =
+                    item
+                else {
+                    return None;
+                };
+                matches!(pd.kind, ParameterKind::Type { .. }).then_some(pd)
+            }))
     }
 
     pub fn ports(&self) -> &PortList {
@@ -7236,7 +7253,7 @@ pub fn elaborate_module_with_defs(
         }
     }
     // Process parameters
-    for param in module.params() {
+    for param in module.params_and_body_types() {
         if let ParameterKind::Data {
             data_type,
             assignments,
@@ -7526,6 +7543,7 @@ pub fn elaborate_module_with_defs(
                     );
                     elab.typedef_types.insert(a.name.name.clone(), dt.clone());
                     register_anonymous_enum_members(dt, &mut elab);
+                    sync_typedefs_tls(&elab.typedefs);
                 }
             }
         }
@@ -10517,6 +10535,7 @@ pub fn elaborate_module_with_defs(
                             );
                             elab.typedef_types.insert(a.name.name.clone(), dt.clone());
                             register_anonymous_enum_members(dt, &mut elab);
+                            sync_typedefs_tls(&elab.typedefs);
                         }
                     }
                 }
@@ -33042,7 +33061,7 @@ fn inline_module_items(
                                     let mut val = eval_const_expr_val(v, scoped_eval_params);
                                     let mut packed_pattern = false;
                                     // Check if target parameter is real or implicit real
-                                    for p_decl in sub_mod.params() {
+                                    for p_decl in sub_mod.params_and_body_types() {
                                         if let ParameterKind::Data {
                                             data_type,
                                             assignments,
@@ -33630,7 +33649,7 @@ fn inline_module_items(
                 // global tables only hold overridden type parameters (bound
                 // above) and the parent's own names.
                 let mut inst_types: HashMap<String, DataType> = HashMap::default();
-                for p_decl in sub_mod.params() {
+                for p_decl in sub_mod.params_and_body_types() {
                     if let ParameterKind::Type { assignments } = &p_decl.kind {
                         for a in assignments {
                             if let Some(def_dt) = &a.init {
@@ -34079,7 +34098,7 @@ fn inline_module_items(
                         Vec::new()
                     };
                     let mut local_tds = elab.typedefs.as_map().clone();
-                    for p_decl in sub_mod.params() {
+                    for p_decl in sub_mod.params_and_body_types() {
                         if let ParameterKind::Type { assignments } = &p_decl.kind {
                             for a in assignments {
                                 if ovr_type_names.contains(a.name.name.as_str()) {
@@ -34336,7 +34355,7 @@ fn inline_module_items(
                 // typedef entries are saved to the same list for restore.
                 let overridden_type_names: std::collections::HashSet<&str> =
                     type_overrides.iter().map(|(n, _)| n.as_str()).collect();
-                for p_decl in sub_mod.params() {
+                for p_decl in sub_mod.params_and_body_types() {
                     if let ParameterKind::Type { assignments } = &p_decl.kind {
                         for a in assignments {
                             if overridden_type_names.contains(a.name.name.as_str()) {
@@ -36621,7 +36640,7 @@ fn inline_module_items(
                 // Per-instance type-parameter bindings for statement
                 // substitution — see `RewriteCtx::type_binds`.
                 let mut pend_type_binds: HashMap<String, DataType> = HashMap::default();
-                for p_decl in sub_mod.params() {
+                for p_decl in sub_mod.params_and_body_types() {
                     if let ParameterKind::Type { assignments } = &p_decl.kind {
                         for a in assignments {
                             let dt = type_overrides

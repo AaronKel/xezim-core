@@ -71,6 +71,7 @@ pub(crate) fn elab_phase(label: &str, since: &mut std::time::Instant) {
 pub mod bits2;
 pub mod elaborate;
 pub mod packed_value;
+mod body_type_params;
 pub mod pkg_scope;
 pub mod sdf;
 pub mod stdout_sink;
@@ -1601,6 +1602,7 @@ fn parse_and_elaborate(
     // §26.3: a type name declared by two packages (or a package and $unit / a
     // module) gets its package-qualified spelling before anything keys the
     // flat per-design type tables by it (#300).
+    body_type_params::normalize(&mut all_descriptions);
     pkg_scope::qualify_colliding_package_types(&mut all_descriptions)?;
     pkg_scope::stamp_automatic_subroutines(&mut all_descriptions);
     let cli = module_timescale_cli();
