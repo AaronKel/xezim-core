@@ -5204,6 +5204,15 @@ pub fn register_scoped_typedef_alias(
     if let Some(w) = elab.typedefs.get(&td.name.name).copied() {
         typedefs_insert_traced(&mut elab.typedefs, "insert:scoped_alias", key.clone(), w);
     }
+    // §6.18 / §26.3: qualifying an alias must retain its collection
+    // dimensions and packed element width, as well as its element type.
+    // Nested member references may already use this qualified key.
+    if let Some(dims) = elab.typedef_unpacked_dims.get(&td.name.name).cloned() {
+        elab.typedef_unpacked_dims.insert(key.clone(), dims);
+    }
+    if let Some(width) = elab.typedef_elem_widths.get(&td.name.name).copied() {
+        elab.typedef_elem_widths.insert(key.clone(), width);
+    }
     if let Some(dt) = elab.typedef_types.get(&td.name.name).cloned() {
         let prefix = format!("{pkg}::");
         fn referenced(
@@ -5495,6 +5504,11 @@ fn check_enum_member_duplicates(
 }
 
 pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
+    // A later package may reuse a bare typedef name with scalar geometry.
+    // Do not carry an earlier declaration's packed element stride into it.
+    if !matches!(td.data_type, DataType::Void(_)) {
+        elab.typedef_elem_widths.remove(&td.name.name);
+    }
     // §6.18: a bare forward type declaration `typedef name;`. Record it for the
     // resolution check and register a placeholder, but never clobber a name that
     // a real (non-forward) typedef has already resolved — `typedef_test_0`
@@ -5696,6 +5710,8 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     } else if !td.dimensions.is_empty() {
         elab.typedef_unpacked_dims
             .insert(td.name.name.clone(), td.dimensions.clone());
+    } else if !matches!(td.data_type, DataType::Void(_)) {
+        elab.typedef_unpacked_dims.remove(&td.name.name);
     }
     // §20.6.2/§20.7: const-eval sizes `$bits(arr_t)` / `$dimensions(v)` from
     // the full definition, not just the element width.
@@ -44173,6 +44189,18 @@ fn rebind_imported_typedefs(
                 }
                 if let Some(t) = elab.typedef_types.get(&key).cloned() {
                     elab.typedef_types.insert(n.clone(), t);
+                    // §6.18 / §26.3: an import binds the whole type, including
+                    // its shape; a scalar import clears any displaced shape.
+                    if let Some(dims) = elab.typedef_unpacked_dims.get(&key).cloned() {
+                        elab.typedef_unpacked_dims.insert(n.clone(), dims);
+                    } else {
+                        elab.typedef_unpacked_dims.remove(&n);
+                    }
+                    if let Some(width) = elab.typedef_elem_widths.get(&key).copied() {
+                        elab.typedef_elem_widths.insert(n.clone(), width);
+                    } else {
+                        elab.typedef_elem_widths.remove(&n);
+                    }
                 }
             }
         }
