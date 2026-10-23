@@ -28477,6 +28477,30 @@ fn inline_instantiations_inner(
                                         elab.string_signals.insert(decl.name.name.clone());
                                     }
                                     let qualified = format!("{}::{}", name, decl.name.name);
+                                    // §26.3: retain this declaration's own type,
+                                    // even when another package owns the bare name.
+                                    let owned_type =
+                                        if let DataType::TypeReference { name: tn, .. } =
+                                            &dd.data_type
+                                            && !tn.has_scope()
+                                            && elab
+                                                .typedef_types
+                                                .contains_key(&format!("{name}::{}", tn.name.name))
+                                        {
+                                            scope_local_typerefs(
+                                                &dd.data_type,
+                                                &std::collections::HashSet::from([tn
+                                                    .name
+                                                    .name
+                                                    .clone()]),
+                                                &format!("{name}::"),
+                                            )
+                                        } else {
+                                            dd.data_type.clone()
+                                        };
+                                    elab.var_decl_types
+                                        .entry(qualified.clone())
+                                        .or_insert(owned_type);
                                     elab.pkg_var_decls.insert(
                                         qualified.clone(),
                                         Signal {
