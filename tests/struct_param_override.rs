@@ -57,3 +57,44 @@ fn overridden_struct_param_keeps_its_fields() {
     assert_eq!(design.parameters["u.u.WIDTH"].to_i64(), Some(32));
     assert_eq!(design.signals["u.u.result_o"].width, 32);
 }
+
+#[test]
+fn overridden_struct_fields_follow_instance_type_and_binding() {
+    let design = elaborate(
+        r#"
+package p;
+ typedef struct packed {int unsigned Width;logic Flag;} a_t;
+ typedef struct packed {logic[7:0] head;int unsigned Width;logic[2:0] Flag;} b_t;
+ parameter a_t A='{Width:32,Flag:1'b1};
+ parameter b_t B='{head:8'hff,Width:17,Flag:3'b101};
+endpackage
+module child #(parameter p::a_t Features=p::A,
+ localparam int WIDTH=Features.Width)(output logic[WIDTH-1:0] result_o);
+endmodule
+module typed_child #(parameter type T=p::a_t,parameter T Features='0,
+ localparam int WIDTH=Features.Width)(output logic[WIDTH-1:0] result_o);
+endmodule
+module parent;
+ localparam p::a_t F=p::A;
+ child#(.Features(F)) u();
+endmodule
+module t;
+ child#(.Features({32'd11,1'b1})) a();
+ child#(.Features({32'd29,1'b0})) b();
+ child c(); defparam c.Features={32'd19,1'b1};
+ typed_child#(.T(p::b_t),.Features(p::B)) d();
+ parent e();
+endmodule
+"#,
+    );
+    for (instance, width) in [("a", 11), ("b", 29), ("c", 19), ("d", 17), ("e.u", 32)] {
+        assert_eq!(
+            design.parameters[&format!("{instance}.WIDTH")].to_i64(),
+            Some(width)
+        );
+        assert_eq!(
+            design.signals[&format!("{instance}.result_o")].width,
+            width as u32
+        );
+    }
+}
