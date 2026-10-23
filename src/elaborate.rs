@@ -43163,21 +43163,66 @@ pub fn rename_process_shadowed_locals(
     let empty_locals: std::collections::HashSet<String> = std::collections::HashSet::new();
     let empty_iface: HashMap<String, String> = HashMap::default();
     let mut out = rewrite_stmt(stmt, "", &map, &empty_locals, &empty_iface);
-    // `rewrite_stmt` has no VarDecl arm: rename the declarators themselves and
-    // rewrite their initializers (a later decl's init may read an earlier
-    // renamed local).
-    if let StatementKind::SeqBlock { stmts, .. } = &mut out.kind {
-        for s in stmts.iter_mut() {
-            if let StatementKind::VarDecl { declarators, .. } = &mut s.kind {
-                for d in declarators.iter_mut() {
-                    if let Some(f) = renames.get(&d.name.name) {
-                        d.name.name = f.clone();
+    // §6.21 / §20.7: ranges read the renamed local too. A declaration's
+    // packed or unpacked dimensions must follow the same binding as its body,
+    // including a declaration in a nested block reading an outer local array.
+    fn declarations(
+        stmt: &mut Statement,
+        renames: &HashMap<String, String>,
+        map: &HashMap<String, Expression>,
+        own: bool,
+    ) {
+        let empty = std::collections::HashSet::new();
+        let interfaces = HashMap::default();
+        match &mut stmt.kind {
+            StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } => {
+                *data_type = rewrite_data_type_scoped(data_type, "", map, &empty, &interfaces);
+                for d in declarators {
+                    if own && let Some(fresh) = renames.get(&d.name.name) {
+                        d.name.name = fresh.clone();
                     }
-                    if let Some(init) = &d.init {
-                        d.init = Some(rewrite_expr(init, "", &map, &empty_locals, &empty_iface));
-                    }
+                    d.dimensions =
+                        rewrite_unpacked_dims_scoped(&d.dimensions, "", map, &empty, &interfaces);
                 }
             }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                for child in stmts {
+                    declarations(child, renames, map, false);
+                }
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                declarations(then_stmt, renames, map, false);
+                if let Some(child) = else_stmt {
+                    declarations(child, renames, map, false);
+                }
+            }
+            StatementKind::Case { items, .. } => {
+                for item in items {
+                    declarations(&mut item.stmt, renames, map, false);
+                }
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => declarations(body, renames, map, false),
+            _ => {}
+        }
+    }
+    if let StatementKind::SeqBlock { stmts, .. } = &mut out.kind {
+        for stmt in stmts {
+            declarations(stmt, &renames, &map, true);
         }
     }
     Some(out)
