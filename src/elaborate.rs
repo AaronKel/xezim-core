@@ -5062,6 +5062,23 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     // visibility stays owned by the import machinery
                     // (§26.2.2), exactly like the scalar alias below.
                     if !assign.dimensions.is_empty() {
+                        let scoped_type;
+                        let data_type = if let DataType::TypeReference { name, .. } = data_type
+                            && !name.has_scope()
+                            && elab
+                                .typedef_types
+                                .contains_key(&format!("{}::{}", p.name.name, name.name.name))
+                        {
+                            let own = std::collections::HashSet::from([name.name.name.clone()]);
+                            scoped_type = scope_local_typerefs(
+                                data_type,
+                                &own,
+                                &format!("{}::", p.name.name),
+                            );
+                            &scoped_type
+                        } else {
+                            data_type
+                        };
                         let params_snapshot = elab.parameters.clone();
                         let scoped_name = format!("{}::{}", p.name.name, assign.name.name);
                         if register_array_param(
@@ -5188,6 +5205,36 @@ pub fn register_scoped_typedef_alias(
         typedefs_insert_traced(&mut elab.typedefs, "insert:scoped_alias", key.clone(), w);
     }
     if let Some(dt) = elab.typedef_types.get(&td.name.name).cloned() {
+        let prefix = format!("{pkg}::");
+        fn referenced(
+            dt: &DataType,
+            prefix: &str,
+            known: &HashMap<String, DataType>,
+            out: &mut std::collections::HashSet<String>,
+        ) {
+            match dt {
+                DataType::TypeReference { name, .. }
+                    if !name.has_scope()
+                        && known.contains_key(&format!("{prefix}{}", name.name.name)) =>
+                {
+                    out.insert(name.name.name.clone());
+                }
+                DataType::Struct(s) => {
+                    for field in &s.members {
+                        referenced(&field.data_type, prefix, known, out);
+                    }
+                }
+                DataType::Enum(e) => {
+                    if let Some(base) = &e.base_type {
+                        referenced(base, prefix, known, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut own = std::collections::HashSet::new();
+        referenced(&dt, &prefix, &elab.typedef_types, &mut own);
+        let dt = scope_local_typerefs(&dt, &own, &prefix);
         elab.typedef_types.insert(key, dt);
     }
     // `process_typedef` refreshes the const-eval snapshot, but it runs BEFORE
@@ -7141,6 +7188,18 @@ pub fn elaborate_module_with_defs(
         for td in ordered_typedefs(defs) {
             check_enum_member_duplicates(td, &elab)?;
             process_typedef(td, &mut elab);
+        }
+        // §6.20.2: aggregate array values need their element typedef layout.
+        // Scalar sizing parameters still hoist first; only designs with typed
+        // package arrays need the second fixpoint after typedef registration.
+        if defs.values().any(|d| {
+            matches!(d, Definition::Package(p)
+            if p.items.iter().any(|i| matches!(i, PackageItem::Parameter(pd)
+                if matches!(&pd.kind, ParameterKind::Data { data_type, assignments }
+                    if matches!(data_type, DataType::TypeReference { .. } | DataType::Struct(_))
+                    && assignments.iter().any(|a| !a.dimensions.is_empty())))))
+        }) {
+            hoist_package_params(defs, &mut elab);
         }
         for def in defs.values() {
             match def {
@@ -20348,20 +20407,29 @@ pub fn const_eval_i64_with_params(
                     ExprKind::MemberAccess { expr: base, .. }
                         if matches!(base.kind, ExprKind::MemberAccess { .. }) =>
                     {
-                        member_access_chain_as_scopes(inner).and_then(|(scopes, leaf)| {
-                            let mut key = String::new();
-                            for l in &scopes {
-                                key.push_str(&l.name.name);
-                                key.push_str("::");
-                            }
-                            key.push_str(&leaf.name);
-                            TYPEDEFS_TLS.with(|td| {
-                                td.borrow()
-                                    .as_ref()
-                                    .and_then(|m| m.get(&key).copied())
-                                    .map(|w| w as i64)
+                        member_access_chain_as_scopes(inner)
+                            .and_then(|(scopes, leaf)| {
+                                let mut key = String::new();
+                                for l in &scopes {
+                                    key.push_str(&l.name.name);
+                                    key.push_str("::");
+                                }
+                                key.push_str(&leaf.name);
+                                TYPEDEFS_TLS.with(|td| {
+                                    td.borrow()
+                                        .as_ref()
+                                        .and_then(|m| m.get(&key).copied())
+                                        .map(|w| w as i64)
+                                })
                             })
-                        })
+                            .or_else(|| {
+                                if let ExprKind::MemberAccess { expr: base, member } = &inner.kind {
+                                    const_struct_field_in_base(base, &member.name)
+                                        .map(|(_, w)| w as i64)
+                                } else {
+                                    None
+                                }
+                            })
                     }
                     // §7.2.2: `a[i].field.subfield` — the base is not a bare ident.
                     ExprKind::MemberAccess { expr: base, member }
@@ -20825,6 +20893,16 @@ fn tls_register_struct_layout(name: &str, fields: &[(String, u32, u32)]) {
 /// Root parameter and dotted field path of a const select base.
 /// An index is the element (`OUTERS[0].rsp` keeps layout `OUTERS`, path `rsp`).
 fn const_struct_select_root(expr: &Expression) -> Option<(String, String)> {
+    // Package and instance prefixes are part of the array's registered key.
+    // Resolve that key before interpreting a suffix as a struct member.
+    let mut keys = Vec::new();
+    const_index_base_keys(expr, None, &mut keys);
+    if let Some(root) = STRUCT_FIELDS_TLS.with(|c| {
+        let map = c.borrow();
+        keys.into_iter().find(|key| map.contains_key(key))
+    }) {
+        return Some((root, String::new()));
+    }
     match &expr.kind {
         ExprKind::Paren(inner) => const_struct_select_root(inner),
         ExprKind::Index { expr, .. } => const_struct_select_root(expr),
@@ -20854,6 +20932,19 @@ fn const_struct_select_root(expr: &Expression) -> Option<(String, String)> {
 /// Nested paths are stored on the root (`rsp.accept`); the offset is relative
 /// to the prefix already sliced into the base value.
 fn const_struct_field_in_base(base: &Expression, member: &str) -> Option<(u32, u32)> {
+    if let ExprKind::Ident(h) = &base.kind
+        && h.path.len() == 1
+        && h.path[0].selects.is_empty()
+    {
+        return STRUCT_FIELDS_TLS.with(|c| {
+            c.borrow().get(&h.path[0].name.name).and_then(|fields| {
+                fields
+                    .iter()
+                    .find(|(name, _, _)| name == member)
+                    .map(|(_, offset, width)| (*offset, *width))
+            })
+        });
+    }
     let (root, prefix) = const_struct_select_root(base)?;
     let full = if prefix.is_empty() {
         member.to_string()
