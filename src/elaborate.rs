@@ -35100,7 +35100,7 @@ fn inline_module_items(
                                     ) {
                                         mark_array_z_init_if_4state(elab, &sig_name, dt);
                                     }
-                                    elab.var_decl_types.insert(sig_name, dt.clone());
+                                    elab.var_decl_types.insert(sig_name, scope_local_typerefs(&dt, &sub_typedef_names_all, &inst_prefix));
                                 }
                             }
                         }
@@ -35163,7 +35163,7 @@ fn inline_module_items(
                                                 .insert(sig_name.clone(), declared);
                                         }
                                         elab.var_decl_types
-                                            .insert(sig_name.clone(), pd.data_type.clone());
+                                            .insert(sig_name.clone(), scope_local_typerefs(&pd.data_type, &sub_typedef_names_all, &inst_prefix));
                                     }
                                     // §7.4.1: a non-ANSI PORT of a packed
                                     // multi-D / packed-struct type needs the
@@ -35609,7 +35609,7 @@ fn inline_module_items(
                                     );
                                     mark_array_z_init_if_4state(elab, &sig_name, &nd.data_type);
                                     elab.var_decl_types
-                                        .insert(sig_name.clone(), nd.data_type.clone());
+                                        .insert(sig_name.clone(), scope_local_typerefs(&nd.data_type, &sub_typedef_names_all, &inst_prefix));
                                     if let Some(UnpackedDimension::Range { left, right, .. }) =
                                         effective_dims.first()
                                     {
@@ -36137,7 +36137,7 @@ fn inline_module_items(
                                     }
                                     unregister_net_type(elab, &sig_name);
                                     elab.var_decl_types
-                                        .insert(sig_name.clone(), dd.data_type.clone());
+                                        .insert(sig_name.clone(), scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
                                     continue;
                                 }
                                 if sig_name.contains("ram0.mem")
@@ -36197,7 +36197,7 @@ fn inline_module_items(
                                         // (always x) instead of copying member
                                         // signals, so the queue filled with x.
                                         elab.var_decl_types
-                                            .insert(sig_name.clone(), dd.data_type.clone());
+                                            .insert(sig_name.clone(), scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
                                     }
                                     Some(UnpackedDimension::Associative {
                                         data_type: kdt, ..
@@ -36364,7 +36364,7 @@ fn inline_module_items(
                                                     elab.arrays.insert(en, (0, 63, width));
                                                 }
                                                 elab.var_decl_types
-                                                    .insert(sig_name.clone(), dd.data_type.clone());
+                                                    .insert(sig_name.clone(), scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
                                                 continue;
                                             }
                                         }
@@ -36414,7 +36414,7 @@ fn inline_module_items(
                                                 .insert(sig_name.clone(), declared);
                                         }
                                         elab.var_decl_types
-                                            .insert(sig_name.clone(), dd.data_type.clone());
+                                            .insert(sig_name.clone(), scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
                                         // §6.8: its initializer is deferred like every
                                         // other instance declaration's (one whole-pattern
                                         // assignment, rewritten into the instance scope).
@@ -36475,7 +36475,7 @@ fn inline_module_items(
                                     // struct through it).
                                     elab.var_decl_types
                                         .entry(sig_name.clone())
-                                        .or_insert_with(|| dd.data_type.clone());
+                                        .or_insert_with(|| scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
                                     // §7.2: an array of UNPACKED structs stores
                                     // each element member-wise, exactly as the
                                     // top-level path registers it. Without this
@@ -36608,7 +36608,7 @@ fn inline_module_items(
                                     if unpacked_struct_decl {
                                         register_unpacked_aggregate(elab, &sig_name, &dd.data_type);
                                         elab.var_decl_types
-                                            .insert(sig_name.clone(), dd.data_type.clone());
+                                            .insert(sig_name.clone(), scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
                                         continue;
                                     }
                                     // The declared type of a SCALAR child
@@ -36631,7 +36631,7 @@ fn inline_module_items(
                                     }
                                     elab.var_decl_types
                                         .entry(sig_name.clone())
-                                        .or_insert_with(|| dd.data_type.clone());
+                                        .or_insert_with(|| scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
                                     // §6.11.1: a 2-state scalar drops x/z on
                                     // every write, as at top level.
                                     if is_type_two_state_resolved(
