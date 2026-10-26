@@ -62,7 +62,16 @@ pub(super) fn elements(
     if outer.is_empty() {
         return None;
     }
-    let items = init.and_then(|e| pattern_items(e, &outer, dims.len() > 1, init_params));
+    // §10.9.1: a `default:` that is itself a pattern is a ROW of a nested
+    // array — unless the element is a struct, whose literal is a pattern of
+    // scalars (`'{default: '{7, 2'd1}}` over `p_t A[2][2]`) and fills every
+    // leaf. See `pattern_items`.
+    let struct_elem = matches!(
+        resolve_typedef_chain(data_type, &elab.typedef_types),
+        DataType::Struct(_)
+    );
+    let items =
+        init.and_then(|e| pattern_items(e, &outer, dims.len() > 1, struct_elem, init_params));
     let elem_w = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
     let row_count = dims[1..].iter().try_fold(1usize, |n, d| {
         n.checked_mul(const_dim_indices(std::slice::from_ref(d), params)?.len())
@@ -134,6 +143,7 @@ fn pattern_items(
     e: &Expression,
     outer: &[i64],
     nested: bool,
+    struct_elem: bool,
     params: &HashMap<String, Value>,
 ) -> Option<Vec<Expression>> {
     let items = match &e.kind {
@@ -185,13 +195,7 @@ fn pattern_items(
         .into_iter()
         .map(|slot| match (slot, default) {
             (Some(v), _) => Some(v.clone()),
-            (None, Some(d))
-                if nested
-                    && !matches!(
-                        d.kind,
-                        ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
-                    ) =>
-            {
+            (None, Some(d)) if nested && !default_is_row(d, struct_elem) => {
                 Some(Expression::new(
                     ExprKind::AssignmentPattern(vec![AssignmentPatternItem::Default(d.clone())]),
                     d.span,
@@ -307,5 +311,25 @@ fn register_shape(elab: &mut ElaboratedModule, name: &str, shape: &[(i64, i64)],
         for index in left.min(right)..=left.max(right) {
             register_shape(elab, &format!("{name}[{index}]"), &shape[1..], width);
         }
+    }
+}
+
+/// Is a nested array's `default:` value a row literal? A pattern or a
+/// concatenation is a row — except for a struct element, where a pattern
+/// whose items are scalars is the struct's own literal and reaches every
+/// leaf (§10.9.1); a row of struct literals has patterns as items.
+fn default_is_row(d: &Expression, struct_elem: bool) -> bool {
+    match &d.kind {
+        ExprKind::Concatenation(_) => true,
+        ExprKind::AssignmentPattern(items) => {
+            !struct_elem
+                || items.iter().any(|it| {
+                    matches!(
+                        it.expr().kind,
+                        ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
+                    )
+                })
+        }
+        _ => false,
     }
 }
