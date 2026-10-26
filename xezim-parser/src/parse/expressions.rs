@@ -552,8 +552,9 @@ impl Parser {
             // so the `'{` was left for the enclosing concatenation and the
             // parse died on `expected RBrace`. The type prefix is dropped;
             // member layout comes from the assignment context, same as the
-            // bare form.
-            if self.at(TokenKind::ApostropheLBrace) {
+            // bare form. Only a scoped NAME can be a type: `f(x)'{...}` or
+            // `a[0]'{...}` stays an error, as for scoped casts.
+            if self.at(TokenKind::ApostropheLBrace) && Self::scoped_name_expr(&lhs) {
                 self.bump();
                 let items = self.parse_assignment_pattern_items();
                 self.expect(TokenKind::RBrace);
