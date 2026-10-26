@@ -37040,6 +37040,36 @@ fn inline_module_items(
                     {
                         no_subst_ports.insert(pname.clone());
                     }
+                    // The mirror case: a `[N:0]` formal bound to a WHOLE net
+                    // whose own range is not `[N:0]` (`logic [0:7] a` to
+                    // `input [7:0] p`). Substituting renames `p[0]` to `a[0]`,
+                    // the actual's MSB, where §23.3.3 pairs the formal's bit
+                    // 0 with the actual's LSB `a[7]`. Keep the formal then too.
+                    if is_input
+                        && !elab.packed_full_dims.contains_key(&cat2(&inst_prefix, &pname))
+                        && whole_net_ident_name(actual)
+                            .is_some_and(|n| elab.packed_full_dims.contains_key(&n))
+                    {
+                        no_subst_ports.insert(pname.clone());
+                    }
+                    // §5.7.1/§23.3.3: a fill literal (`'0`, `'1`, `'x`, `'z`)
+                    // has no width of its own; it takes the FORMAL's width
+                    // through the connection assign. Substituting it hands
+                    // the body a one-bit literal, so `$bits(p)` read 1 and
+                    // `%b` printed one digit while selects still worked.
+                    let mut fill_actual: &Expression = actual;
+                    while let ExprKind::Paren(inner) = &fill_actual.kind {
+                        fill_actual = inner;
+                    }
+                    if is_input
+                        && formal != 0
+                        && matches!(
+                            &fill_actual.kind,
+                            ExprKind::Number(NumberLiteral::UnbasedUnsized(_))
+                        )
+                    {
+                        no_subst_ports.insert(pname.clone());
+                    }
                     // §7.2.1/§23.3.3: a PACKED-STRUCT formal read member-wise
                     // (`din.f0`) needs its own member layout. Substituting a
                     // FLAT actual (a plain vector net, a concat, a select)
