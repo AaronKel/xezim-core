@@ -1314,9 +1314,20 @@ struct ClassConstDecl {
     /// The base class (§8.13): its constants are visible through this
     /// class's scope too.
     extends: Option<String>,
+    /// §8.25: the arguments the `extends Base#(...)` clause passes to the
+    /// base, positional, evaluated in THIS class's parameter environment
+    /// (`extends Base#(Q + 1)` reads the derived `Q`).
+    extends_args: Vec<(Option<String>, Option<Expression>)>,
 }
 
 thread_local! {
+    /// §23.8: the chain of instances being inlined, outermost first —
+    /// `(instance prefix, definition name)`. An upward hierarchical name
+    /// whose first segment is the DEFINITION name of an enclosing instance
+    /// (`dut.gclk_a` written in a module bound into `dut`) resolves to that
+    /// instance (`resolve_upward_module_name`).
+    static INLINE_CHAIN_TLS: std::cell::RefCell<Vec<(String, String)>>
+        = const { std::cell::RefCell::new(Vec::new()) };
     /// Class constant declarations by class name (`register_class_consts`).
     static CLASS_CONST_DECLS_TLS: std::cell::RefCell<HashMap<String, Rc<ClassConstDecl>>>
         = std::cell::RefCell::new(HashMap::default());
@@ -1353,6 +1364,19 @@ fn class_const_decl(c: &ClassDeclaration) -> ClassConstDecl {
         header_order,
         values,
         extends: c.extends.as_ref().map(|e| e.name.name.clone()),
+        extends_args: c
+            .extends
+            .as_ref()
+            .map(|e| {
+                e.args
+                    .iter()
+                    .map(|a| match a {
+                        ParamValue::Expr(x) => (None, Some(x.clone())),
+                        ParamValue::Type(_) => (None, None),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -1552,10 +1576,33 @@ fn class_spec_const(
     member: &str,
     params: &HashMap<String, Value>,
 ) -> Option<Value> {
-    let decl = CLASS_CONST_DECLS_TLS.with(|m| m.borrow().get(cls).cloned())?;
-    if !decl.values.iter().any(|(n, _)| n == member) {
+    let mut consts = Vec::new();
+    class_spec_consts(cls, args, params, 0, &mut consts)?;
+    consts
+        .into_iter()
+        .rev()
+        .find(|(n, _)| n == member)
+        .map(|(_, v)| v)
+}
+
+/// §8.25 / §8.13: every constant of the specialization `cls#(args)`, the
+/// base chain's first (nearest ancestor last), each evaluated in its own
+/// class's environment. The derived class's header parameters are bound
+/// from `args`; the base's from the `extends Base#(...)` arguments, which
+/// read the derived environment (`extends A#(Q + 1)`). A body constant
+/// that names an inherited one (`LPB = Q + LPA`) sees the base's value for
+/// THIS specialization, not the base's default.
+fn class_spec_consts(
+    cls: &str,
+    args: &[(Option<String>, Option<Expression>)],
+    params: &HashMap<String, Value>,
+    depth: usize,
+    out: &mut Vec<(String, Value)>,
+) -> Option<()> {
+    if depth > 64 {
         return None;
     }
+    let decl = CLASS_CONST_DECLS_TLS.with(|m| m.borrow().get(cls).cloned())?;
     let mut overrides: HashMap<String, Value> = HashMap::default();
     for (i, (name, e)) in args.iter().enumerate() {
         let Some(e) = e else {
@@ -1570,19 +1617,43 @@ fn class_spec_const(
         };
         overrides.insert(pname, eval_const_expr_val(e, params));
     }
+    // Header parameters first: the base's arguments may read them.
     let mut env = params.clone();
-    for (n, init) in &decl.values {
+    let mut own: Vec<(String, Value)> = Vec::new();
+    let header_count = decl
+        .values
+        .iter()
+        .take_while(|(n, _)| decl.header_order.contains(n))
+        .count();
+    for (n, init) in &decl.values[..header_count] {
         let v = match (overrides.remove(n), init) {
             (Some(v), _) => v,
             (None, Some(init)) => eval_const_expr_val(init, &env),
             (None, None) => continue,
         };
-        if n == member {
-            return Some(v);
-        }
-        env.insert(n.clone(), v);
+        env.insert(n.clone(), v.clone());
+        own.push((n.clone(), v));
     }
-    None
+    if let Some(base) = &decl.extends {
+        let mut inherited = Vec::new();
+        if class_spec_consts(base, &decl.extends_args, &env, depth + 1, &mut inherited).is_some() {
+            for (n, v) in &inherited {
+                env.insert(n.clone(), v.clone());
+            }
+            out.extend(inherited);
+        }
+    }
+    for (n, init) in &decl.values[header_count..] {
+        let v = match (overrides.remove(n), init) {
+            (Some(v), _) => v,
+            (None, Some(init)) => eval_const_expr_val(init, &env),
+            (None, None) => continue,
+        };
+        env.insert(n.clone(), v.clone());
+        own.push((n.clone(), v));
+    }
+    out.extend(own);
+    Some(())
 }
 
 /// §8.23 / §8.25.1: the value of a class-scoped constant reference
@@ -32666,6 +32737,19 @@ fn inline_module_items(
     // imports at all, so an unqualified `T [1:0] s;` in a sub-module silently
     // took whichever package last hoisted that bare name.
     rebind_imported_typedefs(elab, source_def.items(), definitions);
+    INLINE_CHAIN_TLS.with(|c| {
+        c.borrow_mut()
+            .push((prefix.to_string(), source_def.name().to_string()))
+    });
+    struct ChainPop;
+    impl Drop for ChainPop {
+        fn drop(&mut self) {
+            INLINE_CHAIN_TLS.with(|c| {
+                c.borrow_mut().pop();
+            });
+        }
+    }
+    let _chain_pop = ChainPop;
     // §20.6.2/§20.7: this body's declarations answer `$bits` and the array
     // queries in its own constant expressions (generate conditions, widths,
     // the parameter overrides it passes to its children).
@@ -33087,6 +33171,13 @@ fn inline_module_items(
                                         parent_port_map,
                                         parent_local_names,
                                         interface_map,
+                                    );
+                                    resolve_upward_module_name(
+                                        &mut rewritten_e,
+                                        parent_local_names,
+                                        parent_port_map,
+                                        interface_map,
+                                        elab,
                                     );
                                     // Whole-net identity actuals keep the plain
                                     // substitution machinery (port_aliases &
@@ -42424,6 +42515,60 @@ pub fn rewrite_expr(
     interface_map: &HashMap<String, String>,
 ) -> Expression {
     rewrite_expr_impl(expr, prefix, port_map, local_names, interface_map)
+}
+
+/// §23.8 / §23.10.1: a port actual `dut.gclk_a` whose first segment names
+/// no local, port, interface or child instance of the current scope but IS
+/// the definition name of an enclosing instance (the harness is bound into
+/// `dut`, instantiated as `t.u_dut`) refers to that instance. The runtime
+/// resolves such a name in a statement by its upward search, but an
+/// actual is bound at elaboration, so rewrite it to the instance's path and
+/// root it; the simulator then resolves it absolutely. Instance names take
+/// precedence over definition names (§23.8), and the top module itself is
+/// left to the existing absolute-path handling.
+fn resolve_upward_module_name(
+    e: &mut Expression,
+    local_names: &std::collections::HashSet<String>,
+    port_map: &HashMap<String, Expression>,
+    interface_map: &HashMap<String, String>,
+    elab: &ElaboratedModule,
+) {
+    let ExprKind::Ident(h) = &mut e.kind else {
+        return;
+    };
+    if h.root.is_some() || h.path.len() < 2 || !h.path[0].selects.is_empty() {
+        return;
+    }
+    let head = h.path[0].name.name.clone();
+    if local_names.contains(&head)
+        || port_map.contains_key(&head)
+        || interface_map.contains_key(&head)
+        || elab.packages.contains(&head)
+    {
+        return;
+    }
+    let chain: Vec<(String, String)> = INLINE_CHAIN_TLS.with(|c| c.borrow().clone());
+    // The current scope's own child instances shadow definition names.
+    let current = chain.last().map(|(p, _)| p.clone()).unwrap_or_default();
+    let child = cat2(&current, &head);
+    if elab.instances.iter().any(|i| i.path == child) {
+        return;
+    }
+    let Some((inst_prefix, _)) = chain
+        .iter()
+        .rev()
+        .find(|(p, d)| !p.is_empty() && *d == head)
+    else {
+        return;
+    };
+    let segs: Vec<&str> = inst_prefix.trim_end_matches('.').split('.').collect();
+    let first = h.path.remove(0);
+    for (i, seg) in segs.iter().enumerate() {
+        let mut s = first.clone();
+        s.name.name = (*seg).to_string();
+        h.path.insert(i, s);
+    }
+    h.root = Some("$root".to_string());
 }
 
 /// Mark every identifier in an EXPRESSION port actual as parent-rooted
