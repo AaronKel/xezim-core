@@ -4917,6 +4917,105 @@ pub(crate) fn signals_insert_traced(
     map.insert(name, sig)
 }
 
+/// §10.9.2 / §26.3: re-evaluate STRUCT-typed package parameters once the
+/// package typedefs exist. `hoist_package_params` runs before any typedef is
+/// registered (typedefs may be sized by package parameters), so a struct
+/// parameter's type does not resolve there and its assignment pattern folds
+/// to 0. A module localparam built from it before the package is imported
+/// (`build_config(cva6_config_pkg::cva6_cfg)`) then read that 0. Only the
+/// `pkg::name` alias is updated, as in the hoist; bare visibility stays with
+/// the import machinery.
+fn hoist_package_struct_params(defs: &HashMap<String, Definition>, elab: &mut ElaboratedModule) {
+    let mut pkgs: Vec<&crate::ast::module::PackageDeclaration> = defs
+        .values()
+        .filter_map(|d| match d {
+            Definition::Package(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    pkgs.sort_by(|a, b| a.name.name.cmp(&b.name.name));
+    // Two passes: a struct parameter may be built from another package's.
+    for _pass in 0..2 {
+        for p in &pkgs {
+            let mut own_overlay = overlay_pkg_params(p, elab);
+            for item in &p.items {
+                let crate::ast::decl::PackageItem::Parameter(pd) = item else {
+                    continue;
+                };
+                let ParameterKind::Data {
+                    data_type,
+                    assignments,
+                } = &pd.kind
+                else {
+                    continue;
+                };
+                // A package-local type name binds THIS package's typedef,
+                // ahead of a same-named one elsewhere.
+                let local_dt = match data_type {
+                    DataType::TypeReference {
+                        name, dimensions, ..
+                    } if !name.has_scope() && dimensions.is_empty() => elab
+                        .typedef_types
+                        .get(&format!("{}::{}", p.name.name, name.name.name))
+                        .cloned(),
+                    _ => None,
+                };
+                let dt = local_dt.as_ref().unwrap_or(data_type);
+                if !matches!(resolve_typedef_chain(dt, &elab.typedef_types), DataType::Struct(_)) {
+                    continue;
+                }
+                let width = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs));
+                if width == 0 {
+                    continue;
+                }
+                for assign in assignments {
+                    let Some(init) = &assign.init else { continue };
+                    if !assign.dimensions.is_empty() {
+                        continue;
+                    }
+                    let subbed;
+                    let init: &Expression = if expr_has_call(init) {
+                        match substitute_const_fn_calls(init, &elab.parameters, elab, 0)
+                            .filter(|e| !expr_has_call(e))
+                        {
+                            Some(e) => {
+                                subbed = e;
+                                &subbed
+                            }
+                            None => continue,
+                        }
+                    } else {
+                        init
+                    };
+                    let v = match pack_struct_const_value(
+                        dt,
+                        init,
+                        &elab.parameters,
+                        &elab.typedefs,
+                        &elab.typedef_types,
+                    ) {
+                        Some(v) => v.resize(width),
+                        None => eval_init_for_width(init, &elab.parameters, width),
+                    };
+                    alias_pkg_param(elab, &p.name.name, &assign.name.name, &v);
+                    // Later parameters of this package see it bare.
+                    own_overlay.push((
+                        assign.name.name.clone(),
+                        elab.parameters.get(&assign.name.name).cloned(),
+                    ));
+                    params_insert_traced(
+                        &mut elab.parameters,
+                        line!(),
+                        assign.name.name.clone(),
+                        v,
+                    );
+                }
+            }
+            restore_overlay(elab, own_overlay);
+        }
+    }
+}
+
 fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut ElaboratedModule) {
     let mut pkgs: Vec<&crate::ast::module::PackageDeclaration> = defs
         .values()
@@ -5140,6 +5239,19 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     };
                     let mut v = if is_string_data_type(data_type) {
                         string_param_value(init, &elab.parameters)
+                    } else if let Some(sv) = pack_struct_const_value(
+                        data_type,
+                        init,
+                        &elab.parameters,
+                        &elab.typedefs,
+                        &elab.typedef_types,
+                    ) {
+                        // §10.9.2: a struct-typed package parameter with an
+                        // assignment pattern packs by member. The width-only
+                        // fold made it 0 until a later pass, so a module
+                        // localparam computed from it in between
+                        // (`build_config(cva6_config_pkg::cva6_cfg)`) read 0.
+                        sv.resize(width)
                     } else {
                         eval_init_for_width(init, &elab.parameters, width)
                     };
@@ -7345,6 +7457,13 @@ pub fn elaborate_module_with_defs(
         for td in ordered_typedefs(defs) {
             process_typedef(td, &mut elab);
         }
+        // Package parameters again, now that typedefs and enum members exist:
+        // the first hoist ran before either, so an enum-valued parameter
+        // (`localparam cache_type_t T = config_pkg::WT`) folded to 0 — and a
+        // struct parameter built from it (CVA6's `DCacheType`) picked the
+        // wrong generate branch. Then the struct parameters themselves.
+        hoist_package_params(defs, &mut elab);
+        hoist_package_struct_params(defs, &mut elab);
     }
 
     // Process top-level imports
@@ -38207,6 +38326,75 @@ fn const_function_actual(
     value
 }
 
+/// Packed-struct layouts bound into `STRUCT_FIELDS_TLS` for one constant
+/// function call (see `eval_const_user_function`). Dropping it restores each
+/// name's previous layout, so a caller's — or an outer recursion level's —
+/// same-named struct keeps its own.
+#[derive(Default)]
+struct ConstFnStructLayouts {
+    saved: Vec<(String, Option<Vec<(String, u32, u32)>>)>,
+}
+
+impl ConstFnStructLayouts {
+    fn bind(
+        &mut self,
+        name: &str,
+        dt: &DataType,
+        params: &HashMap<String, Value>,
+        elab: &ElaboratedModule,
+    ) {
+        let Some(fields) = flatten_struct_fields(dt, params, &elab.typedefs, &elab.typedef_types)
+        else {
+            return;
+        };
+        let prev = STRUCT_FIELDS_TLS.with(|c| c.borrow_mut().insert(name.to_string(), fields));
+        self.saved.push((name.to_string(), prev));
+    }
+}
+
+impl Drop for ConstFnStructLayouts {
+    fn drop(&mut self) {
+        STRUCT_FIELDS_TLS.with(|c| {
+            let mut c = c.borrow_mut();
+            for (name, prev) in self.saved.drain(..).rev() {
+                match prev {
+                    Some(fields) => c.insert(name, fields),
+                    None => c.remove(&name),
+                };
+            }
+        });
+    }
+}
+
+/// `s.a.b` as an assignment target — `MemberAccess` chains, or the dotted
+/// `Ident` path the parser also produces — split into the root variable and
+/// the dotted field path the struct layout table keys on. `None` for anything
+/// with a select along the way.
+fn const_fn_member_target(target: &Expression) -> Option<(String, String)> {
+    match &target.kind {
+        ExprKind::Ident(h)
+            if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+        {
+            let field = h.path[1..]
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            Some((h.path[0].name.name.clone(), field))
+        }
+        ExprKind::MemberAccess { expr, member } => match &expr.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                Some((h.path[0].name.name.clone(), member.name.clone()))
+            }
+            _ => {
+                let (root, field) = const_fn_member_target(expr)?;
+                Some((root, format!("{}.{}", field, member.name)))
+            }
+        },
+        _ => None,
+    }
+}
+
 fn eval_const_user_function(
     fd: &FunctionDeclaration,
     arg_vals: &[Value],
@@ -38234,6 +38422,41 @@ fn eval_const_user_function(
         }
         locals.insert(port.name.name.clone(), v);
     }
+    // §7.2 / §13.4.3: a packed-struct formal, local or return variable is read
+    // and written BY MEMBER inside the function (`cfg.XLEN = u.XLEN`). Member
+    // selects resolve through the bare-name layout table, so bind each one's
+    // layout for the call's duration; the guard restores the caller's on every
+    // exit. Without this the whole call bailed and a struct localparam built
+    // by a configuration function (CVA6's `build_config`) elaborated as 0.
+    let mut layouts = ConstFnStructLayouts::default();
+    for port in &fd.ports {
+        layouts.bind(&port.name.name, &port.data_type, &locals, elab);
+    }
+    layouts.bind(&fname, &fd.return_type, &locals, elab);
+    fn bind_decls(
+        stmts: &[Statement],
+        layouts: &mut ConstFnStructLayouts,
+        locals: &HashMap<String, Value>,
+        elab: &ElaboratedModule,
+    ) {
+        use crate::ast::stmt::StatementKind as SK;
+        for st in stmts {
+            match &st.kind {
+                SK::VarDecl {
+                    data_type,
+                    declarators,
+                    ..
+                } => {
+                    for d in declarators {
+                        layouts.bind(&d.name.name, data_type, locals, elab);
+                    }
+                }
+                SK::SeqBlock { stmts, .. } => bind_decls(stmts, layouts, locals, elab),
+                _ => {}
+            }
+        }
+    }
+    bind_decls(&fd.items, &mut layouts, &locals, elab);
     // The implicit return variable (typed per the declared return type).
     let return_type = resolve_typedef_chain(&fd.return_type, &elab.typedef_types);
     let return_width = resolve_type_width(return_type, Some(&locals), Some(&elab.typedefs));
@@ -38272,6 +38495,28 @@ fn eval_const_user_function(
                     locals.insert(name, value);
                 } else {
                     locals.insert(name, rhs);
+                }
+                Some(())
+            }
+            // §7.2.1: a whole-member write `s.f = v` / `s.a.b = v` lands on the
+            // member's bit range of the packed struct local.
+            ExprKind::MemberAccess { .. } | ExprKind::Ident(_) => {
+                let (name, field) = const_fn_member_target(target)?;
+                let (off, w) = STRUCT_FIELDS_TLS.with(|c| {
+                    c.borrow().get(&name).and_then(|layout| {
+                        layout
+                            .iter()
+                            .find(|(f, _, _)| *f == field)
+                            .map(|&(_, o, w)| (o, w))
+                    })
+                })?;
+                let value = locals.get_mut(&name)?;
+                if w == 0 || off + w > value.width {
+                    return None;
+                }
+                let rhs = rhs.resize(w);
+                for bit in 0..w {
+                    value.set_bit((off + bit) as usize, rhs.get_bit(bit as usize));
                 }
                 Some(())
             }
@@ -38716,6 +38961,20 @@ fn const_fn_expr_supported(e: &Expression) -> bool {
         // `TYPEDEFS_TLS`, and an unpopulated table silently yields width 1
         // rather than failing, which is exactly the quiet-wrong-answer this
         // list exists to prevent.
+        // A cast to a BUILT-IN integral keyword (`bit'(e)`, `int'(e)`) is the
+        // exception: its width needs no typedef table, so it cannot fall into
+        // the width-1 trap above.
+        ExprKind::SystemCall { name, args } if name == "$__xz_type_cast" && args.len() == 2 => {
+            let builtin = match &args[0].kind {
+                ExprKind::TypeLiteral(dt) => match dt.as_ref() {
+                    DataType::IntegerAtom { .. } => true,
+                    DataType::IntegerVector { dimensions, .. } => dimensions.is_empty(),
+                    _ => false,
+                },
+                _ => false,
+            };
+            builtin && const_fn_expr_supported(&args[1])
+        }
         ExprKind::SystemCall { name, args } => {
             matches!(name.as_str(), "$clog2" | "$bits" | "$signed" | "$unsigned")
                 && args.iter().all(const_fn_expr_supported)

@@ -986,6 +986,22 @@ impl Parser {
                 continue;
             }
 
+            // §10.9.2 TYPED assignment pattern with a SCOPED type
+            // (`pkg::cfg_t'{XLEN: 64, ...}`). The bare-name form is handled
+            // in the primary; the scoped name only exists here, as a member
+            // access chain. Same treatment: the prefix is dropped and the
+            // member layout comes from the assignment context.
+            if self.at(TokenKind::ApostropheLBrace)
+                && matches!(lhs.kind, ExprKind::MemberAccess { .. })
+                && Self::scoped_name_expr(&lhs)
+            {
+                self.bump();
+                let items = self.parse_assignment_pattern_items();
+                self.expect(TokenKind::RBrace);
+                lhs = Expression::new(ExprKind::AssignmentPattern(items), self.span_from(start));
+                continue;
+            }
+
             break;
         }
 
