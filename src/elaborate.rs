@@ -5316,6 +5316,22 @@ pub fn register_scoped_typedef_alias(
     if let Some(w) = elab.typedefs.get(&td.name.name).copied() {
         typedefs_insert_traced(&mut elab.typedefs, "insert:scoped_alias", key.clone(), w);
     }
+    // §26.3 / §6.19: the members of a package ENUM under `pkg::MEMBER` too.
+    // Members are hoisted under their bare name only (last package wins), so
+    // `f_pkg::ADD` in a constant context — a declaration initializer, a
+    // localparam, the inliner's spelling of a member two packages both
+    // declare — read `a_pkg::ADD`'s value. Members wider than 64 bits are
+    // parked by the inliner's package pass (`wide_enum_value_map`).
+    if matches!(td.data_type, DataType::Enum(_)) {
+        let w = elab.typedefs.get(&td.name.name).copied().unwrap_or(32).max(1);
+        if w <= 64 {
+            if let Some(members) = elab.enum_members.get(&td.name.name).cloned() {
+                for (m, v) in members {
+                    alias_pkg_param(elab, pkg, &m, &Value::from_u64(v, w));
+                }
+            }
+        }
+    }
     // §6.18 / §26.3: qualifying an alias must retain its collection
     // dimensions and packed element width, as well as its element type.
     // Nested member references may already use this qualified key.
