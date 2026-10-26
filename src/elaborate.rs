@@ -35545,24 +35545,52 @@ fn inline_module_items(
                                 // Packed multi-D net (`wire [1:0][15:0] a;`):
                                 // record the element width / full dimensions so
                                 // `a[i]` slices instead of bit-selecting.
+                                // §7.4.1: packed dims that live on the TYPEDEF
+                                // (`typedef k_lane [4:0] k_plane; wire k_plane a;`)
+                                // — one step of a BARE reference, as the inlined
+                                // variable arm does; a reference carrying its own
+                                // dims keeps them for the chained walk below. The
+                                // raw reference had no element stride, so `a` was
+                                // one flat vector and `assign a[1][0] = 1'b1`
+                                // wrote bit 0 (same hole issue #92 reports for
+                                // variables).
+                                let nd_resolved: DataType = match &nd.data_type {
+                                    DataType::TypeReference {
+                                        name, dimensions, ..
+                                    } if dimensions.is_empty() => {
+                                        lookup_scoped_type(name, &elab.typedef_types)
+                                            .cloned()
+                                            .unwrap_or_else(|| nd.data_type.clone())
+                                    }
+                                    _ => nd.data_type.clone(),
+                                };
                                 if let Some(elem_w) = packed_inner_elem_width(
                                     &nd.data_type,
                                     &sub_merged_params,
                                     &elab.typedefs,
-                                ) {
+                                )
+                                .or_else(|| {
+                                    packed_inner_elem_width(
+                                        &nd_resolved,
+                                        &sub_merged_params,
+                                        &elab.typedefs,
+                                    )
+                                }) {
                                     elab.packed_signal_elem_widths
                                         .insert(sig_name.clone(), elem_w);
                                 }
                                 if let Some(fdims) =
-                                    packed_full_dims_of(&nd.data_type, &sub_merged_params).or_else(
-                                        || {
+                                    packed_full_dims_of(&nd.data_type, &sub_merged_params)
+                                        .or_else(|| {
+                                            packed_full_dims_of(&nd_resolved, &sub_merged_params)
+                                        })
+                                        .or_else(|| {
                                             packed_full_dims_chained(
                                                 &nd.data_type,
                                                 &sub_merged_params,
                                                 &elab.typedef_types,
                                             )
-                                        },
-                                    )
+                                        })
                                 {
                                     elab.packed_full_dims.insert(sig_name.clone(), fdims);
                                 }
@@ -35971,13 +35999,20 @@ fn inline_module_items(
                             // typedef, same as the top-level DataDecl arm —
                             // `resolve_typedef_chain` would drop the
                             // intermediate `[4:0]`.
+                            // Only a BARE reference resolves one step: with dims
+                            // written on the reference itself (`pair_t [3:0] a;`)
+                            // the typedef's own type would drop that outer
+                            // `[3:0]` and `packed_full_dims_of` would record
+                            // the typedef's dims as the whole shape. Such a
+                            // declaration takes the chained walk below.
                             let dd_resolved: DataType = match &dd.data_type {
-                                DataType::TypeReference { name, .. } => lookup_scoped_type(
-                                    name,
-                                    &elab.typedef_types,
-                                )
-                                .cloned()
-                                .unwrap_or_else(|| dd.data_type.clone()),
+                                DataType::TypeReference {
+                                    name, dimensions, ..
+                                } if dimensions.is_empty() => {
+                                    lookup_scoped_type(name, &elab.typedef_types)
+                                        .cloned()
+                                        .unwrap_or_else(|| dd.data_type.clone())
+                                }
                                 _ => dd.data_type.clone(),
                             };
                             for decl in &dd.declarators {
