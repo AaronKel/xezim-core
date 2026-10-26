@@ -158,6 +158,28 @@ pub(crate) fn param_trace(site: &str, key: &str, detail: &str) {
 /// Insert into a parameter-value table, logging the written value and the
 /// value it replaced when the key is traced. Same result as
 /// `HashMap::insert`; the untraced path is the plain insert.
+/// Register each member of a packed-struct parameter under its dotted name
+/// (`Cfg.VLEN`), sliced out of the struct's packed value. Nested members
+/// come flattened (`A.B`), so the key is simply `<param>.<member path>`.
+fn register_struct_param_members(
+    map: &mut HashMap<String, Value>,
+    key: &str,
+    val: &Value,
+    fields: &[(String, u32, u32)],
+) {
+    for (member, off, w) in fields {
+        if *w == 0 || off + w > val.width {
+            continue;
+        }
+        params_insert_traced(
+            map,
+            line!(),
+            format!("{}.{}", key, member),
+            val.range_select((off + w - 1) as usize, *off as usize),
+        );
+    }
+}
+
 fn params_insert_traced(
     map: &mut HashMap<String, Value>,
     site: u32,
@@ -7783,6 +7805,20 @@ pub fn elaborate_module_with_defs(
 
                 if let Some(fields) = struct_fields {
                     tls_register_struct_layout(&assign.name.name, &fields);
+                    // §6.20.2 / §7.2.1: `P.member` of a packed-struct
+                    // parameter is itself a constant. Register each member
+                    // under its dotted name so a declared range such as
+                    // `logic [Cfg.VLEN-1:0]` on a function's return type or
+                    // formal (sized by name through the parameter table, not
+                    // by the struct-aware elaborator) resolves, and so a
+                    // function reading `Cfg.VLEN` is still a constant
+                    // function.
+                    register_struct_param_members(
+                        &mut elab.parameters,
+                        &assign.name.name,
+                        &val,
+                        &fields,
+                    );
                     elab.packed_struct_fields
                         .entry(assign.name.name.clone())
                         .or_insert(fields);
@@ -34751,7 +34787,7 @@ fn inline_module_items(
                         _ => None,
                     })
                     .collect();
-                let sub_merged_params: HashMap<String, Value> = if local_params.is_empty() {
+                let mut sub_merged_params: HashMap<String, Value> = if local_params.is_empty() {
                     sub_local_params.clone()
                 } else if sub_local_params.is_empty() {
                     local_params.clone()
@@ -34767,6 +34803,8 @@ fn inline_module_items(
                 // register the field layout under the SCOPED name so runtime
                 // member selects (`C.a` inside the instance → "c0.C" + field
                 // slice) resolve; without it they read x.
+                let mut struct_member_entries: Vec<(String, Value, Vec<(String, u32, u32)>)> =
+                    Vec::new();
                 for p_decl in
                     sub_mod
                         .params()
@@ -34796,12 +34834,36 @@ fn inline_module_items(
                             if !fields.is_empty() {
                                 for assign in assignments {
                                     let scoped = cat2(&inst_prefix, &assign.name.name);
+                                    // §6.20.2: each member is a constant of
+                                    // its own. Register it scoped for the
+                                    // simulator's table and bare for this
+                                    // instance's signature rewrite
+                                    // (`param_expr_map` below), so a
+                                    // function returning `logic
+                                    // [Cfg.VLEN-1:0]` is sized by the member
+                                    // and not left as `.VLEN` of a literal.
+                                    if let Some(val) = elab.parameters.get(&scoped).cloned() {
+                                        register_struct_param_members(
+                                            &mut elab.parameters,
+                                            &scoped,
+                                            &val,
+                                            &fields,
+                                        );
+                                        struct_member_entries.push((
+                                            assign.name.name.clone(),
+                                            val,
+                                            fields.clone(),
+                                        ));
+                                    }
                                     elab.packed_struct_fields.insert(scoped, fields.clone());
                                     tls_register_struct_layout(&assign.name.name, &fields);
                                 }
                             }
                         }
                     }
+                }
+                for (name, val, fields) in struct_member_entries {
+                    register_struct_param_members(&mut sub_merged_params, &name, &val, &fields);
                 }
 
                 // Bind NON-overridden `parameter type` DEFAULTS as scoped
@@ -42533,6 +42595,21 @@ fn rewrite_expr_impl(
                 new_hier.path[0].name.name = if_prefix.clone();
                 return Expression::new(ExprKind::Ident(new_hier), expr.span);
             }
+            // §6.20.2: `Cfg.VLEN` names a MEMBER of a packed-struct
+            // parameter, mapped under its dotted spelling. Substitute the
+            // member's constant whole; substituting the head alone left the
+            // struct's literal with a dangling `.VLEN`.
+            if hier.path.len() >= 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                let dotted = hier
+                    .path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if let Some(mapped) = port_map.get(dotted.as_str()) {
+                    return mapped.clone();
+                }
+            }
             if let Some(mapped) = port_map.get(name) {
                 // §25.5.4: `p.b` through a modport-typed port whose actual is
                 // an interface instance — a modport EXPRESSION member
@@ -42935,6 +43012,25 @@ fn rewrite_expr_impl(
             type_args_text: type_args_text.clone(),
         },
         ExprKind::MemberAccess { expr: base, member } => {
+            // §6.20.2: `Cfg.VLEN` as member access on a packed-struct
+            // parameter — the member is mapped under its dotted spelling
+            // (see the Ident arm); take it whole.
+            if let ExprKind::Ident(h) = &base.kind
+                && h.root.is_none()
+                && h.path.iter().all(|s| s.selects.is_empty())
+            {
+                let mut dotted = h
+                    .path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                dotted.push('.');
+                dotted.push_str(&member.name);
+                if let Some(mapped) = port_map.get(dotted.as_str()) {
+                    return mapped.clone();
+                }
+            }
             let rewritten_base =
                 rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
             // `flatten_pkg_member_refs`: only a package-headed `P::m` folds.
