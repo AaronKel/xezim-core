@@ -20720,6 +20720,14 @@ pub fn const_eval_i64_with_params(
                     arg
                 };
                 match &inner.kind {
+                    // §7.4.5/§20.6.2: an element or slice of a declared
+                    // variable (`pk[2]` of `logic [3:0][1:0] pk`) has the
+                    // width of the dimensions its index selects leave.
+                    ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+                        if decl_select_bits(inner, params).is_some() =>
+                    {
+                        decl_select_bits(inner, params)
+                    }
                     ExprKind::Ident(hier) => {
                         let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                         // First try parameter ident → its Value width.
@@ -20846,6 +20854,14 @@ pub fn const_eval_i64_with_params(
                     ExprKind::SystemCall { name: cn, .. } if is_cast_call(cn) => params
                         .and_then(|p| const_cast_bits(inner, p))
                         .map(i64::from),
+                    // §20.6.2/§11.6.1: an operator, conditional or call
+                    // operand has its self-determined width.
+                    ExprKind::Binary { .. }
+                    | ExprKind::Unary { .. }
+                    | ExprKind::Conditional { .. }
+                    | ExprKind::Call { .. } => params
+                        .and_then(|p| const_self_width(inner, p))
+                        .map(i64::from),
                     // §20.6.2 over an EXPRESSION operand: compute the
                     // self-determined width structurally. A port declared
                     // `[$bits({{A{1'b0}}, {(A*B){1'b0}}})-1:0]` elaborated to
@@ -20913,8 +20929,17 @@ pub fn const_eval_i64_with_params(
                                                     .map(|w| w as i64)
                                             })
                                         })
+                                        // A signal (`{sig, arr[1]}`): its
+                                        // declared width, as `$bits(sig)`.
+                                        .or_else(|| {
+                                            params
+                                                .and_then(|p| const_self_width(e, p))
+                                                .map(i64::from)
+                                        })
                                 }
-                                _ => None,
+                                // A cast, operator, conditional or call inside
+                                // the concatenation (`{q_t'(1), 2'b0}`).
+                                _ => params.and_then(|p| const_self_width(e, p)).map(i64::from),
                             }
                         }
                         expr_bits(inner, params)
@@ -21478,6 +21503,10 @@ fn prebind_bits_from_declared_types(
             // §20.6.2: the installed declared shapes know a type parameter's
             // instance binding and every unpacked dimension.
             let from_shape = decl_var_query("$bits", args, Some(params))
+                // §7.4.5: an element or slice of a declared variable has the
+                // width its selects leave (`pk[2]` of `logic [3:0][1:0]`);
+                // the declared-type walk below sized it as one bit.
+                .or_else(|| decl_select_bits(&args[0], Some(params)))
                 .and_then(|b| u32::try_from(b).ok())
                 .filter(|w| *w > 0);
             if let Some(w) = from_shape.or_else(|| {
@@ -21638,16 +21667,23 @@ fn prebind_bits_of_signals(
     let mut out = e.clone();
     if let ExprKind::SystemCall { name, args } = &e.kind {
         if name == "$bits" && args.len() == 1 {
-            if let Some(w) = bits_of_signal_expr(
-                &args[0],
-                signals,
-                params,
-                prefix,
-                typedefs,
-                typedef_types,
-                struct_fields,
-                arrays,
-            ) {
+            // §7.4.5: an element or slice of a declared variable (see
+            // `decl_select_bits`) before the signal table's element width.
+            let from_shape = decl_select_bits(&args[0], Some(params))
+                .and_then(|b| u32::try_from(b).ok())
+                .filter(|w| *w > 0);
+            if let Some(w) = from_shape.or_else(|| {
+                bits_of_signal_expr(
+                    &args[0],
+                    signals,
+                    params,
+                    prefix,
+                    typedefs,
+                    typedef_types,
+                    struct_fields,
+                    arrays,
+                )
+            }) {
                 out.kind = ExprKind::Number(NumberLiteral::Integer {
                     size: None,
                     signed: false,
@@ -22178,6 +22214,66 @@ fn decl_shape_query(
     Some((q, bits))
 }
 
+/// §7.4.5/§20.6.2: `$bits` of `v[i]…` (index selects only) on a declared
+/// variable `v` of the scope: its width over the dimensions, unpacked then
+/// packed, that the selects leave. None for any other operand, or when the
+/// selects reach past the declared dimensions.
+fn decl_select_bits(e: &Expression, params: Option<&HashMap<String, Value>>) -> Option<i64> {
+    // A final part-select (`pk[3:2]`, `pk[i +: 2]`) keeps that many elements
+    // of the next dimension.
+    let (mut cur, slice) = match &e.kind {
+        ExprKind::RangeSelect {
+            expr,
+            kind,
+            left,
+            right,
+        } => {
+            let n = match kind {
+                crate::ast::expr::RangeKind::Constant => {
+                    let l = const_eval_i64_with_params(left, params)?;
+                    let r = const_eval_i64_with_params(right, params)?;
+                    (l - r).abs() + 1
+                }
+                _ => const_eval_i64_with_params(right, params)?,
+            };
+            (expr.as_ref(), Some(n))
+        }
+        _ => (e, None),
+    };
+    let mut k = 0usize;
+    while let ExprKind::Index { expr, .. } = &cur.kind {
+        k += 1;
+        cur = expr;
+    }
+    let ExprKind::Ident(h) = &cur.kind else {
+        return None;
+    };
+    if (k == 0 && slice.is_none())
+        || h.path.len() != 1
+        || h.root.is_some()
+        || !h.path[0].selects.is_empty()
+    {
+        return None;
+    }
+    if !is_decl_shape_operand(cur) {
+        return None;
+    }
+    let (q, bits) = decl_shape_query(&h.path[0].name.name, params)?;
+    let bits = bits?;
+    let sliced = k + usize::from(slice.is_some());
+    if sliced > q.dims.len() {
+        return None;
+    }
+    let mut w = bits;
+    for &(l, r) in &q.dims[..sliced] {
+        w /= (l - r).abs() + 1;
+    }
+    if let Some(n) = slice {
+        w = w.checked_mul(n)?;
+    }
+    (w > 0).then_some(w)
+}
+
 /// §20.6.2 `$bits` and the §20.7 array queries over a declared variable of the
 /// scope being elaborated: `$bits(fx)`, `$size(fx2, 2)`, `$increment(pu)`.
 /// None when the operand is not such a variable (a parameter or a type keeps
@@ -22705,6 +22801,114 @@ fn const_cast_bits(e: &Expression, params: &HashMap<String, Value>) -> Option<u3
         _ => return None,
     };
     (w > 0).then_some(w)
+}
+
+/// §20.6.2/§11.6.1: the self-determined width of a compound `$bits` operand
+/// in a constant expression: `$bits(q_t'(1) + 1)`, `$bits({q_t'(1), 8'd2})`,
+/// `$bits(c ? a : b)`, `$bits(f(1))`. A leaf (an identifier, member or
+/// select) is answered by the `$bits` evaluator itself, a cast by its
+/// target. None when a width is not known here.
+fn const_self_width(e: &Expression, params: &HashMap<String, Value>) -> Option<u32> {
+    use crate::ast::expr::{BinaryOp as B, UnaryOp as U};
+    let leaf = |x: &Expression| -> Option<u32> {
+        let call = Expression::new(
+            ExprKind::SystemCall {
+                name: "$bits".to_string(),
+                args: vec![x.clone()],
+            },
+            x.span,
+        );
+        let w = const_eval_i64_with_params(&call, Some(params))
+            .filter(|&w| w > 0)
+            .or_else(|| eval_const_expr_val(&call, params).to_i64())?;
+        u32::try_from(w).ok().filter(|&w| w > 0)
+    };
+    match &e.kind {
+        ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => Some(*s),
+        ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
+        ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
+        ExprKind::Number(NumberLiteral::Real(_)) => Some(64),
+        ExprKind::StringLiteral(t) => Some(8 * t.len().max(1) as u32),
+        ExprKind::Paren(i) => const_self_width(i, params),
+        ExprKind::SystemCall { name, .. } if is_cast_call(name) => const_cast_bits(e, params),
+        // `$signed`/`$unsigned` keep the width (§11.7).
+        ExprKind::SystemCall { name, args }
+            if (name == "$signed" || name == "$unsigned") && args.len() == 1 =>
+        {
+            const_self_width(&args[0], params)
+        }
+        ExprKind::Concatenation(parts) => parts
+            .iter()
+            .try_fold(0u32, |t, x| t.checked_add(const_self_width(x, params)?)),
+        ExprKind::Replication { count, exprs } => {
+            let n = u32::try_from(const_eval_i64_with_params(count, Some(params))?).ok()?;
+            exprs
+                .iter()
+                .try_fold(0u32, |t, x| t.checked_add(const_self_width(x, params)?))?
+                .checked_mul(n)
+        }
+        ExprKind::Unary { op, operand } => match op {
+            U::LogNot | U::BitAnd | U::BitNand | U::BitOr | U::BitNor | U::BitXor | U::BitXnor => {
+                Some(1)
+            }
+            U::Plus | U::Minus | U::BitNot => const_self_width(operand, params),
+            _ => None,
+        },
+        ExprKind::Binary { op, left, right } => match op {
+            B::Eq
+            | B::Neq
+            | B::CaseEq
+            | B::CaseNeq
+            | B::WildcardEq
+            | B::WildcardNeq
+            | B::LogAnd
+            | B::LogOr
+            | B::LogImplies
+            | B::LogEquiv
+            | B::Lt
+            | B::Leq
+            | B::Gt
+            | B::Geq => Some(1),
+            B::ShiftLeft | B::ShiftRight | B::ArithShiftLeft | B::ArithShiftRight | B::Power => {
+                const_self_width(left, params)
+            }
+            B::Add
+            | B::Sub
+            | B::Mul
+            | B::Div
+            | B::Mod
+            | B::BitAnd
+            | B::BitOr
+            | B::BitXor
+            | B::BitXnor => {
+                Some(const_self_width(left, params)?.max(const_self_width(right, params)?))
+            }
+            _ => None,
+        },
+        ExprKind::Conditional {
+            then_expr,
+            else_expr,
+            ..
+        } => Some(const_self_width(then_expr, params)?.max(const_self_width(else_expr, params)?)),
+        // §13.4.1: a function call has the width of its declared return type.
+        ExprKind::Call { func, .. } => {
+            let ExprKind::Ident(h) = &func.kind else {
+                return None;
+            };
+            let name = h.path.last()?.name.name.as_str();
+            let rt = FUNCS_TLS.with(|f| {
+                let f = f.borrow();
+                f.as_ref()?.get(name).map(|fd| fd.return_type.clone())
+            })?;
+            let td = TYPEDEFS_TLS.with(|t| t.borrow().clone());
+            Some(resolve_type_width(&rt, Some(params), td.as_ref())).filter(|&w| w > 0)
+        }
+        ExprKind::Ident(_)
+        | ExprKind::MemberAccess { .. }
+        | ExprKind::Index { .. }
+        | ExprKind::RangeSelect { .. } => leaf(e),
+        _ => None,
+    }
 }
 
 /// The constant-evaluator lowerings of a cast (§6.24.1).
@@ -25232,6 +25436,13 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 arg
             };
             let w: u32 = match &inner.kind {
+                // §7.4.5/§20.6.2: an element or slice of a declared variable
+                // — see the matching arm in `const_eval_i64_with_params`.
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+                    if decl_select_bits(inner, Some(params)).is_some() =>
+                {
+                    decl_select_bits(inner, Some(params)).map_or(0, |b| b as u32)
+                }
                 ExprKind::Ident(hier) => {
                     let n = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                     // §26.3: prefer the qualified `P::T` key — the bare name is
@@ -25314,6 +25525,15 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 ExprKind::SystemCall { name: cn, .. } if is_cast_call(cn) => {
                     const_cast_bits(inner, params).unwrap_or(0)
                 }
+                // §20.6.2/§11.6.1: a concatenation, replication, operator,
+                // conditional or call operand has its self-determined width.
+                ExprKind::Concatenation(_)
+                | ExprKind::Replication { .. }
+                | ExprKind::Paren(_)
+                | ExprKind::Binary { .. }
+                | ExprKind::Unary { .. }
+                | ExprKind::Conditional { .. }
+                | ExprKind::Call { .. } => const_self_width(inner, params).unwrap_or(0),
                 // §20.6.2 `$bits(<data_type>)`. `logic [0:0][1:0][1:0]` parses
                 // to a TypeLiteral, which no arm evaluated, so the `_ => 0`
                 // default made the enclosing localparam 0 — and
