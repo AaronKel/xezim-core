@@ -30718,6 +30718,25 @@ fn unpacked_connection_elements(
             _ => None,
         }
     }
+    // §10.9.1 / §10.10: an assignment pattern or an unpacked-array
+    // concatenation written as the actual (`.h({pkg::t'{...}})`,
+    // `.h('{a, b})`) supplies its elements directly, left to right. Only a
+    // positional pattern: a keyed or `default:` pattern needs the formal's
+    // shape to place its items and keeps the element-wise fallback.
+    match &expr.kind {
+        ExprKind::Concatenation(items) if !items.is_empty() => {
+            return Some(items.clone());
+        }
+        ExprKind::AssignmentPattern(items)
+            if !items.is_empty()
+                && items
+                    .iter()
+                    .all(|it| matches!(it, AssignmentPatternItem::Ordered(_))) =>
+        {
+            return Some(items.iter().map(|it| it.expr().clone()).collect());
+        }
+        _ => {}
+    }
     let (name, sels) = split(expr)?;
     let mut dims = elab.unpacked_decl_dims.get(&name).cloned().or_else(|| {
         if let Some(&(lo, hi, _)) = elab.arrays.get(&name) {
@@ -31385,18 +31404,44 @@ fn collect_body_driven_names(
             }
             ModuleItem::ModuleInstantiation(mi) => {
                 let child = definitions.get(&mi.module_name.name);
+                // §23.2.2.1 (#572): a non-ANSI header lists names only; the
+                // directions are the body's port declarations. Reading them
+                // here keeps an input bound to such a child's input from
+                // counting as body-driven, which switched off every shape
+                // rule of its own port connection.
+                let by_name: Option<HashMap<String, PortDirection>> = child.map(|d| {
+                    let mut m: HashMap<String, PortDirection> = HashMap::default();
+                    match d.ports() {
+                        PortList::Ansi(ps) => {
+                            for p in ps {
+                                if let Some(dir) = p.direction {
+                                    m.insert(p.name.name.clone(), dir);
+                                }
+                            }
+                        }
+                        PortList::NonAnsi(_) => {
+                            for it in d.items() {
+                                if let ModuleItem::PortDeclaration(pd) = it {
+                                    for dc in &pd.declarators {
+                                        m.insert(dc.name.name.clone(), pd.direction);
+                                    }
+                                }
+                            }
+                        }
+                        PortList::Empty => {}
+                    }
+                    m
+                });
                 let dirs: Option<Vec<Option<PortDirection>>> = child.map(|d| match d.ports() {
                     PortList::Ansi(ps) => ps.iter().map(|p| p.direction).collect(),
-                    _ => Vec::new(),
+                    PortList::NonAnsi(names) => names
+                        .iter()
+                        .map(|n| by_name.as_ref().and_then(|m| m.get(&n.name).copied()))
+                        .collect(),
+                    PortList::Empty => Vec::new(),
                 });
                 let named_dir = |n: &str| -> Option<PortDirection> {
-                    match child?.ports() {
-                        PortList::Ansi(ps) => ps
-                            .iter()
-                            .find(|p| p.name.name == n)
-                            .and_then(|p| p.direction),
-                        _ => None,
-                    }
+                    by_name.as_ref().and_then(|m| m.get(n).copied())
                 };
                 for inst in &mi.instances {
                     for (i, conn) in inst.connections.iter().enumerate() {
