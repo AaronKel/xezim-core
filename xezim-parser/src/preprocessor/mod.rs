@@ -1848,10 +1848,8 @@ impl Preprocessor {
         while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
             k += 1;
         }
-        let mut j = k;
-        while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
-            j += 1;
-        }
+        // The list may follow on a later line (§22.5.1), as in the lookahead.
+        let mut j = Self::skip_space_and_comments(b, k);
         if b.get(j) == Some(&b'(') {
             let mut depth = 0usize;
             while j < b.len() {
