@@ -1950,18 +1950,20 @@ fn parse_and_elaborate(
                 definitions.insert(name, SourceDefinition::Program(Rc::new(p)));
             }
             ast::Description::Class(mut c) => {
+                // A compilation-unit class scales its method delays by the
+                // unit's `timescale, like a package's classes. Under
+                // `-override_timescale` the time-semantics pass converts them
+                // to tick counts already (§3.14.2); the delay-only pass must
+                // not scale them a second time (#571).
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_class_time_semantics(&mut c, u, p, tick_s);
-                }
-                // A compilation-unit class scales its method delays by the
-                // unit's `timescale, like a package's classes.
-                let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
-                    module_timescales
+                } else {
+                    let (unit_s, prec_s) = module_timescales
                         .get("$unit")
                         .copied()
-                        .unwrap_or((tick_s, tick_s))
-                });
-                elaborate::rewrite_class_delays_pub(&mut c, unit_s, prec_s, tick_s);
+                        .unwrap_or((tick_s, tick_s));
+                    elaborate::rewrite_class_delays_pub(&mut c, unit_s, prec_s, tick_s);
+                }
                 let name = c.name.name.clone();
                 let rc = Rc::new(c);
                 // Always keep the class in its own registry so a same-named
@@ -2026,7 +2028,11 @@ fn parse_and_elaborate(
                         }
                     }
                 }
-                elaborate::rewrite_package_delays_pub(&mut p.items, unit_s, prec_s, tick_s);
+                // Under `-override_timescale` the time-semantics pass above
+                // converted the package's delays already (#571).
+                if cu_scope_ts.is_none() {
+                    elaborate::rewrite_package_delays_pub(&mut p.items, unit_s, prec_s, tick_s);
+                }
                 definitions.insert(name, SourceDefinition::Package(Rc::new(p)));
             }
             ast::Description::TypedefDecl(t) => {
@@ -2088,34 +2094,34 @@ fn parse_and_elaborate(
                 top_level_lets.push(l);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Function(mut f)) => {
+                // A `$unit` subroutine's delays scale by the compilation
+                // unit's `timescale (recorded as "$unit"), like a module's;
+                // under `-override_timescale` the time-semantics pass is the
+                // one conversion (#571).
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_scope_time_semantics(&mut f.items, u, p, tick_s);
-                }
-                // A `$unit` subroutine's delays scale by the compilation
-                // unit's `timescale (recorded as "$unit"), like a module's.
-                let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
-                    module_timescales
+                } else {
+                    let (unit_s, prec_s) = module_timescales
                         .get("$unit")
                         .copied()
-                        .unwrap_or((tick_s, tick_s))
-                });
-                for st in f.items.iter_mut() {
-                    elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
+                        .unwrap_or((tick_s, tick_s));
+                    for st in f.items.iter_mut() {
+                        elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
+                    }
                 }
                 top_level_functions.push(f);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Task(mut t)) => {
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_scope_time_semantics(&mut t.items, u, p, tick_s);
-                }
-                let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
-                    module_timescales
+                } else {
+                    let (unit_s, prec_s) = module_timescales
                         .get("$unit")
                         .copied()
-                        .unwrap_or((tick_s, tick_s))
-                });
-                for st in t.items.iter_mut() {
-                    elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
+                        .unwrap_or((tick_s, tick_s));
+                    for st in t.items.iter_mut() {
+                        elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
+                    }
                 }
                 top_level_tasks.push(t);
             }
