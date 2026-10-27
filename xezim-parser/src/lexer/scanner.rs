@@ -773,16 +773,22 @@ impl<'a> Lexer<'a> {
         // §5.7.1 permits whitespace between the size and the base specifier
         // (`32 'h ff`), so probe past spaces/tabs before the apostrophe and
         // only commit if a real base specifier follows.
+        // §5.3: white space is spaces, tabs, newlines and form feeds, so a
+        // line break may separate the size from the base too (`{2\n'd1}`).
         let mut probe = self.pos;
-        while probe < self.input.len() && (self.input[probe] == b' ' || self.input[probe] == b'\t')
-        {
+        while probe < self.input.len() && is_literal_space(self.input[probe]) {
             probe += 1;
         }
         if probe < self.input.len() && self.input[probe] == b'\'' {
-            let next = self.input.get(probe + 1).copied().unwrap_or(0);
+            // `'b`, `'sb`: only a base letter (after an optional `s`) makes
+            // this a based literal; `N '(...)` and `N '{...}` are not.
+            let mut b = probe + 1;
+            if matches!(self.input.get(b), Some(b's' | b'S')) {
+                b += 1;
+            }
             if matches!(
-                next,
-                b's' | b'S' | b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H'
+                self.input.get(b).copied().unwrap_or(0),
+                b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H'
             ) {
                 self.pos = probe; // consume the inter-token whitespace
                 self.pos += 1; // skip '
@@ -798,9 +804,7 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 // IEEE 1800-2017 §5.7.1: whitespace allowed between base and value
-                while self.pos < self.input.len()
-                    && (self.input[self.pos] == b' ' || self.input[self.pos] == b'\t')
-                {
+                while self.pos < self.input.len() && is_literal_space(self.input[self.pos]) {
                     self.pos += 1;
                 }
                 while self.pos < self.input.len()
@@ -814,7 +818,7 @@ impl<'a> Lexer<'a> {
                 {
                     self.pos += 1;
                 }
-                let text = lossy_string(&self.input[start..self.pos]);
+                let text = literal_text(&self.input[start..self.pos]);
                 return Token::new(TokenKind::IntegerLiteral, text, Span::new(start, self.pos));
             }
         }
@@ -940,9 +944,7 @@ impl<'a> Lexer<'a> {
         }
         self.pos = p + 1; // consume optional sign + base specifier
         // IEEE 1800-2017 §5.7.1: whitespace allowed between base and value
-        while self.pos < self.input.len()
-            && (self.input[self.pos] == b' ' || self.input[self.pos] == b'\t')
-        {
+        while self.pos < self.input.len() && is_literal_space(self.input[self.pos]) {
             self.pos += 1;
         }
         while self.pos < self.input.len()
@@ -956,8 +958,29 @@ impl<'a> Lexer<'a> {
         {
             self.pos += 1;
         }
-        let text = lossy_string(&self.input[start..self.pos]);
+        let text = literal_text(&self.input[start..self.pos]);
         Token::new(TokenKind::IntegerLiteral, text, Span::new(start, self.pos))
+    }
+}
+
+/// §5.3: the white space that may separate the size, the base and the value
+/// of a based literal (§5.7.1): blanks, tabs, newlines and form feeds.
+fn is_literal_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
+}
+
+/// A based literal's text without the white space between its tokens, so
+/// `2 'd 1` reads as `2'd1`: the size was parsed from `"2 "` and lost.
+fn literal_text(bytes: &[u8]) -> String {
+    if bytes.iter().any(|&c| is_literal_space(c)) {
+        let kept: Vec<u8> = bytes
+            .iter()
+            .copied()
+            .filter(|&c| !is_literal_space(c))
+            .collect();
+        lossy_string(&kept)
+    } else {
+        lossy_string(bytes)
     }
 }
 
