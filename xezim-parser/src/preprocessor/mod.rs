@@ -138,6 +138,11 @@ impl OriginSink {
     }
 }
 
+/// The first position of `needle` in `hay`.
+fn find_byte_seq(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Offset of the first byte of `b` equal to one of `targets`, eight bytes at
 /// a time; `None` when there is none. The same answer as
 /// `b.iter().position(..)` with that predicate.
@@ -1594,7 +1599,14 @@ impl Preprocessor {
             // Split-text indices of the lines joined into `logical_line`.
             joined.clear();
             joined.push(li);
-            while logical_line.contains('`') && Self::has_unclosed_paren(&logical_line) {
+            // §22.5.1: the actual-argument list of a macro defined with
+            // formals may start on a later line than its name (white space
+            // and comments between them, §5.3), so a line ending in such a
+            // name is joined with the following ones like an open paren.
+            while logical_line.contains('`')
+                && (Self::has_unclosed_paren(&logical_line)
+                    || self.ends_with_parameterized_macro(&logical_line))
+            {
                 if let Some((lj, next)) = lines.next() {
                     logical_line.push('\n');
                     logical_line.push_str(next);
@@ -2384,10 +2396,13 @@ impl Preprocessor {
                     result.push_str(&self.current_line.to_string());
                 } else if let Some(def) = self.defines.get(macro_name) {
                     // eprintln!("[PP] expanding macro '{}'", macro_name);
-                    let mut p = i;
-                    while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
-                        p += 1;
-                    }
+                    // §22.5.1/§5.3: white space, newlines and comments may
+                    // separate the name from its actual-argument list.
+                    let p = if def.params.is_some() {
+                        Self::skip_space_and_comments(bytes, i)
+                    } else {
+                        i
+                    };
                     if def.params.is_some() && p < bytes.len() && bytes[p] == b'(' {
                         i = p;
                         // Parameterized macro: find arguments
@@ -2726,6 +2741,71 @@ impl Preprocessor {
         }
         result.push_str(&line[copied..]);
         result
+    }
+
+    /// The first byte at or after `i` that is not white space or part of a
+    /// comment (`// ...` to the end of its line, `/* ... */`).
+    fn skip_space_and_comments(bytes: &[u8], mut i: usize) -> usize {
+        loop {
+            while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c') {
+                i += 1;
+            }
+            if bytes[i..].starts_with(b"//") {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i..].starts_with(b"/*") {
+                match find_byte_seq(&bytes[i + 2..], b"*/") {
+                    Some(k) => {
+                        i += 2 + k + 2;
+                        continue;
+                    }
+                    None => return bytes.len(),
+                }
+            }
+            return i;
+        }
+    }
+
+    /// Whether `line` ends, outside a string, with the use of a macro defined
+    /// with formal arguments followed only by white space and comments: its
+    /// argument list must still come (§22.5.1).
+    fn ends_with_parameterized_macro(&self, line: &str) -> bool {
+        let bytes = line.as_bytes();
+        let mut in_string = false;
+        let mut last: Option<usize> = None;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if in_string => i += 1,
+                b'"' => in_string = !in_string,
+                b'/' if !in_string && bytes[i..].starts_with(b"//") => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'`' if !in_string => last = Some(i),
+                _ => {}
+            }
+            i += 1;
+        }
+        let Some(at) = last else {
+            return false;
+        };
+        let start = at + 1;
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end == start || Self::skip_space_and_comments(bytes, end) != bytes.len() {
+            return false;
+        }
+        self.defines
+            .get(&line[start..end])
+            .is_some_and(|d| d.params.is_some())
     }
 
     fn has_unclosed_paren(line: &str) -> bool {
