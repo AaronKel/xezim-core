@@ -170,7 +170,8 @@ pub use value::Value;
 /// \\x27 = \\x26 + assertion clocking event lists (§16.5 / §9.4.2).
 /// \x28 = \x27 + hierarchical interface-port aliases (§25.3 / §23.8).
 /// \x29 = \x28 + retained specify-parameter declaration kind (§6.20.5).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x29";
+/// \x2a = \x29 + constructor argument forwarding flags (IEEE 1800-2023 §8.17).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x2a";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -1769,6 +1770,9 @@ fn parse_and_elaborate(
             (elaborate::secs_to_exp(u), elaborate::secs_to_exp(p)),
         );
     }
+    // IEEE 1800-2023 §8.17: constructor argument forwarding, on the parsed
+    // declarations themselves, before the registries below share them.
+    elaborate::constructor_forwarding::forward(&mut all_descriptions);
     let mut definitions: crate::hasher::HashMap<String, SourceDefinition> =
         crate::hasher::HashMap::default();
     // §3.13/§23.2: a module and a CLASS may legally share a name — they live in

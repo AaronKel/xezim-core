@@ -4727,10 +4727,24 @@ impl Parser {
                 unscoped_bases.push(base_name.clone());
             }
             let args_at = self.pos;
+            let mut ext_default_args = false;
             let args = if self.at(TokenKind::Hash) {
                 self.parse_param_args()
             } else if self.at(TokenKind::LParen) {
-                self.parse_param_args()
+                // IEEE 1800-2023 §8.17: `extends Base(default)` forwards the
+                // subclass constructor's arguments to the superclass's.
+                if crate::is_sv2023()
+                    && self.peek_kind() == TokenKind::KwDefault
+                    && self.peek_kind_n(2) == TokenKind::RParen
+                {
+                    self.bump();
+                    self.bump();
+                    self.bump();
+                    ext_default_args = true;
+                    Vec::new()
+                } else {
+                    self.parse_param_args()
+                }
             }
             // Support extends C(args) or C#(args)
             else {
@@ -4763,6 +4777,7 @@ impl Parser {
                 args,
                 span: self.span_from(ext_start),
                 scopes: base_scopes,
+                default_args: ext_default_args,
             })
         } else {
             None

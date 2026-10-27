@@ -2423,8 +2423,15 @@ impl Parser {
             if self.at(TokenKind::Comma) {
                 // Empty argument: foo(a, , b)
                 args.push(Expression::new(ExprKind::Empty, self.span_from(start)));
-            } else if self.is_data_type_keyword()
-                && matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Comma)
+            } else if (self.is_data_type_keyword()
+                && matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Comma))
+                // IEEE 1800-2023 §8.17: `super.new(default)` forwards the
+                // enclosing constructor's arguments. Kept as an identifier
+                // spelled by the keyword (no user name can be `default`);
+                // the elaborator expands it to the formals.
+                || (crate::is_sv2023()
+                    && self.at(TokenKind::KwDefault)
+                    && self.peek_kind() == TokenKind::RParen)
             {
                 // §20.6.2: a bare built-in type keyword as a call argument, e.g.
                 // `$bits(integer)` / `$bits(byte)`. The expression grammar can't

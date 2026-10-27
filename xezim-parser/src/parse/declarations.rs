@@ -494,7 +494,12 @@ impl Parser {
         let return_type = self.parse_function_return_type(start);
         // Name can be 'new', a regular identifier, or class::method
         let name = self.parse_method_name();
-        let mut ports = self.parse_function_ports();
+        let default_args = self.eat_default_constructor_args(&name.name.name);
+        let mut ports = if default_args {
+            Vec::new()
+        } else {
+            self.parse_function_ports()
+        };
         let ansi_ports = ports.len();
         self.expect(TokenKind::Semicolon);
         let mut items = Vec::new();
@@ -543,8 +548,28 @@ impl Parser {
             items,
             endlabel,
             strict_body_ports,
+            default_args,
             span: self.span_from(start),
         }
+    }
+
+    /// IEEE 1800-2023 §8.17: `function new(default);` — consumes the
+    /// `(default)` argument list of a constructor and reports it, so the
+    /// constructor takes its superclass constructor's arguments. Leaves the
+    /// cursor untouched for any other port list (or in 2017 mode).
+    pub(super) fn eat_default_constructor_args(&mut self, method_name: &str) -> bool {
+        if method_name == "new"
+            && crate::is_sv2023()
+            && self.at(TokenKind::LParen)
+            && self.peek_kind() == TokenKind::KwDefault
+            && self.peek_kind_n(2) == TokenKind::RParen
+        {
+            self.bump();
+            self.bump();
+            self.bump();
+            return true;
+        }
+        false
     }
 
     /// Parse a NON-ANSI task/function body port declaration
@@ -874,7 +899,12 @@ impl Parser {
         let lifetime = self.parse_optional_lifetime();
         let return_type = self.parse_function_return_type(start);
         let name = self.parse_method_name();
-        let ports = self.parse_function_ports();
+        let default_args = self.eat_default_constructor_args(&name.name.name);
+        let ports = if default_args {
+            Vec::new()
+        } else {
+            self.parse_function_ports()
+        };
         self.expect(TokenKind::Semicolon);
         FunctionDeclaration {
             lifetime,
@@ -885,6 +915,7 @@ impl Parser {
             items: Vec::new(),
             endlabel: None,
             strict_body_ports: Vec::new(),
+            default_args,
             span: self.span_from(start),
         }
     }

@@ -17,6 +17,7 @@ pub(crate) mod array_params;
 mod interface_arrays;
 pub mod interface_ports;
 mod module_class_scope;
+pub(crate) mod constructor_forwarding;
 pub(crate) mod relaxed_static;
 
 struct ScopeGuardLite<F: FnMut()>(F);

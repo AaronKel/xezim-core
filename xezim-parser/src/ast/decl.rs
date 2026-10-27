@@ -1314,6 +1314,11 @@ pub struct FunctionDeclaration {
     /// Not consumed by elaboration — behavior-neutral.
     #[cfg_attr(feature = "serde", serde(default))]
     pub strict_body_ports: Vec<Identifier>,
+    /// IEEE 1800-2023 §8.17: `function new(default);` — the constructor
+    /// takes the argument list of its superclass constructor and forwards
+    /// it. The elaborator fills `ports` in from the base chain.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub default_args: bool,
     pub span: Span,
 }
 
@@ -1402,6 +1407,10 @@ pub struct ClassExtends {
     /// packages resolves to the one the prefix names (§26.3).
     #[cfg_attr(feature = "serde", serde(default))]
     pub scopes: Vec<Identifier>,
+    /// IEEE 1800-2023 §8.17: `extends Base(default)` — the subclass
+    /// constructor's arguments are forwarded to the superclass constructor.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub default_args: bool,
 }
 
 /// Items that can appear inside a class body.
