@@ -17,7 +17,7 @@ rand = "0.8"
 sv-parser = { path = "xezim-parser" }
 serde = { version = "1", features = ["derive", "rc"] }
 bincode = { version = "2", default-features = false, features = ["std", "serde"] }
-zstd = "0.13"
+zstd = "0.14"
 
 [features]
 # Fixed `Value` layout for native readers (see value.rs); off by default.
