@@ -4205,9 +4205,12 @@ impl Parser {
             // `#(2)` downstream (the UDP elaborator reads a scalar delay
             // out of `params`). Literals only: an identifier here would
             // be ambiguous against too many neighbors.
-            Some(vec![ParamConnection::Ordered(Some(
-                self.parse_param_value(),
-            ))])
+            // One delay value (A.2.2.3), as for a gate: a general expression
+            // went on into an unnamed instance's terminal list as a call on
+            // the literal (`my_mux #0 (z, a, b, s)` read `0 (z, a, b, s)`).
+            Some(vec![ParamConnection::Ordered(Some(ParamValue::Expr(
+                self.parse_delay_value(),
+            )))])
         } else {
             None
         }
@@ -4310,6 +4313,17 @@ impl Parser {
                 declarators: decls,
                 span: self.span_from(start),
             });
+        }
+        // §29.3: `udp_identifier [drive_strength] [delay2] udp_instance`.
+        // A `(` opening with a strength keyword is the drive strength; xezim
+        // does not model strengths (as for gates, §28.4), so it is consumed.
+        // Taken for the terminal list, it read `(strong0, weak1)` as ports.
+        if self.at(TokenKind::LParen) && self.peek_kind().is_strength_keyword() {
+            self.bump(); // (
+            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                self.bump();
+            }
+            self.expect(TokenKind::RParen);
         }
         let params = self.parse_instantiation_params();
 

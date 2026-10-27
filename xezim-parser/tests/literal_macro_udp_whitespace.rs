@@ -5,7 +5,7 @@
 //! unnamed instance (§29.3).
 
 use sv_parser::preprocessor::Preprocessor;
-use sv_parser::tokenize;
+use sv_parser::{parse, tokenize};
 
 fn literals(src: &str) -> Vec<String> {
     tokenize(src)
@@ -55,4 +55,18 @@ fn macro_arguments_on_a_later_line() {
         "{out}"
     );
     assert!(!out.contains("`ADD"), "{out}");
+}
+
+/// §29.3: `udp [drive_strength] [delay] [name] (terminals)`.
+#[test]
+fn unnamed_udp_instance_after_strength_or_delay() {
+    let src = "primitive p (z, a); output z; input a; table 0 : 0; 1 : 1; endtable endprimitive
+module t; reg a; wire z0, z1, z2, z3, z4;
+  p #0 (z0, a);
+  p #0 (z1, a), (z2, a);
+  p (strong0, weak1) (z3, a);
+  p (strong0, weak1) #1.5 (z4, a);
+endmodule";
+    let r = parse(src);
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
 }
