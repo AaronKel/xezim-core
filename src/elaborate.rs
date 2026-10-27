@@ -1236,6 +1236,13 @@ pub struct ElaboratedClass {
     /// each object's rows are registered when new[n] allocates them.
     #[serde(default)]
     pub dynamic_assoc_properties: HashMap<String, Vec<UnpackedDimension>>,
+    /// §7.4.5/§7.5: a dynamic or queue outer dimension whose elements are
+    /// themselves unpacked arrays (`T a[][N]`, `T a[][]`, `T a[$][N]`): the
+    /// tail dimensions after the outer one. The member's leaf width is in
+    /// `queue_properties`; the runtime shapes each object's storage from the
+    /// tail the way a module-scope declaration of the same shape is shaped.
+    #[serde(default)]
+    pub dynamic_tail_properties: HashMap<String, Vec<UnpackedDimension>>,
     /// §7.4.2 / §20.7: the DECLARED `(left, right)` bounds of every unpacked
     /// dimension of a fixed-size array member with at least one descending
     /// dimension (`int ds[3:1]`). `array_properties` / `array_nd_properties`
@@ -2071,6 +2078,7 @@ fn elaborate_class_in_scope(
     let mut array_of_coll_properties: HashMap<String, (Vec<(i64, i64)>, u32, CollDimKind)> =
         HashMap::default();
     let mut dynamic_assoc_properties: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
+    let mut dynamic_tail_properties: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut array_prop_decl_dims: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
     let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
@@ -2329,6 +2337,23 @@ fn elaborate_class_in_scope(
                                 .all(|d| matches!(d, UnpackedDimension::Associative { .. }))
                         {
                             dynamic_assoc_properties
+                                .insert(decl.name.name.clone(), effective_dims[1..].to_vec());
+                        }
+                        if matches!(
+                            effective_dims.first(),
+                            Some(UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. })
+                        ) && effective_dims.len() > 1
+                            && effective_dims[1..].iter().all(|d| {
+                                matches!(
+                                    d,
+                                    UnpackedDimension::Range { .. }
+                                        | UnpackedDimension::Expression { .. }
+                                        | UnpackedDimension::Unsized(_)
+                                        | UnpackedDimension::Queue { .. }
+                                )
+                            })
+                        {
+                            dynamic_tail_properties
                                 .insert(decl.name.name.clone(), effective_dims[1..].to_vec());
                         }
                         // §8.25: a fixed array sized by a header VALUE
@@ -3095,6 +3120,7 @@ fn elaborate_class_in_scope(
         array_nd_properties,
         array_of_coll_properties,
         dynamic_assoc_properties,
+        dynamic_tail_properties,
         array_prop_decl_dims,
     }
 }
@@ -46474,6 +46500,35 @@ mod logged_map_tests {
             if matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }))
         );
         assert_eq!(restored.dynamic_assoc_properties["deep"].len(), 2);
+    }
+
+    /// §7.4.5: a dynamic or queue outer dimension over unpacked rows keeps
+    /// its row dimensions across artifacts; an associative tail, a scalar
+    /// dynamic array and a fixed outer shape record none.
+    #[test]
+    fn dynamic_tail_property_metadata_roundtrips() {
+        let parsed = crate::parse(
+            "class holder; bit [7:0] raw[][2]; int d[][]; int q3[$][2][3]; int v[][string]; int plain[]; int fixed[2][3]; endclass",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Class(decl) = &parsed.source.descriptions[0] else {
+            panic!("class expected");
+        };
+        let cd = elaborate_class(decl);
+        assert_eq!(cd.dynamic_tail_properties.len(), 3);
+        assert_eq!(cd.dynamic_tail_properties["raw"].len(), 1);
+        assert!(matches!(
+            cd.dynamic_tail_properties["d"][..],
+            [UnpackedDimension::Unsized(_)]
+        ));
+        assert_eq!(cd.dynamic_tail_properties["q3"].len(), 2);
+        assert!(cd.queue_properties.contains_key("raw"));
+        assert!(!cd.dynamic_tail_properties.contains_key("v"));
+        let cfg = crate::xez_bincode_config();
+        let encoded = bincode::serde::encode_to_vec(&cd, cfg).unwrap();
+        let (restored, _): (ElaboratedClass, usize) =
+            bincode::serde::decode_from_slice(&encoded, cfg).unwrap();
+        assert_eq!(restored.dynamic_tail_properties["q3"].len(), 2);
     }
 
     fn tls_snapshot() -> Option<HashMap<String, u32>> {
