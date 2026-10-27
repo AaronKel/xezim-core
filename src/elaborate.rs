@@ -7410,6 +7410,8 @@ pub fn elaborate_module_with_defs(
     // $unit-scope definitions are installed after that, see `seed_ooc_bodies`.
 
     // Process top-level typedefs and other global definitions from all_defs
+    // Set below once the `$unit` typedefs are known; never another design's.
+    CONST_FN_UNIT_TYPES.with(|c| *c.borrow_mut() = None);
     if let Some(defs) = all_defs {
         // §6.18: typedefs must be processed in DEPENDENCY order. A struct
         // typedef's width is resolved from the width map built by the
@@ -7601,6 +7603,14 @@ pub fn elaborate_module_with_defs(
         for td in ordered_typedefs(defs) {
             process_typedef(td, &mut elab);
         }
+        let unit_types: HashMap<String, DataType> = ordered_typedefs(defs)
+            .into_iter()
+            .filter_map(|td| {
+                let dt = elab.typedef_types.get(&td.name.name)?;
+                Some((td.name.name.clone(), dt.clone()))
+            })
+            .collect();
+        CONST_FN_UNIT_TYPES.with(|c| *c.borrow_mut() = Some(unit_types));
         // Package parameters again, now that typedefs and enum members exist:
         // the first hoist ran before either, so an enum-valued parameter
         // (`localparam cache_type_t T = config_pkg::WT`) folded to 0 — and a
@@ -7947,6 +7957,10 @@ pub fn elaborate_module_with_defs(
                         w,
                     );
                     elab.typedef_types.insert(a.name.name.clone(), dt.clone());
+                    // §6.24.1: a cast to the type parameter in a constant
+                    // expression (`T'(45)`) reads its declared type from the
+                    // shape table, like a typedef.
+                    tls_register_typedef_shape(&a.name.name, dt, &[]);
                     register_anonymous_enum_members(dt, &mut elab);
                     sync_typedefs_tls(&elab.typedefs);
                 }
@@ -10945,6 +10959,10 @@ pub fn elaborate_module_with_defs(
                                 w,
                             );
                             elab.typedef_types.insert(a.name.name.clone(), dt.clone());
+                            // §6.24.1: a cast to the type parameter in a constant
+                            // expression (`T'(45)`) reads its declared type from the
+                            // shape table, like a typedef.
+                            tls_register_typedef_shape(&a.name.name, dt, &[]);
                             register_anonymous_enum_members(dt, &mut elab);
                             sync_typedefs_tls(&elab.typedefs);
                         }
@@ -20198,7 +20216,29 @@ fn const_eval_user_call(
             &shell,
         ));
     }
-    eval_const_user_function(&fd, &argv, &shell.parameters, &shell, 0)
+    // §13.4.3/§6.24.1: the function casts to the typedefs of the scope
+    // that declares it: its package (registered as `pkg::f` with this
+    // body), else, called from an instance that does not declare it, `$unit`.
+    let owner = match scoped_key.as_deref().and_then(|k| k.split_once("::")) {
+        Some((pkg, _)) => Some(pkg.to_string()),
+        None => funcs
+            .iter()
+            .filter(|(k, f)| {
+                f.span == fd.span
+                    && k.split_once("::").is_some_and(|(_, leaf)| leaf == fname)
+            })
+            .map(|(k, _)| k.split_once("::").map_or(k.as_str(), |(pkg, _)| pkg).to_string())
+            .min(),
+    };
+    let foreign = owner.is_none()
+        && CONST_FN_LOCAL_FUNCS
+            .with(|c| c.borrow().as_ref().is_some_and(|own| !own.contains(&fname)));
+    let prev_in_unit = CONST_FN_IN_UNIT.with(|c| c.replace(foreign));
+    let prev_owner = CONST_FN_PACKAGE.with(|c| c.replace(owner));
+    let v = eval_const_user_function(&fd, &argv, &shell.parameters, &shell, 0);
+    CONST_FN_PACKAGE.with(|c| *c.borrow_mut() = prev_owner);
+    CONST_FN_IN_UNIT.with(|c| c.set(prev_in_unit));
+    v
 }
 
 /// Candidate ENV KEYS for the base of a constant `base[index]` element
@@ -34367,6 +34407,33 @@ fn inline_module_items(
                         CONST_FN_LOCAL_TYPES.with(|c| *c.borrow_mut() = prev);
                     }
                 });
+                // Its own functions, not the `$unit` ones injected into it.
+                let local_funcs: HashSet<String> = UNIT_FUNCTION_SITES.with(|u| {
+                    let u = u.borrow();
+                    sub_mod
+                        .items()
+                        .iter()
+                        .filter_map(|it| match it {
+                            ModuleItem::FunctionDeclaration(fd)
+                                if !u.contains(&(
+                                    fd.name.name.name.clone(),
+                                    fd.span.start,
+                                    fd.span.end,
+                                )) =>
+                            {
+                                Some(fd.name.name.name.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                });
+                let mut prev_local_funcs =
+                    Some(CONST_FN_LOCAL_FUNCS.with(|c| c.replace(Some(local_funcs))));
+                let _local_funcs = scopeguard_lite(move || {
+                    if let Some(prev) = prev_local_funcs.take() {
+                        CONST_FN_LOCAL_FUNCS.with(|c| *c.borrow_mut() = prev);
+                    }
+                });
                 let mut inst_types: HashMap<String, DataType> = HashMap::default();
                 for p_decl in sub_mod.params_and_body_types() {
                     if let ParameterKind::Type { assignments } = &p_decl.kind {
@@ -39592,6 +39659,25 @@ thread_local! {
     /// module resolves in that instance and nowhere else.
     static CONST_FN_LOCAL_TYPES: std::cell::RefCell<Option<HashMap<String, DataType>>> =
         const { std::cell::RefCell::new(None) };
+    /// The functions the instance being elaborated declares itself. A
+    /// constant function it calls but does not declare (a `$unit` one)
+    /// resolves the typedefs it casts to in its own scope, not through
+    /// `CONST_FN_LOCAL_TYPES`.
+    static CONST_FN_LOCAL_FUNCS: std::cell::RefCell<Option<HashSet<String>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set while a `$unit` constant function called from inside an instance
+    /// is folded: its bare cast targets resolve in `CONST_FN_UNIT_TYPES`.
+    static CONST_FN_IN_UNIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// (name, span start, span end) of each `$unit` function. They are
+    /// injected into every module's items, where they look like the
+    /// module's own; see `set_unit_function_sites`.
+    static UNIT_FUNCTION_SITES: std::cell::RefCell<HashSet<(String, usize, usize)>> =
+        std::cell::RefCell::new(HashSet::default());
+    /// The `$unit` typedefs' declared types, taken once they are all
+    /// registered. The shared typedef table is overwritten by an instance's
+    /// same-named body typedefs, so it cannot answer for `$unit` there.
+    static CONST_FN_UNIT_TYPES: std::cell::RefCell<Option<HashMap<String, DataType>>> =
+        const { std::cell::RefCell::new(None) };
     /// The package that declares the constant function being folded, if
     /// any. Its body sees that package's typedefs (and what it imports), not
     /// those of the scope that called it.
@@ -39662,6 +39748,22 @@ fn const_fn_local_typedef(name: &str, elab: &ElaboratedModule) -> Option<DataTyp
     })
 }
 
+/// Record the `$unit` functions of the design being elaborated (name and
+/// declaration span), so an injected copy in a module is not taken for a
+/// function the module declares itself.
+pub(crate) fn set_unit_function_sites(sites: HashSet<(String, usize, usize)>) {
+    UNIT_FUNCTION_SITES.with(|c| *c.borrow_mut() = sites);
+}
+
+/// A bare type name inside a `$unit` constant function folded for an
+/// instance: the `$unit` typedef of that name, else the one package that
+/// declares it (an imported typedef).
+fn const_fn_unit_typedef(name: &str, elab: &ElaboratedModule) -> Option<DataType> {
+    CONST_FN_UNIT_TYPES
+        .with(|c| c.borrow().as_ref()?.get(name).cloned())
+        .or_else(|| const_fn_imported_typedef(name, elab).cloned())
+}
+
 /// The declared type of the typedef a cast target names (`dir_e`, `p::dir_e`,
 /// or a type literal referring to one), followed through typedefs of
 /// typedefs. `None` when the target is not a typedef of `elab`, e.g. a
@@ -39701,6 +39803,7 @@ fn const_fn_cast_typedef(target: &Expression, elab: &ElaboratedModule) -> Option
     let mut dt = match (&scoped, &pkg) {
         (Some(k), _) => elab.typedef_types.get(k)?.clone(),
         (None, Some(pkg)) => const_fn_package_typedef(pkg, &leaf, elab)?.clone(),
+        (None, None) if CONST_FN_IN_UNIT.with(|c| c.get()) => const_fn_unit_typedef(&leaf, elab)?,
         (None, None) if CONST_FN_IN_INSTANCE.with(|c| c.get()) => {
             const_fn_local_typedef(&leaf, elab)?
         }
@@ -39714,6 +39817,9 @@ fn const_fn_cast_typedef(target: &Expression, elab: &ElaboratedModule) -> Option
                 dt = match &pkg {
                     Some(pkg) if name.scopes.is_empty() => {
                         const_fn_package_typedef(pkg, &name.name.name, elab)?.clone()
+                    }
+                    None if name.scopes.is_empty() && CONST_FN_IN_UNIT.with(|c| c.get()) => {
+                        const_fn_unit_typedef(&name.name.name, elab)?
                     }
                     None if name.scopes.is_empty() && CONST_FN_IN_INSTANCE.with(|c| c.get()) => {
                         const_fn_local_typedef(&name.name.name, elab)?
@@ -39866,9 +39972,19 @@ fn substitute_const_fn_calls(
                 ));
             }
             let owner = const_fn_owner_package(&fname, scoped_key.as_deref(), &fd, elab);
+            // §13.4.3/§6.24.1: a function the instance calls but does not
+            // declare (a `$unit` one) casts to the typedefs of ITS scope.
+            // Folded as the instance's own, `w_t'(x)` took the instance's
+            // `w_t` when the body declared one of that name.
+            let foreign = owner.is_none()
+                && scoped_key.is_none()
+                && CONST_FN_LOCAL_FUNCS
+                    .with(|c| c.borrow().as_ref().is_some_and(|own| !own.contains(&fname)));
+            let prev_in_unit = CONST_FN_IN_UNIT.with(|c| c.replace(foreign));
             let prev_owner = CONST_FN_PACKAGE.with(|c| c.replace(owner));
             let v = eval_const_user_function(&fd, &argv, params, elab, depth);
             CONST_FN_PACKAGE.with(|c| *c.borrow_mut() = prev_owner);
+            CONST_FN_IN_UNIT.with(|c| c.set(prev_in_unit));
             let v = v?;
             // §13.4.1: preserve the declared return width and signedness,
             // including wide and four-state results used by another call.

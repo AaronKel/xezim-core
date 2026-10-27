@@ -2190,6 +2190,16 @@ fn parse_and_elaborate(
     // overridden default too.
     let mut param_override_hits = apply_param_overrides(&mut definitions, None)?;
 
+    // §13.4.3/§6.24.1: the `$unit` functions are injected into every module
+    // below; constant folding needs to tell such a copy from a function the
+    // module declares itself.
+    elaborate::set_unit_function_sites(
+        top_level_functions
+            .iter()
+            .map(|f| (f.name.name.name.clone(), f.span.start, f.span.end))
+            .collect(),
+    );
+
     // §23.11: retain module/generate bind declarations in their lexical
     // scopes. Targets are resolved after the ordinary hierarchy is elaborated.
     if !top_level_functions.is_empty()

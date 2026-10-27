@@ -46,3 +46,28 @@ endmodule
     assert_eq!(p("PARAM_WIDTH"), Some(5));
     assert_eq!(p("NESTED"), Some(1));
 }
+
+/// §6.20.3: a cast to a type parameter of the root module, which is not
+/// elaborated as an instance, takes that parameter's type.
+#[test]
+fn root_type_parameter_cast_folds_with_its_width_and_sign() {
+    let parsed = xezim_core::parse_str(
+        r#"
+module top #(parameter type T = logic [3:0], parameter type S = logic signed [2:0]);
+  localparam int H = T'(45);
+  localparam int SV = S'(45);
+  localparam int SN = S'(45) < 0;
+endmodule
+"#,
+    )
+    .expect("parse");
+    let Description::Module(module) = &parsed.source.descriptions[0] else {
+        panic!("module");
+    };
+    let model =
+        elaborate_module(Definition::Module(module), &HashMap::default()).expect("elaborate");
+    let p = |n: &str| model.parameters[n].to_i64();
+    assert_eq!(p("H"), Some(13));
+    assert_eq!(p("SV"), Some(-3));
+    assert_eq!(p("SN"), Some(1));
+}
