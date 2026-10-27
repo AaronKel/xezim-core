@@ -17865,15 +17865,16 @@ fn quiet_packed_width_probe(
 fn design_ast_blob(all_defs: &HashMap<String, Definition>) -> Vec<u8> {
     let mut blob: Vec<u8> = Vec::new();
     for def in all_defs.values() {
+        let cfg = crate::xez_bincode_config();
         let bytes = match def {
-            Definition::Module(m) => bincode::serialize(m),
-            Definition::Interface(i) => bincode::serialize(i),
-            Definition::Program(p) => bincode::serialize(p),
-            Definition::Class(c) => bincode::serialize(c),
-            Definition::Covergroup(cg) => bincode::serialize(cg),
-            Definition::Package(p) => bincode::serialize(p),
-            Definition::Typedef(t) => bincode::serialize(t),
-            Definition::Udp(u) => bincode::serialize(u),
+            Definition::Module(m) => bincode::serde::encode_to_vec(m, cfg),
+            Definition::Interface(i) => bincode::serde::encode_to_vec(i, cfg),
+            Definition::Program(p) => bincode::serde::encode_to_vec(p, cfg),
+            Definition::Class(c) => bincode::serde::encode_to_vec(c, cfg),
+            Definition::Covergroup(cg) => bincode::serde::encode_to_vec(cg, cfg),
+            Definition::Package(p) => bincode::serde::encode_to_vec(p, cfg),
+            Definition::Typedef(t) => bincode::serde::encode_to_vec(t, cfg),
+            Definition::Udp(u) => bincode::serde::encode_to_vec(u, cfg),
         };
         if let Ok(b) = bytes {
             blob.extend_from_slice(&b);
@@ -46216,8 +46217,10 @@ mod logged_map_tests {
         assert!(cd.queue_properties.contains_key("v"));
         assert!(cd.array_of_coll_properties.contains_key("fixed_rows"));
         assert!(!cd.assoc_properties.contains_key("v"));
-        let encoded = bincode::serialize(&cd).unwrap();
-        let restored: ElaboratedClass = bincode::deserialize(&encoded).unwrap();
+        let cfg = crate::xez_bincode_config();
+        let encoded = bincode::serde::encode_to_vec(&cd, cfg).unwrap();
+        let (restored, _): (ElaboratedClass, usize) =
+            bincode::serde::decode_from_slice(&encoded, cfg).unwrap();
         assert!(
             matches!(&restored.dynamic_assoc_properties["v"][0], UnpackedDimension::Associative { data_type: Some(dt), .. }
             if matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }))

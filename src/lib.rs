@@ -171,7 +171,8 @@ pub use value::Value;
 /// \x28 = \x27 + hierarchical interface-port aliases (§25.3 / §23.8).
 /// \x29 = \x28 + retained specify-parameter declaration kind (§6.20.5).
 /// \x2a = \x29 + constructor argument forwarding flags (IEEE 1800-2023 §8.17).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x2a";
+/// \x2b = \x2a + bincode 2 encoding (the standard configuration).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x2b";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -241,16 +242,13 @@ fn compression_stats_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Bincode configuration for xezim compiled artifacts. Variable-int encoding
-/// shrinks length tags, enum discriminants, and small integers; the wire
-/// format is incompatible with the top-level `bincode::serialize` defaults
-/// (which use fixed 8-byte ints), so this is the single source of truth used
-/// by both writer and reader.
-pub fn xez_bincode_options() -> impl bincode::Options + Copy {
-    use bincode::Options;
-    bincode::DefaultOptions::new()
-        .with_varint_encoding()
-        .with_little_endian()
+/// Bincode configuration for xezim compiled artifacts and caches: the
+/// bincode 2 standard configuration (little-endian, variable-length
+/// integers, no limit). Variable-int encoding shrinks length tags, enum
+/// discriminants, and small integers. The single source of truth for every
+/// writer and reader, in this crate and in xezim.
+pub fn xez_bincode_config() -> impl bincode::config::Config + Copy {
+    bincode::config::standard()
 }
 
 fn artifact_version_error(file_magic: &[u8; 8]) -> Option<String> {
@@ -272,7 +270,6 @@ fn artifact_version_error(file_magic: &[u8; 8]) -> Option<String> {
 /// If compression statistics are enabled via `set_compression_stats(true)`,
 /// prints the compression ratio after writing.
 pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<(), String> {
-    use bincode::Options;
     use std::io::Write;
 
     if artifact_uncompressed() {
@@ -280,8 +277,7 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
         let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
         w.write_all(XEZIM_BYTECODE_MAGIC)
             .map_err(|e| format!("write '{}': {}", path, e))?;
-        xez_bincode_options()
-            .serialize_into(&mut w, elab)
+        bincode::serde::encode_into_std_write(elab, &mut w, xez_bincode_config())
             .map_err(|e| format!("serialize: {}", e))?;
         return w.flush().map_err(|e| format!("flush '{}': {}", path, e));
     }
@@ -303,8 +299,7 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
     if stats_enabled {
         // First, serialize to measure uncompressed size
         let mut uncompressed = Vec::new();
-        xez_bincode_options()
-            .serialize_into(&mut uncompressed, elab)
+        bincode::serde::encode_into_std_write(elab, &mut uncompressed, xez_bincode_config())
             .map_err(|e| format!("serialize: {}", e))?;
         let uncompressed_size = uncompressed.len();
 
@@ -343,8 +338,7 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
         // Standard path without statistics. bincode writes field by field;
         // batch those writes before they reach the compressor.
         let mut buffered = std::io::BufWriter::with_capacity(1 << 20, enc);
-        xez_bincode_options()
-            .serialize_into(&mut buffered, elab)
+        bincode::serde::encode_into_std_write(elab, &mut buffered, xez_bincode_config())
             .map_err(|e| format!("serialize: {}", e))?;
         let enc = buffered
             .into_inner()
@@ -361,7 +355,6 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
 /// If compression statistics are enabled via `set_compression_stats(true)`,
 /// prints the file size and decompression info.
 pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, String> {
-    use bincode::Options;
     use std::io::Read;
 
     let stats_enabled = compression_stats_enabled();
@@ -398,13 +391,17 @@ pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, 
     // output so those are memory copies, not one decompression call each.
     let elab = if got == 4 && head == [0x28, 0xB5, 0x2F, 0xFD] {
         let dec = zstd::stream::Decoder::new(chained).map_err(|e| format!("zstd init: {}", e))?;
-        xez_bincode_options()
-            .deserialize_from(std::io::BufReader::with_capacity(1 << 20, dec))
-            .map_err(|e| format!("deserialize: {}", e))?
+        bincode::serde::decode_from_std_read(
+            &mut std::io::BufReader::with_capacity(1 << 20, dec),
+            xez_bincode_config(),
+        )
+        .map_err(|e| format!("deserialize: {}", e))?
     } else {
-        xez_bincode_options()
-            .deserialize_from(std::io::BufReader::with_capacity(1 << 16, chained))
-            .map_err(|e| format!("deserialize: {}", e))?
+        bincode::serde::decode_from_std_read(
+            &mut std::io::BufReader::with_capacity(1 << 16, chained),
+            xez_bincode_config(),
+        )
+        .map_err(|e| format!("deserialize: {}", e))?
     };
     Ok(Some(elab))
 }
@@ -412,7 +409,6 @@ pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, 
 /// Like `read_compiled` but reads from an in-memory slice (e.g. an embedded
 /// `include_bytes!()` payload in a binary produced by `--emit-native`).
 pub fn read_compiled_bytes(bytes: &[u8]) -> Result<elaborate::ElaboratedModule, String> {
-    use bincode::Options;
     if bytes.len() < 8 {
         return Err("xezim artifact: payload shorter than magic header".to_string());
     }
@@ -428,12 +424,14 @@ pub fn read_compiled_bytes(bytes: &[u8]) -> Result<elaborate::ElaboratedModule, 
     // Same compressed/uncompressed sniff as `read_compiled`.
     if body.len() >= 4 && body[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
         let dec = zstd::stream::Decoder::new(body).map_err(|e| format!("zstd init: {}", e))?;
-        xez_bincode_options()
-            .deserialize_from(std::io::BufReader::with_capacity(1 << 20, dec))
-            .map_err(|e| format!("deserialize: {}", e))
+        bincode::serde::decode_from_std_read(
+            &mut std::io::BufReader::with_capacity(1 << 20, dec),
+            xez_bincode_config(),
+        )
+        .map_err(|e| format!("deserialize: {}", e))
     } else {
-        xez_bincode_options()
-            .deserialize(body)
+        bincode::serde::decode_from_slice(body, xez_bincode_config())
+            .map(|(elab, _)| elab)
             .map_err(|e| format!("deserialize: {}", e))
     }
 }
@@ -3083,29 +3081,28 @@ fn parse_and_elaborate(
         // sizes correctly identify hot spots. On c910 hello this revealed
         // continuous_assigns at 394 MB, always_blocks at 193 MB, signals at
         // 173 MB — the three to target for memory work.
-        use bincode::Options;
-        let opts = xez_bincode_options();
+        let cfg = xez_bincode_config();
         let try_size = |label: &str, bytes: Result<Vec<u8>, _>| match bytes {
             Ok(b) => eprintln!("[elab-bytes-bincode] {}: {:>10} bytes", label, b.len()),
             Err(_) => eprintln!("[elab-bytes-bincode] {}: <serialize failed>", label),
         };
-        try_size("always_blocks    ", opts.serialize(&elab.always_blocks));
-        try_size("initial_blocks   ", opts.serialize(&elab.initial_blocks));
+        try_size("always_blocks    ", bincode::serde::encode_to_vec(&elab.always_blocks, cfg));
+        try_size("initial_blocks   ", bincode::serde::encode_to_vec(&elab.initial_blocks, cfg));
         try_size(
             "continuous_assigns",
-            opts.serialize(&elab.continuous_assigns),
+            bincode::serde::encode_to_vec(&elab.continuous_assigns, cfg),
         );
-        try_size("signals          ", opts.serialize(&elab.signals));
-        try_size("parameters       ", opts.serialize(&elab.parameters));
-        try_size("arrays           ", opts.serialize(&elab.arrays));
-        try_size("arrays_2d        ", opts.serialize(&elab.arrays_2d));
-        try_size("arrays_nd        ", opts.serialize(&elab.arrays_nd));
-        try_size("functions        ", opts.serialize(&elab.functions));
-        try_size("tasks            ", opts.serialize(&elab.tasks));
-        try_size("typedefs         ", opts.serialize(&elab.typedefs));
-        try_size("typedef_types    ", opts.serialize(&elab.typedef_types));
-        try_size("classes          ", opts.serialize(&elab.classes));
-        try_size("specify_delays   ", opts.serialize(&elab.specify_delays));
+        try_size("signals          ", bincode::serde::encode_to_vec(&elab.signals, cfg));
+        try_size("parameters       ", bincode::serde::encode_to_vec(&elab.parameters, cfg));
+        try_size("arrays           ", bincode::serde::encode_to_vec(&elab.arrays, cfg));
+        try_size("arrays_2d        ", bincode::serde::encode_to_vec(&elab.arrays_2d, cfg));
+        try_size("arrays_nd        ", bincode::serde::encode_to_vec(&elab.arrays_nd, cfg));
+        try_size("functions        ", bincode::serde::encode_to_vec(&elab.functions, cfg));
+        try_size("tasks            ", bincode::serde::encode_to_vec(&elab.tasks, cfg));
+        try_size("typedefs         ", bincode::serde::encode_to_vec(&elab.typedefs, cfg));
+        try_size("typedef_types    ", bincode::serde::encode_to_vec(&elab.typedef_types, cfg));
+        try_size("classes          ", bincode::serde::encode_to_vec(&elab.classes, cfg));
+        try_size("specify_delays   ", bincode::serde::encode_to_vec(&elab.specify_delays, cfg));
     }
     elab_phase("post-inline passes", &mut phase_t);
     Ok((definitions, elab))
