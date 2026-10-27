@@ -173,7 +173,8 @@ pub use value::Value;
 /// \x2a = \x29 + constructor argument forwarding flags (IEEE 1800-2023 §8.17).
 /// \x2b = \x2a + bincode 2 encoding (the standard configuration).
 /// \x2c = \x2b + class members with a dynamic outer dimension over unpacked tails (§7.4.5).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x2c";
+/// \x2d = \x2c + the fall delay of a UDP instance (§28.16, §29.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x2d";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

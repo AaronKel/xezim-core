@@ -446,10 +446,14 @@ pub struct UdpInstance {
     pub init: Option<char>,
     /// Truth table.
     pub rows: Vec<crate::ast::decl::UdpTableRow>,
-    /// Instance delay in simulation ticks (0 = none). Single delay applied to
-    /// all transitions (rise==fall==turn-off).
+    /// Instance delay in simulation ticks (0 = none): the rise delay, and
+    /// every delay when `delay_fall` is None.
     #[serde(default)]
     pub delay: u64,
+    /// §28.16/§29.3: the fall delay of a `#(rise, fall)` instance delay;
+    /// None when one value was given (it applies to every transition).
+    #[serde(default)]
+    pub delay_fall: Option<u64>,
     pub span: crate::ast::Span,
 }
 
@@ -42296,27 +42300,25 @@ fn lower_udp_instances(
 ) {
     use crate::ast::decl::PortConnection;
     let n_ports = udp.ports.len();
-    // Instance delay: `#(d)` before the instance — a scalar time literal in the
-    // enclosing module's time units. (Rise/fall pairs collapse to the first.)
+    // Instance delay: `#(d)` or `#(rise, fall)` before the instance — scalar
+    // time values in the enclosing module's time units (§28.16, §29.3).
     // A parameter it names (`#(D)`) belongs to the enclosing INSTANCE: bring
     // the expression into that scope first, like the terminals below, or an
     // inlined instance's `D` missed the flattened `u.D` and the delay was 0.
-    let delay: u64 = inst
-        .params
-        .as_ref()
-        .and_then(|ps| ps.first())
-        .and_then(|p| match p {
+    let delay_at = |k: usize| -> Option<u64> {
+        match inst.params.as_ref()?.get(k)? {
             crate::ast::decl::ParamConnection::Ordered(Some(
                 crate::ast::decl::ParamValue::Expr(e),
             )) => {
                 let e = rewrite_expr(e, prefix, &HashMap::default(), local_names, interface_map);
-                const_eval_i64_with_params(&e, Some(&elab.parameters))
+                const_eval_i64_with_params(&e, Some(&elab.parameters)).map(|d| d.max(0) as u64)
             }
             _ => None,
-        })
-        .filter(|d| *d > 0)
-        .map(|d| d as u64)
-        .unwrap_or(0);
+        }
+    };
+    let delay: u64 = delay_at(0).unwrap_or(0);
+    // The fall delay: a 1->0 output change waited the rise delay instead.
+    let delay_fall: Option<u64> = delay_at(1);
 
     for hi in &inst.instances {
         // Positional terminals only (§29.7).
@@ -42434,6 +42436,7 @@ fn lower_udp_instances(
                     init: udp.init,
                     rows: udp.rows.clone(),
                     delay,
+                    delay_fall,
                     span: udp.span,
                 });
             }
@@ -42458,6 +42461,7 @@ fn lower_udp_instances(
                         init: udp.init,
                         rows: udp.rows.clone(),
                         delay,
+                        delay_fall,
                         span: udp.span,
                     });
                 }

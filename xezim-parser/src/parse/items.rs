@@ -4185,7 +4185,16 @@ impl Parser {
                         value: pv,
                     });
                 } else {
-                    p.push(ParamConnection::Ordered(Some(self.parse_param_value())));
+                    let v = self.parse_param_value();
+                    // §29.3/§28.16 `delay2 ::= #(mintypmax [, mintypmax])`:
+                    // a UDP's delay may be `min:typ:max`.
+                    let v = match v {
+                        ParamValue::Expr(e) if self.at(TokenKind::Colon) => {
+                            ParamValue::Expr(self.parse_mintypmax_rest(e))
+                        }
+                        v => v,
+                    };
+                    p.push(ParamConnection::Ordered(Some(v)));
                 }
 
                 if self.eat(TokenKind::Comma).is_none() {
@@ -4197,7 +4206,9 @@ impl Parser {
         } else if matches!(
             self.current_kind(),
             TokenKind::IntegerLiteral | TokenKind::RealLiteral | TokenKind::TimeLiteral
-        ) {
+        ) || (self.at(TokenKind::Identifier)
+            && !matches!(self.peek_kind(), TokenKind::DoubleColon | TokenKind::Dot))
+        {
             // §28.3 primitive delay without parens — `ubuf #2 u (o, i)`.
             // Eating the `#` and returning None left the literal in the
             // stream to trip the instance-name parse. A single NUMERIC
@@ -4205,6 +4216,9 @@ impl Parser {
             // `#(2)` downstream (the UDP elaborator reads a scalar delay
             // out of `params`). Literals only: an identifier here would
             // be ambiguous against too many neighbors.
+            // A.2.2.3 `delay_value` is also a parameter name (`#D`): with
+            // the `#` eaten and nothing returned, `my_mux #D (z, a)` became
+            // an instance NAMED `D` with no delay.
             // One delay value (A.2.2.3), as for a gate: a general expression
             // went on into an unnamed instance's terminal list as a call on
             // the literal (`my_mux #0 (z, a, b, s)` read `0 (z, a, b, s)`).

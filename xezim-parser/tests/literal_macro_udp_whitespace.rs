@@ -57,15 +57,19 @@ fn macro_arguments_on_a_later_line() {
     assert!(!out.contains("`ADD"), "{out}");
 }
 
-/// §29.3: `udp [drive_strength] [delay] [name] (terminals)`.
+/// §29.3: `udp [drive_strength] [delay] [name] (terminals)`, the delay a
+/// number, a parameter name (A.2.2.3) or `(min:typ:max)`.
 #[test]
 fn unnamed_udp_instance_after_strength_or_delay() {
     let src = "primitive p (z, a); output z; input a; table 0 : 0; 1 : 1; endtable endprimitive
-module t; reg a; wire z0, z1, z2, z3, z4;
+module t; localparam int D = 2; reg a; wire z0, z1, z2, z3, z4, z5, z6, z7;
   p #0 (z0, a);
   p #0 (z1, a), (z2, a);
   p (strong0, weak1) (z3, a);
   p (strong0, weak1) #1.5 (z4, a);
+  p #D (z5, a);
+  p #D u (z6, a);
+  p #(1:2:3) (z7, a);
 endmodule";
     let r = parse(src);
     assert!(r.errors.is_empty(), "{:?}", r.errors);
