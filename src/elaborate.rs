@@ -5236,6 +5236,18 @@ fn hoist_package_struct_params(defs: &HashMap<String, Definition>, elab: &mut El
                                 let qualified = format!("{}::{}", p.name.name, bare);
                                 for key in [&bare, &dotted, &qualified] {
                                     tls_register_struct_layout(key, &fields);
+                                    // The runtime member read of an element
+                                    // (`p::ENC[f].man_bits` in a class
+                                    // method, which reaches it as `p.ENC`)
+                                    // needs the layout too; it read 0.
+                                    elab.packed_struct_fields
+                                        .entry(key.clone())
+                                        .or_insert_with(|| fields.clone());
+                                }
+                                // ... and its element width and bounds under
+                                // the qualified spellings.
+                                for key in [&dotted, &qualified] {
+                                    register_packed_param_index(elab, key, data_type, None);
                                 }
                             }
                         }
