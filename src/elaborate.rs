@@ -3494,6 +3494,13 @@ pub struct ElaboratedModule {
     /// `foreach` binds those index variables with the key type.
     #[serde(default)]
     pub assoc_inner_string_keys: HashMap<String, Vec<bool>>,
+    /// §7.8/§7.4.5: associative arrays whose elements are themselves
+    /// unpacked collections (`int aq[int][$]`, `int aa[int][int]`,
+    /// `int ad[int][4]`). `m[k][j]` on one of these selects an element of the
+    /// row; on any other associative array of an integral type it is a bit of
+    /// the element.
+    #[serde(default)]
+    pub assoc_coll_elems: HashSet<String>,
     /// N-dimensional unpacked array shapes (N >= 3): name → Vec of (lo, hi) per dim.
     pub arrays_nd: HashMap<String, (Vec<(i64, i64)>, u32)>,
     /// Parameter init expressions that couldn't be evaluated at elaboration time
@@ -3957,6 +3964,7 @@ impl ElaboratedModule {
             array_elem_class: HashMap::default(),
             assoc_key_type_names: HashMap::default(),
             assoc_inner_string_keys: HashMap::default(),
+            assoc_coll_elems: HashSet::default(),
             arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
             nets: HashSet::default(),
@@ -9601,6 +9609,9 @@ pub fn elaborate_module_with_defs(
                         if let Some(lv) = assoc_inner_string_levels(&effective_dims) {
                             elab.assoc_inner_string_keys
                                 .insert(decl.name.name.clone(), lv);
+                        }
+                        if effective_dims.len() > 1 {
+                            elab.assoc_coll_elems.insert(decl.name.name.clone());
                         }
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
@@ -16664,6 +16675,9 @@ fn elaborate_items_numbered(
                         if let Some(lv) = assoc_inner_string_levels(&decl.dimensions) {
                             elab.assoc_inner_string_keys
                                 .insert(decl.name.name.clone(), lv);
+                        }
+                        if decl.dimensions.len() > 1 {
+                            elab.assoc_coll_elems.insert(decl.name.name.clone());
                         }
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
@@ -25232,6 +25246,9 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
                     if let Some(lv) = assoc_inner_string_levels(&mdims) {
                         elab.assoc_inner_string_keys.insert(mbase.clone(), lv);
                     }
+                    if mdims.len() > 1 {
+                        elab.assoc_coll_elems.insert(mbase.clone());
+                    }
                     elab.var_decl_types
                         .insert(mbase.clone(), member.data_type.clone());
                     continue;
@@ -29463,6 +29480,9 @@ fn inline_instantiations_inner(
                                     if let Some(lv) = assoc_inner_string_levels(&decl.dimensions) {
                                         elab.assoc_inner_string_keys
                                             .insert(decl.name.name.clone(), lv);
+                                    }
+                                    if decl.dimensions.len() > 1 {
+                                        elab.assoc_coll_elems.insert(decl.name.name.clone());
                                     }
                                     continue;
                                 }
@@ -37556,6 +37576,9 @@ fn inline_module_items(
                                         {
                                             elab.assoc_inner_string_keys
                                                 .insert(sig_name.clone(), lv);
+                                        }
+                                        if effective_decl_dims.len() > 1 {
+                                            elab.assoc_coll_elems.insert(sig_name.clone());
                                         }
                                         // §10.7: the element width, under the SCOPED name — the runtime
                                         // looks it up by resolved signal name, and a bare leaf would
