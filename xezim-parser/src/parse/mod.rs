@@ -314,6 +314,38 @@ impl Parser {
                 self.expect(TokenKind::Semicolon);
                 self.parse_description()
             }
+            // §33.4: a configuration (`config cfg; design work.top; ...
+            // endconfig`). xezim takes its tops from `-s` or the design and
+            // has no library mapping, so the declaration is read and set
+            // aside with a warning; it was a stream of "unexpected token"
+            // errors (#603).
+            TokenKind::KwConfig => {
+                let start = self.current().span.start;
+                self.bump(); // config
+                let name = if self.at(TokenKind::Identifier) {
+                    self.current().text.clone()
+                } else {
+                    String::new()
+                };
+                while !self.at(TokenKind::KwEndconfig) && !self.at(TokenKind::Eof) {
+                    self.bump();
+                }
+                if self.eat(TokenKind::KwEndconfig).is_some()
+                    && self.eat(TokenKind::Colon).is_some()
+                    && self.at(TokenKind::Identifier)
+                {
+                    self.bump();
+                }
+                self.diagnostics
+                    .push(crate::diagnostics::Diagnostic::warning(
+                        format!(
+                            "configuration '{name}' is ignored: xezim selects the design \
+                         top with -s and maps no libraries (IEEE 1800-2017 §33.4)"
+                        ),
+                        self.span_from(start),
+                    ));
+                None
+            }
             TokenKind::KwModule | TokenKind::KwMacromodule => {
                 Some(Description::Module(self.parse_module_declaration()))
             }
