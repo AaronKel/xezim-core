@@ -3515,6 +3515,12 @@ pub struct ElaboratedModule {
     /// the element.
     #[serde(default)]
     pub assoc_coll_elems: HashSet<String>,
+    /// §7.8/§7.10: the dimensions of each ROW of an associative array in
+    /// `assoc_coll_elems` (every dimension after the key, outermost first):
+    /// `int aq[int][$]` has a queue row. A write to an absent row
+    /// (`aq[6][0] = 9`) creates it as that kind of collection.
+    #[serde(default)]
+    pub assoc_row_dims: HashMap<String, Vec<UnpackedDimension>>,
     /// N-dimensional unpacked array shapes (N >= 3): name → Vec of (lo, hi) per dim.
     pub arrays_nd: HashMap<String, (Vec<(i64, i64)>, u32)>,
     /// Parameter init expressions that couldn't be evaluated at elaboration time
@@ -3978,6 +3984,7 @@ impl ElaboratedModule {
             array_elem_class: HashMap::default(),
             assoc_key_type_names: HashMap::default(),
             assoc_inner_string_keys: HashMap::default(),
+            assoc_row_dims: HashMap::default(),
             assoc_coll_elems: HashSet::default(),
             arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
@@ -9624,9 +9631,7 @@ pub fn elaborate_module_with_defs(
                             elab.assoc_inner_string_keys
                                 .insert(decl.name.name.clone(), lv);
                         }
-                        if effective_dims.len() > 1 {
-                            elab.assoc_coll_elems.insert(decl.name.name.clone());
-                        }
+                        record_assoc_rows(&mut elab, &decl.name.name, &effective_dims);
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
                         }
@@ -16690,9 +16695,7 @@ fn elaborate_items_numbered(
                             elab.assoc_inner_string_keys
                                 .insert(decl.name.name.clone(), lv);
                         }
-                        if decl.dimensions.len() > 1 {
-                            elab.assoc_coll_elems.insert(decl.name.name.clone());
-                        }
+                        record_assoc_rows(elab, &decl.name.name, &decl.dimensions);
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
                         }
@@ -19506,6 +19509,16 @@ pub fn resolve_typedef_chain<'a>(
 /// §7.8: the inner-level string-key flags of an associative array of
 /// associative arrays (see `assoc_inner_string_keys`); `None` when `dims`
 /// has no associative dimension after the first.
+/// Records an associative array whose elements are collections
+/// (`assoc_coll_elems`) and the dimensions of its rows (`assoc_row_dims`).
+fn record_assoc_rows(elab: &mut ElaboratedModule, name: &str, dims: &[UnpackedDimension]) {
+    if dims.len() > 1 {
+        elab.assoc_coll_elems.insert(name.to_string());
+        elab.assoc_row_dims
+            .insert(name.to_string(), dims[1..].to_vec());
+    }
+}
+
 pub fn assoc_inner_string_levels(dims: &[UnpackedDimension]) -> Option<Vec<bool>> {
     let inner = dims.get(1..)?;
     if !inner
@@ -25260,9 +25273,7 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
                     if let Some(lv) = assoc_inner_string_levels(&mdims) {
                         elab.assoc_inner_string_keys.insert(mbase.clone(), lv);
                     }
-                    if mdims.len() > 1 {
-                        elab.assoc_coll_elems.insert(mbase.clone());
-                    }
+                    record_assoc_rows(elab, &mbase, &mdims);
                     elab.var_decl_types
                         .insert(mbase.clone(), member.data_type.clone());
                     continue;
@@ -29502,9 +29513,7 @@ fn inline_instantiations_inner(
                                         elab.assoc_inner_string_keys
                                             .insert(decl.name.name.clone(), lv);
                                     }
-                                    if decl.dimensions.len() > 1 {
-                                        elab.assoc_coll_elems.insert(decl.name.name.clone());
-                                    }
+                                    record_assoc_rows(elab, &decl.name.name, &decl.dimensions);
                                     continue;
                                 }
                                 // §7.4.2/§7.4.5: a fixed MULTI-dimensional
@@ -37598,9 +37607,7 @@ fn inline_module_items(
                                             elab.assoc_inner_string_keys
                                                 .insert(sig_name.clone(), lv);
                                         }
-                                        if effective_decl_dims.len() > 1 {
-                                            elab.assoc_coll_elems.insert(sig_name.clone());
-                                        }
+                                        record_assoc_rows(elab, &sig_name, &effective_decl_dims);
                                         // §10.7: the element width, under the SCOPED name — the runtime
                                         // looks it up by resolved signal name, and a bare leaf would
                                         // collide with a same-named array in another module.
