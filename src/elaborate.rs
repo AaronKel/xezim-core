@@ -26536,8 +26536,15 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             // (`ENC[i].exp_bits`) must be sliced from the element; a stored
             // `ENC[0].exp_bits` from an earlier, still-zero pack was winning
             // and `fp_width` stayed 1 after the array value was corrected.
+            // Only a PACKED array base is sliced; an indexed path into an
+            // interface or instance array (`b[0].W` of `bus_if b[0:1]`) is
+            // registered under that path and read from it.
             if let Some(path) = const_parameter_path(expr, Some(params))
-                && !path.contains('[')
+                && (!path.contains('[')
+                    || !PACKED_ELEM_W_TLS.with(|c| {
+                        c.borrow()
+                            .contains_key(path.split('[').next().unwrap_or(&path))
+                    }))
                 && let Some(value) = params.get(&path)
             {
                 return value.clone();
