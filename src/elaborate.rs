@@ -10062,6 +10062,16 @@ pub fn elaborate_module_with_defs(
                             inner.filter(|sh| sh.iter().all(|&(lo, hi)| hi >= lo && hi - lo < 4096))
                         {
                             let name = decl.name.name.clone();
+                            // §21.2.1.7: the fixed dimensions' declared bounds,
+                            // behind the same placeholder outer dimension as the
+                            // shape, so `%p` prints a `[1:0]` row from 1 (#597).
+                            if let Some(dd) =
+                                declared_unpacked_dims(&effective_dims[1..], &elab.parameters)
+                            {
+                                let mut all = vec![(0i64, 63i64)];
+                                all.extend(dd);
+                                elab.unpacked_decl_dims.insert(name.clone(), all);
+                            }
                             if inner.len() == 1 {
                                 elab.arrays_2d
                                     .insert(name.clone(), ((0, 63), inner[0], width));
