@@ -176,7 +176,8 @@ pub use value::Value;
 /// \x2d = \x2c + the fall delay of a UDP instance (§28.16, §29.3).
 /// \x2e = \x2d + associative arrays whose elements are collections (§7.8).
 /// \x2f = \x2e + the row dimensions of those arrays (§7.8, §7.10).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x2f";
+/// \x30 = \x2f + the row dimensions of such class members (§7.8).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x30";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

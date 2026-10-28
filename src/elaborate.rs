@@ -1252,6 +1252,11 @@ pub struct ElaboratedClass {
     /// `ElaboratedModule::assoc_coll_elems`.
     #[serde(default)]
     pub assoc_coll_properties: HashSet<String>,
+    /// The row dimensions of each member in `assoc_coll_properties` (every
+    /// dimension after the key); the class counterpart of
+    /// `ElaboratedModule::assoc_row_dims`.
+    #[serde(default)]
+    pub assoc_row_property_dims: HashMap<String, Vec<UnpackedDimension>>,
     /// §7.4.2 / §20.7: the DECLARED `(left, right)` bounds of every unpacked
     /// dimension of a fixed-size array member with at least one descending
     /// dimension (`int ds[3:1]`). `array_properties` / `array_nd_properties`
@@ -2089,6 +2094,7 @@ fn elaborate_class_in_scope(
     let mut dynamic_assoc_properties: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut dynamic_tail_properties: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut assoc_coll_properties: HashSet<String> = HashSet::default();
+    let mut assoc_row_property_dims: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut array_prop_decl_dims: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
     let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
@@ -2372,6 +2378,8 @@ fn elaborate_class_in_scope(
                         ) && effective_dims.len() > 1
                         {
                             assoc_coll_properties.insert(decl.name.name.clone());
+                            assoc_row_property_dims
+                                .insert(decl.name.name.clone(), effective_dims[1..].to_vec());
                         }
                         // §8.25: a fixed array sized by a header VALUE
                         // parameter (`int items[N]`) is a fixed array in every
@@ -3139,6 +3147,7 @@ fn elaborate_class_in_scope(
         dynamic_assoc_properties,
         dynamic_tail_properties,
         assoc_coll_properties,
+        assoc_row_property_dims,
         array_prop_decl_dims,
     }
 }
