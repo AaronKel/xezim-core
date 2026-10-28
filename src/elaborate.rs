@@ -29387,6 +29387,19 @@ fn inline_instantiations_inner(
                         // it at time 0 (enum members are already in scope, having
                         // been processed from this same package's typedefs).
                         crate::ast::decl::PackageItem::Data(dd) => {
+                            // §26.2: a package net is registered as a net, so a
+                            // supply net reads its constant and a wired net
+                            // resolves its drivers (#610).
+                            if let Some(nt) = dd.net_type {
+                                for decl in &dd.declarators {
+                                    register_net_type(elab, &decl.name.name, nt);
+                                    register_net_type(
+                                        elab,
+                                        &format!("{}::{}", name, decl.name.name),
+                                        nt,
+                                    );
+                                }
+                            }
                             // §26.3: keep each package variable's own type even
                             // when its bare name is shared or shadowed.
                             for decl in &dd.declarators {
@@ -42675,6 +42688,28 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
 
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     widen_overlapping_select_drivers(elab);
+    // §26.2: a package net driven by its qualified name (`assign
+    // nets::w = ...`, a port connected to `nets::w`) is the hoisted bare net
+    // `w`. Spelled `nets.w` its drivers were never counted together, so a
+    // `wand` kept the last write (#610).
+    if !elab.packages.is_empty() {
+        for ca in elab.continuous_assigns.iter_mut() {
+            if let ExprKind::Ident(h) = &ca.lhs.kind
+                && h.root.is_none()
+                && h.path.len() == 2
+                && h.path.iter().all(|s| s.selects.is_empty())
+                && elab.packages.contains(&h.path[0].name.name)
+                && elab
+                    .nets
+                    .contains(&format!("{}::{}", h.path[0].name.name, h.path[1].name.name))
+            {
+                let bare = h.path[1].name.name.clone();
+                if elab.nets.contains(&bare) {
+                    ca.lhs = make_ident_expr(&bare);
+                }
+            }
+        }
+    }
     // §28.12 / §21.2.1.5: a net with ONE driver that carries a strength or
     // is a tristate primitive keeps that driver for `%v`; a net several
     // drivers resolve replaces it below.
@@ -47366,6 +47401,19 @@ fn process_import(
                             );
                         }
                         PackageItem::Data(dd) => {
+                            // §26.2: a package net is registered as a net, so a
+                            // supply net reads its constant and a wired net
+                            // resolves its drivers (#610).
+                            if let Some(nt) = dd.net_type {
+                                for decl in &dd.declarators {
+                                    register_net_type(elab, &decl.name.name, nt);
+                                    register_net_type(
+                                        elab,
+                                        &format!("{}::{}", pkg_name, decl.name.name),
+                                        nt,
+                                    );
+                                }
+                            }
                             let width = match &dd.data_type {
                                 DataType::TypeReference { name, .. } => {
                                     {

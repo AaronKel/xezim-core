@@ -1056,6 +1056,11 @@ pub struct DataDeclaration {
     pub data_type: DataType,
     pub declarators: Vec<VarDeclarator>,
     pub span: Span,
+    /// §26.2: a net declared in a package (`wire`, `supply1`, `wand`, ...),
+    /// kept as package data with its net kind so elaboration registers it
+    /// as a net (supply value, wired resolution).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub net_type: Option<NetType>,
 }
 
 #[derive(Debug, Clone)]

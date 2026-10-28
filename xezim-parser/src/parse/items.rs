@@ -1458,6 +1458,7 @@ impl Parser {
                 at + 1,
                 if is_var {
                     ModuleItem::DataDeclaration(DataDeclaration {
+                        net_type: None,
                         const_kw: false,
                         var_kw: false,
                         lifetime: None,
@@ -4283,6 +4284,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             return ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4320,6 +4322,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             return ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4397,6 +4400,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             return ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4432,6 +4436,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             return ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4527,6 +4532,7 @@ impl Parser {
                 let decls = self.parse_var_declarator_list();
                 self.expect(TokenKind::Semicolon);
                 ModuleItem::DataDeclaration(DataDeclaration {
+                    net_type: None,
                     const_kw: false,
                     var_kw: false,
                     lifetime: None,
@@ -4557,6 +4563,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,

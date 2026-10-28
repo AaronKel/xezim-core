@@ -452,6 +452,7 @@ impl Parser {
         let declarators = self.parse_var_declarator_list();
         self.expect(TokenKind::Semicolon);
         DataDeclaration {
+            net_type: None,
             const_kw,
             var_kw,
             lifetime,
@@ -1426,6 +1427,7 @@ impl Parser {
             // as `wire logic [...] t;` already was.
             _ if self.is_net_type_keyword() => match self.parse_module_item() {
                 Some(ModuleItem::NetDeclaration(n)) => Some(PackageItem::Data(DataDeclaration {
+                    net_type: Some(n.net_type),
                     const_kw: false,
                     var_kw: false,
                     lifetime: None,
@@ -1434,12 +1436,18 @@ impl Parser {
                         .declarators
                         .into_iter()
                         .map(|d| VarDeclarator {
-                            // §6.6: an undriven net holds z, where a package
-                            // variable would start at its type's default.
+                            // §6.6: an undriven net holds z (a supply net its
+                            // constant), where a package variable would start
+                            // at its type's default.
                             init: Some(d.init.unwrap_or_else(|| {
+                                let fill = match n.net_type {
+                                    NetType::Supply1 => '1',
+                                    NetType::Supply0 => '0',
+                                    _ => 'z',
+                                };
                                 crate::ast::expr::Expression::new(
                                     crate::ast::expr::ExprKind::Number(
-                                        crate::ast::expr::NumberLiteral::UnbasedUnsized('z'),
+                                        crate::ast::expr::NumberLiteral::UnbasedUnsized(fill),
                                     ),
                                     d.span,
                                 )
