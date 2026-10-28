@@ -1419,6 +1419,40 @@ impl Parser {
                     Some(PackageItem::Data(self.parse_data_declaration()))
                 }
             }
+            // §26.2 / A.1.11: a package may declare nets. A net with an
+            // implicit data type (`wire [W-1:0] t;`, `wire t;`) went to the
+            // data-declaration parser, which needs an explicit type (#602).
+            // Parse it as a module item does and keep it as package data,
+            // as `wire logic [...] t;` already was.
+            _ if self.is_net_type_keyword() => match self.parse_module_item() {
+                Some(ModuleItem::NetDeclaration(n)) => Some(PackageItem::Data(DataDeclaration {
+                    const_kw: false,
+                    var_kw: false,
+                    lifetime: None,
+                    data_type: n.data_type,
+                    declarators: n
+                        .declarators
+                        .into_iter()
+                        .map(|d| VarDeclarator {
+                            // §6.6: an undriven net holds z, where a package
+                            // variable would start at its type's default.
+                            init: Some(d.init.unwrap_or_else(|| {
+                                crate::ast::expr::Expression::new(
+                                    crate::ast::expr::ExprKind::Number(
+                                        crate::ast::expr::NumberLiteral::UnbasedUnsized('z'),
+                                    ),
+                                    d.span,
+                                )
+                            })),
+                            name: d.name,
+                            dimensions: d.dimensions,
+                            span: d.span,
+                        })
+                        .collect(),
+                    span: n.span,
+                })),
+                _ => Some(PackageItem::Null),
+            },
             _ if self.is_data_type_keyword()
                 || self.at(TokenKind::KwVar)
                 || self.at(TokenKind::KwConst) =>
