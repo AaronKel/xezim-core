@@ -5549,7 +5549,20 @@ impl Parser {
                                     // the terminating `;` (depth-aware).
                                     self.skip_bin_body_to_semicolon();
                                 }
+                                // §19.5: `iff (expr)` after the bin's values.
+                                // Unparsed, its tokens were skipped one by one
+                                // and the guard was lost, or tripped the
+                                // covergroup parser on an `inside` (#605).
+                                let iff_guard = if self.eat(TokenKind::KwIff).is_some() {
+                                    self.expect(TokenKind::LParen);
+                                    let g = self.parse_expression();
+                                    self.expect(TokenKind::RParen);
+                                    Some(g)
+                                } else {
+                                    None
+                                };
                                 bins.push(crate::ast::decl::CoverBin {
+                                    iff_guard,
                                     name: bin_name,
                                     kind: bin_kind,
                                     values,

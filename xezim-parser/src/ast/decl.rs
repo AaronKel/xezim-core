@@ -765,6 +765,10 @@ pub struct CoverBin {
     #[cfg_attr(feature = "serde", serde(default))]
     pub transitions: Vec<Vec<TransStep>>,
     pub span: Span,
+    /// LRM §19.5 `bins b = {..} iff (expr);` — the bin is not incremented
+    /// while the guard is false.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub iff_guard: Option<Expression>,
 }
 
 /// One step of a §19.5.2 transition: a value set (`1, [3:4]`) with an
