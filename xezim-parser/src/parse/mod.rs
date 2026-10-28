@@ -32,6 +32,10 @@ pub struct Parser {
     /// operators. Outside this context `or` stays an event-list separator
     /// (`@(a or b)`) and `and` a gate primitive, so the flag is essential.
     in_sva_seq: bool,
+    /// §16.7: the next primary is a `##` cycle-delay count, a constant
+    /// primary: a name followed by `(` there is the count, and the
+    /// parenthesis starts the next sequence (`##N (x)`), not a call.
+    sva_delay_count: bool,
     /// The classes of this file so far, for the strict inheritance checks.
     pub(super) class_infos: Vec<ClassInfo>,
     /// `pure constraint` names of the class being parsed.
@@ -74,6 +78,7 @@ impl Parser {
             pending_pattern_bindings: Vec::new(),
             plain_loop_vars: Vec::new(),
             in_sva_seq: false,
+            sva_delay_count: false,
             class_infos: Vec::new(),
             pure_constraints: Vec::new(),
             in_constraint: false,

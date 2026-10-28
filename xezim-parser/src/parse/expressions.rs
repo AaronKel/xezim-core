@@ -516,7 +516,7 @@ impl Parser {
                     let count_expr = if self.at(TokenKind::LBracket) {
                         self.parse_sva_delay_range(start)
                     } else {
-                        self.parse_prefix()
+                        self.parse_sva_delay_count()
                     };
                     let rhs = self.parse_expr_bp_ctx(r_bp, no_arrow);
                     let delayed = Expression::new(
@@ -1106,6 +1106,8 @@ impl Parser {
 
     /// Parse prefix / primary expression.
     pub(super) fn parse_prefix(&mut self) -> Expression {
+        // One primary only: a parenthesized count (`##(f(1))`) parses as usual.
+        let delay_count = std::mem::take(&mut self.sva_delay_count);
         let start = self.current().span.start;
 
         match self.current_kind() {
@@ -1726,8 +1728,8 @@ impl Parser {
                         self.span_from(start),
                     );
                 }
-                // Check for function call
-                if self.at(TokenKind::LParen) {
+                // Check for function call (not after `##`, see `sva_delay_count`)
+                if self.at(TokenKind::LParen) && !delay_count {
                     let args = self.parse_call_args();
                     let call = Expression::new(
                         ExprKind::Call {
@@ -2128,7 +2130,7 @@ impl Parser {
                 let cycles = if self.at(TokenKind::LBracket) {
                     self.parse_sva_delay_range(start)
                 } else {
-                    self.parse_prefix()
+                    self.parse_sva_delay_count()
                 };
                 // The next token is either another operand (a bare
                 // sequence) or end-of-expression. We greedily parse one
@@ -2859,6 +2861,35 @@ impl Parser {
     /// (= `[0:$]`), `[+]` (= `[1:$]`) or a single `[n]`. The opening `[` is
     /// current. Returns `Range(lo, hi)` (an unbounded `hi` is `Dollar`), or
     /// the bare count for `[n]`.
+    /// §16.7 `## constant_primary`: the delay count of `##N`. A name is the
+    /// count even when `(` follows (`##N (x)`, `##pkg::N (x)`): the
+    /// parenthesis starts the next sequence, not a call (#609).
+    fn parse_sva_delay_count(&mut self) -> Expression {
+        let start = self.current().span.start;
+        self.sva_delay_count = true;
+        let mut count = self.parse_prefix();
+        while matches!(
+            count.kind,
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
+        ) && self.at(TokenKind::DoubleColon)
+            && matches!(
+                self.peek_kind(),
+                TokenKind::Identifier | TokenKind::EscapedIdentifier
+            )
+        {
+            self.bump(); // ::
+            let member = self.parse_identifier();
+            count = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(count),
+                    member,
+                },
+                self.span_from(start),
+            );
+        }
+        count
+    }
+
     fn parse_sva_delay_range(&mut self, start: usize) -> Expression {
         let mk_num = |this: &Self, v: &str| {
             Expression::new(
