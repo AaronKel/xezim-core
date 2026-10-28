@@ -517,6 +517,45 @@ impl Preprocessor {
         matches!(it.next(), Some("end_protected") | Some("end"))
     }
 
+    /// Whether a `` `define `` line opens a formal argument list (a `(` right
+    /// after the macro name, §22.5.1) that the line does not close.
+    fn define_formals_open(line: &str) -> bool {
+        let Some(rest) = fast_trim_start(line).strip_prefix("`define") else {
+            return false;
+        };
+        let rest = rest.trim_start();
+        let name_len = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .unwrap_or(rest.len());
+        let Some(list) = rest[name_len..].strip_prefix('(') else {
+            return false;
+        };
+        let mut depth = 1i32;
+        let mut in_str = false;
+        let mut prev = ' ';
+        for c in list.chars() {
+            if in_str {
+                if c == '"' && prev != '\\' {
+                    in_str = false;
+                }
+            } else {
+                match c {
+                    '"' => in_str = true,
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            prev = c;
+        }
+        true
+    }
+
     fn is_directive(trimmed: &str, name: &str) -> bool {
         if let Some(rest) = trimmed
             .strip_prefix('`')
@@ -1183,6 +1222,20 @@ impl Preprocessor {
                 // For the directive, we want to strip the \ and the newline
                 let mut clean_line = String::new();
                 let mut current = line.to_string();
+                // §22.5.1 / §5.2: the formal argument list may span lines
+                // (`\`define M(a,` then `b) body`): white space includes
+                // newlines, and no backslash is needed inside the list. The
+                // header ended at the first line, so `b)` was read as code
+                // (#606). Join lines until the list closes.
+                while Self::define_formals_open(&current) && !current.trim_end().ends_with('\\') {
+                    let Some((next_li, next)) = lines.next() else {
+                        break;
+                    };
+                    current.push(' ');
+                    current.push_str(next);
+                    consumed_lines += 1;
+                    continuation.push(next_li);
+                }
 
                 loop {
                     let text = current.as_str();
