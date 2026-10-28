@@ -492,6 +492,10 @@ impl Parser {
                 if l_bp < min_bp {
                     break;
                 }
+                let until_with = matches!(
+                    self.current_kind(),
+                    TokenKind::KwUntil_with | TokenKind::KwS_until_with
+                );
                 self.bump();
 
                 // Ternary operator
@@ -534,7 +538,26 @@ impl Parser {
                     continue;
                 }
 
-                let rhs = self.parse_expr_bp_ctx(r_bp, no_arrow);
+                let mut rhs = self.parse_expr_bp_ctx(r_bp, no_arrow);
+                // §16.12.12: `p until_with q` is `p until (p and q)` (and
+                // `s_until_with` likewise from `s_until`): `p` must also hold
+                // in the cycle `q` does. Boolean operands keep a Boolean
+                // `&&`; a temporal one takes the property `and`.
+                if until_with {
+                    let and = if Self::sva_temporal_ast(&lhs) || Self::sva_temporal_ast(&rhs) {
+                        BinaryOp::SvaAnd
+                    } else {
+                        BinaryOp::LogAnd
+                    };
+                    rhs = Expression::new(
+                        ExprKind::Binary {
+                            op: and,
+                            left: Box::new(lhs.clone()),
+                            right: Box::new(rhs),
+                        },
+                        self.span_from(start),
+                    );
+                }
                 lhs = Expression::new(
                     ExprKind::Binary {
                         op,
@@ -2912,6 +2935,39 @@ impl Parser {
         )
     }
 
+    /// Whether an expression uses a sequence or property operator, so an
+    /// `and` built over it must be the property `and` (§16.12.12).
+    fn sva_temporal_ast(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Binary { op, left, right } => {
+                matches!(
+                    op,
+                    BinaryOp::HashHash
+                        | BinaryOp::SeqAnd
+                        | BinaryOp::Throughout
+                        | BinaryOp::Within
+                        | BinaryOp::Until
+                        | BinaryOp::SUntil
+                        | BinaryOp::Intersect
+                        | BinaryOp::SvaAnd
+                        | BinaryOp::SeqOr
+                        | BinaryOp::OrMinusArrow
+                        | BinaryOp::OrFatArrow
+                ) || Self::sva_temporal_ast(left)
+                    || Self::sva_temporal_ast(right)
+            }
+            ExprKind::Unary { op, operand } => {
+                matches!(
+                    op,
+                    UnaryOp::HashHash | UnaryOp::SEventually | UnaryOp::SAlways
+                ) || Self::sva_temporal_ast(operand)
+            }
+            ExprKind::Paren(x) => Self::sva_temporal_ast(x),
+            ExprKind::SystemCall { name, .. } => name.starts_with("$sva_"),
+            _ => false,
+        }
+    }
+
     fn infix_bp(&self, no_arrow: bool) -> Option<(BinaryOp, u8, u8)> {
         let kind = self.current_kind();
         match kind {
@@ -2932,6 +2988,10 @@ impl Parser {
             TokenKind::KwWithin => Some((BinaryOp::Within, 2, 3)),
             TokenKind::KwUntil => Some((BinaryOp::Until, 2, 3)),
             TokenKind::KwS_until => Some((BinaryOp::SUntil, 2, 3)),
+            // §16.12.12 `until_with` / `s_until_with`: rewritten to
+            // `until` / `s_until` over `(left and right)` by the infix loop.
+            TokenKind::KwUntil_with => Some((BinaryOp::Until, 2, 3)),
+            TokenKind::KwS_until_with => Some((BinaryOp::SUntil, 2, 3)),
             TokenKind::KwIntersect => Some((BinaryOp::Intersect, 4, 5)),
             // §16.9 sequence `and`/`or` — only inside a property/sequence body
             // (the `in_sva_seq` flag), else `or` is an event-list separator and
