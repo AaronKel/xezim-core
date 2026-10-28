@@ -769,6 +769,10 @@ pub struct CoverBin {
     /// while the guard is false.
     #[cfg_attr(feature = "serde", serde(default))]
     pub iff_guard: Option<Expression>,
+    /// LRM §19.5.1.1 `bins b[] = {..} with (expr);` — only the values for
+    /// which `expr` holds, with `item` bound to the value, are in the bin.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub with_filter: Option<Expression>,
 }
 
 /// One step of a §19.5.2 transition: a value set (`1, [3:4]`) with an

@@ -5556,6 +5556,16 @@ impl Parser {
                                     // the terminating `;` (depth-aware).
                                     self.skip_bin_body_to_semicolon();
                                 }
+                                // §19.5.1.1: `with (expr)` filters the bin's
+                                // values; it comes before any `iff` (#611).
+                                let with_filter = if self.eat(TokenKind::KwWith).is_some() {
+                                    self.expect(TokenKind::LParen);
+                                    let f = self.parse_expression();
+                                    self.expect(TokenKind::RParen);
+                                    Some(f)
+                                } else {
+                                    None
+                                };
                                 // §19.5: `iff (expr)` after the bin's values.
                                 // Unparsed, its tokens were skipped one by one
                                 // and the guard was lost, or tripped the
@@ -5570,6 +5580,7 @@ impl Parser {
                                 };
                                 bins.push(crate::ast::decl::CoverBin {
                                     iff_guard,
+                                    with_filter,
                                     name: bin_name,
                                     kind: bin_kind,
                                     values,

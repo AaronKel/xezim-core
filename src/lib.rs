@@ -178,7 +178,8 @@ pub use value::Value;
 /// \x2f = \x2e + the row dimensions of those arrays (§7.8, §7.10).
 /// \x30 = \x2f + the row dimensions of such class members (§7.8).
 /// \x31 = \x30 + the `iff` guard of a covergroup bin (§19.5).
-/// \x32 = \x31 + the net kind of a package net (§26.2).
+/// \x32 = \x31 + the net kind of a package net (§26.2) and the `with` filter of
+/// a covergroup bin (§19.5.1.1).
 pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x32";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
