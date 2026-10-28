@@ -1247,6 +1247,11 @@ pub struct ElaboratedClass {
     /// tail the way a module-scope declaration of the same shape is shaped.
     #[serde(default)]
     pub dynamic_tail_properties: HashMap<String, Vec<UnpackedDimension>>,
+    /// §7.8: associative-array members whose elements are themselves
+    /// unpacked collections (`int m [C][int]`, `int q [int][$]`); see
+    /// `ElaboratedModule::assoc_coll_elems`.
+    #[serde(default)]
+    pub assoc_coll_properties: HashSet<String>,
     /// §7.4.2 / §20.7: the DECLARED `(left, right)` bounds of every unpacked
     /// dimension of a fixed-size array member with at least one descending
     /// dimension (`int ds[3:1]`). `array_properties` / `array_nd_properties`
@@ -2083,6 +2088,7 @@ fn elaborate_class_in_scope(
         HashMap::default();
     let mut dynamic_assoc_properties: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut dynamic_tail_properties: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
+    let mut assoc_coll_properties: HashSet<String> = HashSet::default();
     let mut array_prop_decl_dims: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
     let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
@@ -2359,6 +2365,13 @@ fn elaborate_class_in_scope(
                         {
                             dynamic_tail_properties
                                 .insert(decl.name.name.clone(), effective_dims[1..].to_vec());
+                        }
+                        if matches!(
+                            effective_dims.first(),
+                            Some(UnpackedDimension::Associative { .. })
+                        ) && effective_dims.len() > 1
+                        {
+                            assoc_coll_properties.insert(decl.name.name.clone());
                         }
                         // §8.25: a fixed array sized by a header VALUE
                         // parameter (`int items[N]`) is a fixed array in every
@@ -3125,6 +3138,7 @@ fn elaborate_class_in_scope(
         array_of_coll_properties,
         dynamic_assoc_properties,
         dynamic_tail_properties,
+        assoc_coll_properties,
         array_prop_decl_dims,
     }
 }
