@@ -528,34 +528,96 @@ impl Preprocessor {
         }
     }
 
-    /// Update the design-element nesting depth from one source line. Opening
-    /// keywords increment; `end…` keywords decrement (floored at 0).
+    /// Update the design-element nesting depth from one source line. An
+    /// opening keyword counts as the line's first word or right after a
+    /// closing one (`endmodule module b;`); every closing `end…` keyword on
+    /// the line counts (floored at 0), so `module m; endmodule` on one line
+    /// opens and closes (§22.3 `\`resetall` after it is legal). Comments and
+    /// string literals are skipped; `interface class` is a class (§8.26).
     fn update_design_depth(trimmed: &str, depth: &mut i32) {
-        // The leading word, scanned bytewise while it stays ASCII.
-        let b = trimmed.as_bytes();
-        let n = b
-            .iter()
-            .position(|&c| !(c.is_ascii_alphanumeric() || c == b'_'))
-            .unwrap_or(b.len());
-        let first = if n < b.len() && b[n] >= 0x80 {
-            trimmed
-                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .next()
-                .unwrap_or("")
-        } else {
-            &trimmed[..n]
+        let code = Self::strip_line_comments_and_strings(trimmed);
+        let words: Vec<&str> = code
+            .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        let is_open = |w: &str| {
+            matches!(
+                w,
+                "module"
+                    | "macromodule"
+                    | "interface"
+                    | "package"
+                    | "program"
+                    | "primitive"
+                    | "checker"
+            )
         };
-        match first {
-            "module" | "macromodule" | "interface" | "package" | "program" | "primitive"
-            | "checker" => *depth += 1,
-            "endmodule" | "endinterface" | "endpackage" | "endprogram" | "endprimitive"
-            | "endchecker" => {
+        let is_close = |w: &str| {
+            matches!(
+                w,
+                "endmodule"
+                    | "endinterface"
+                    | "endpackage"
+                    | "endprogram"
+                    | "endprimitive"
+                    | "endchecker"
+            )
+        };
+        let mut prev_close = true; // the line start counts as an opener slot
+        for (i, w) in words.iter().enumerate() {
+            if is_close(w) {
                 if *depth > 0 {
                     *depth -= 1;
                 }
+                prev_close = true;
+                continue;
             }
-            _ => {}
+            if prev_close
+                && is_open(w)
+                && !(*w == "interface" && words.get(i + 1) == Some(&"class"))
+            {
+                *depth += 1;
+            }
+            prev_close = false;
         }
+    }
+
+    /// `line` without `//` and `/* … */` comments and the contents of string
+    /// literals, for keyword scanning.
+    fn strip_line_comments_and_strings(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let b = line.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => break,
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                        i += 1;
+                    }
+                    i += 2;
+                    out.push(' ');
+                }
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        if b[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                    out.push(' ');
+                }
+                _ => {
+                    let ch = line[i..].chars().next().unwrap_or(' ');
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+        out
     }
 
     /// §22.12: validate `\`line <number> "<filename>" <level>`.
