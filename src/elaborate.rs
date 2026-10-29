@@ -5632,6 +5632,8 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     // package's own params for its own typedefs get a bounded
                     // overlay in the hoist loop below.
                     alias_pkg_param(elab, &p.name.name, &assign.name.name, &v);
+                    let scoped = format!("{}.{}", p.name.name, assign.name.name);
+                    register_pkg_param_elem(elab, "", &scoped, data_type);
                 }
             }
             restore_overlay(elab, pkg_overlay);
@@ -8472,6 +8474,8 @@ pub fn elaborate_module_with_defs(
                                     );
                                 }
                                 alias_pkg_param(&mut elab, &p.name.name, &assign.name.name, &v);
+                                let scoped = format!("{}.{}", p.name.name, assign.name.name);
+                                register_pkg_param_elem(&mut elab, "", &scoped, data_type);
                                 params_insert_traced(
                                     &mut elab.parameters,
                                     line!(),
@@ -24164,6 +24168,34 @@ fn alias_pkg_param(elab: &mut ElaboratedModule, pkg: &str, name: &str, v: &Value
     }
 }
 
+/// IEEE 1800-2017 §7.4.5: a package parameter of a packed multi-dimensional
+/// type (`parameter logic [15:0][3:0] P`) gets the element registration a
+/// module parameter gets, so `P[i]` and `pkg::P[i]` select an element instead
+/// of one bit of the flat vector.
+fn register_pkg_param_elem(
+    elab: &mut ElaboratedModule,
+    pkg: &str,
+    name: &str,
+    data_type: &DataType,
+) {
+    // The bytecode compiler spells a scoped reference `pkg.name`.
+    let mut keys = vec![name.to_string()];
+    if !pkg.is_empty() {
+        keys.push(format!("{pkg}.{name}"));
+    }
+    if let Some(ew) = packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs) {
+        for k in &keys {
+            elab.packed_signal_elem_widths.insert(k.clone(), ew);
+            tls_register_elem_w(k, ew);
+        }
+    }
+    if let Some(fdims) = packed_full_dims_of(data_type, &elab.parameters) {
+        for k in keys {
+            elab.packed_full_dims.insert(k, fdims.clone());
+        }
+    }
+}
+
 /// §26.2.2 / §26.3: an imported array retains its element environment and
 /// shape under both the visible declaration name and the qualified name.
 fn register_visible_array_param(
@@ -26840,6 +26872,21 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             if let Some(elem) = const_packed_array_elem(base, &base_val, idx, params) {
                 return elem;
             }
+            // `pkg::P[i]` parses as a member access on the package name.
+            if let ExprKind::MemberAccess { expr, member } = &base.kind
+                && let ExprKind::Ident(pkg) = &expr.kind
+                && let [seg] = pkg.path.as_slice()
+                && let Some(elem_w) = PACKED_ELEM_W_TLS.with(|c| {
+                    c.borrow()
+                        .get(&format!("{}.{}", seg.name.name, member.name))
+                        .copied()
+                })
+            {
+                let lo = (idx as u32).saturating_mul(elem_w);
+                if lo + elem_w <= base_val.width {
+                    return base_val.range_select((lo + elem_w - 1) as usize, lo as usize);
+                }
+            }
             let i = idx as usize;
             if (i as u32) < base_val.width {
                 base_val.range_select(i, i)
@@ -29409,6 +29456,8 @@ fn inline_instantiations_inner(
                                                 );
                                             }
                                             alias_pkg_param(elab, name, &assign.name.name, &v);
+                                            let scoped = format!("{name}.{}", assign.name.name);
+                                            register_pkg_param_elem(elab, "", &scoped, data_type);
                                             params_insert_traced(
                                                 &mut elab.parameters,
                                                 line!(),
@@ -47141,6 +47190,12 @@ fn process_import(
                                             false,
                                         );
                                         alias_pkg_param(elab, pkg_name, &assign.name.name, &v);
+                                        register_pkg_param_elem(
+                                            elab,
+                                            pkg_name,
+                                            &assign.name.name,
+                                            data_type,
+                                        );
                                         params_insert_traced(
                                             &mut elab.parameters,
                                             line!(),
@@ -47557,6 +47612,12 @@ fn process_import(
                                             false,
                                         );
                                         alias_pkg_param(elab, pkg_name, &assign.name.name, &v);
+                                        register_pkg_param_elem(
+                                            elab,
+                                            pkg_name,
+                                            &assign.name.name,
+                                            data_type,
+                                        );
                                         params_insert_traced(
                                             &mut elab.parameters,
                                             line!(),
