@@ -12692,11 +12692,18 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
     let mut attach = |class_name: String, method_name: String, kind: ClassMethodKind, span: _| {
         // §8.24/§8.23: `outer::inner::m` names the nested class, which is
         // registered both under its chain and its own name: attach to each.
+        // The bare key may hold another class — a top-level `class inner`
+        // (`pkg_scope` then renames this one `outer::inner`) or a `B::inner`
+        // registered first — so attach there only when it is enclosed by
+        // the same class as the chained one.
         let mut keys: Vec<String> = vec![class_name.clone()];
-        if let Some(last) = class_name.rsplit("::").next()
-            && last != class_name
-        {
-            keys.push(last.to_string());
+        if let Some((_, last)) = class_name.rsplit_once("::") {
+            let enclosing = |key: &str| elab.classes.get(key).map(|c| c.enclosing.clone());
+            if let Some(Some(outer)) = enclosing(&class_name)
+                && enclosing(last) == Some(Some(outer))
+            {
+                keys.push(last.to_string());
+            }
         }
         for key in keys {
             let Some(cls) = elab.classes.get_mut(&key).map(std::sync::Arc::make_mut) else {
@@ -47911,6 +47918,65 @@ mod generated_instance_tests {
                 })
                 .collect();
             assert_eq!(names, expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod nested_class_method_tests {
+    use super::*;
+
+    /// Whether `class`'s method `m` carries the out-of-block body
+    /// (`function int x::inner::m()`, a scoped name) rather than its own.
+    fn linked_out_of_block(elab: &ElaboratedModule, class: &str) -> bool {
+        match &elab.classes[class].methods["m"].kind {
+            crate::ast::decl::ClassMethodKind::Function(f) => f.name.has_scope(),
+            _ => panic!("{class}::m is not a function"),
+        }
+    }
+
+    /// §8.24/§8.23: an out-of-block `outer::inner::m` attaches to that nested
+    /// class only — not to a top-level `class inner` or another class's
+    /// `inner`, whichever holds the bare name `inner`.
+    #[test]
+    fn nested_method_attaches_only_to_its_own_class() {
+        for (source, expected) in [
+            (
+                "class inner; function int m(); return 1; endfunction endclass
+                 class outer; class inner; extern function int m(); endclass endclass
+                 function int outer::inner::m(); return 2; endfunction
+                 module t; endmodule",
+                &[("outer::inner", true), ("inner", false)][..],
+            ),
+            (
+                "class a; class inner; function int m(); return 1; endfunction endclass endclass
+                 class b; class inner; extern function int m(); endclass endclass
+                 function int b::inner::m(); return 2; endfunction
+                 module t; endmodule",
+                &[("b::inner", true), ("a::inner", false)][..],
+            ),
+            (
+                "class outer; class inner; extern function int m(); endclass endclass
+                 function int outer::inner::m(); return 2; endfunction
+                 module t; endmodule",
+                &[("outer::inner", true), ("inner", true)][..],
+            ),
+        ] {
+            let (_, elab) = crate::parse_and_elaborate_multi(
+                &[source.to_string()],
+                Some("t"),
+                &[],
+                &["t.sv".to_string()],
+                &[],
+            )
+            .expect("elaborate");
+            for &(class, linked) in expected {
+                assert_eq!(
+                    linked_out_of_block(&elab, class),
+                    linked,
+                    "{class}: {source}"
+                );
+            }
         }
     }
 }
