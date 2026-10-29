@@ -35801,6 +35801,14 @@ fn inline_module_items(
                                     data_type,
                                     &snapshot,
                                 ) {
+                                    // A child override `.R(R)` evaluates the
+                                    // name in this local env.
+                                    if let Some(whole) =
+                                        elab.parameters.get(&cat2(&inst_prefix, &assign.name.name))
+                                    {
+                                        sub_local_params
+                                            .insert(assign.name.name.clone(), whole.clone());
+                                    }
                                     continue;
                                 }
                             }
@@ -36312,7 +36320,7 @@ fn inline_module_items(
                         } else {
                             None
                         };
-                        array_params::register(
+                        if array_params::register(
                             elab,
                             &inst_prefix,
                             &assign.name.name,
@@ -36326,7 +36334,11 @@ fn inline_module_items(
                             } else {
                                 &snapshot
                             },
-                        );
+                        ) && let Some(whole) =
+                            elab.parameters.get(&cat2(&inst_prefix, &assign.name.name))
+                        {
+                            sub_local_params.insert(assign.name.name.clone(), whole.clone());
+                        }
                     }
                 }
 
