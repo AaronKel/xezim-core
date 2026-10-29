@@ -834,7 +834,10 @@ impl Preprocessor {
                 self.add_include_dir(parent);
             }
         }
-        let stripped = self.strip_comments(source);
+        let name = source_path
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let stripped = self.strip_file_comments(source, &name);
         let (resolved, origins) = self.resolve_directives(
             &stripped,
             source_path,
@@ -852,7 +855,7 @@ impl Preprocessor {
         // directive from a previous file in the same process doesn't
         // pollute this one.
         crate::set_default_nettype_none_seen(false);
-        let stripped = self.strip_comments(source);
+        let stripped = self.strip_file_comments(source, "");
         let (resolved, origins) = self.resolve_directives(
             &stripped,
             None,
@@ -881,6 +884,91 @@ impl Preprocessor {
     /// returned: which file, line and column each of its lines came from.
     pub fn take_line_map(&mut self) -> Option<LineMap> {
         self.last_map.take()
+    }
+
+    /// `strip_comments` of one file's text, `path` naming it in warnings,
+    /// with the opt-in source relaxations applied: a NUL byte read as a
+    /// space (XEZIM_RELAX_NUL_BYTES, #628) and white space between a
+    /// backtick and a name removed (XEZIM_RELAX_MACRO_SPACE, #627).
+    fn strip_file_comments(&self, source: &str, path: &str) -> String {
+        let warn = |n: usize, what: &str, clause: &str, var: &str| {
+            eprintln!(
+                "{path}: warning: {n} {what} (IEEE 1800-2017 {clause}, {var})",
+                path = if path.is_empty() { "<input>" } else { path }
+            );
+        };
+        let nuls = if crate::RELAX_NUL_BYTES.get() {
+            source.bytes().filter(|&b| b == 0).count()
+        } else {
+            0
+        };
+        let stripped = if nuls > 0 {
+            warn(
+                nuls,
+                "NUL byte(s) read as white space",
+                "§5.3",
+                "XEZIM_RELAX_NUL_BYTES",
+            );
+            self.strip_comments(&source.replace('\0', " "))
+        } else {
+            self.strip_comments(source)
+        };
+        if !crate::RELAX_MACRO_SPACE.get() || !stripped.contains('`') {
+            return stripped;
+        }
+        let (joined, spaced) = Self::join_spaced_backticks(&stripped);
+        if spaced > 0 {
+            warn(
+                spaced,
+                "backtick(s) followed by white space read as a macro usage or directive",
+                "§22.5.1",
+                "XEZIM_RELAX_MACRO_SPACE",
+            );
+        }
+        joined
+    }
+
+    /// The text with the blanks and tabs removed between a backtick and the
+    /// name that follows it, outside string literals, and how many there
+    /// were. A `` `` `` paste is left as it is.
+    fn join_spaced_backticks(text: &str) -> (String, usize) {
+        let b = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut count = 0;
+        let mut in_str = false;
+        let mut seg = 0;
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'\\' if in_str => i += 1,
+                b'"' if i == 0 || b[i - 1] != b'`' => in_str = !in_str,
+                b'\n' => in_str = false,
+                b'`' if !in_str => {
+                    if b.get(i + 1) == Some(&b'`') {
+                        i += 2;
+                        continue;
+                    }
+                    let mut j = i + 1;
+                    while matches!(b.get(j), Some(b' ' | b'\t')) {
+                        j += 1;
+                    }
+                    if j > i + 1
+                        && b.get(j)
+                            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+                    {
+                        out.push_str(&text[seg..=i]);
+                        seg = j;
+                        count += 1;
+                        i = j;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out.push_str(&text[seg..]);
+        (out, count)
     }
 
     fn strip_comments(&self, source: &str) -> String {
@@ -1431,7 +1519,10 @@ impl Preprocessor {
                             }) {
                                 Ok(contents) => {
                                     self.include_depth += 1;
-                                    let stripped = self.strip_comments(&contents);
+                                    let stripped = self.strip_file_comments(
+                                        &contents,
+                                        &resolved.display().to_string(),
+                                    );
                                     let site = (here.file, here.line);
                                     let (included, origins) = self.resolve_directives(
                                         &stripped,
