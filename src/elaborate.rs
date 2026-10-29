@@ -9566,9 +9566,11 @@ pub fn elaborate_module_with_defs(
                             "variable/net",
                         )
                     {
-                        // §26.3: local decl shadows the wildcard-imported name.
+                        // §26.3: local decl shadows the wildcard-imported name,
+                        // so an imported package net's kind goes too (#610).
                         elab.signals.remove(&decl.name.name);
                         elab.parameters.remove(&decl.name.name);
+                        unregister_net_type(&mut elab, &decl.name.name);
                     } else if elab.signals.contains_key(&decl.name.name)
                         || elab.parameters.contains_key(&decl.name.name)
                     {
@@ -29449,10 +29451,14 @@ fn inline_instantiations_inner(
                         crate::ast::decl::PackageItem::Data(dd) => {
                             // §26.2: a package net is registered as a net, so a
                             // supply net reads its constant and a wired net
-                            // resolves its drivers (#610).
+                            // resolves its drivers (#610). The bare name is the
+                            // net only where no local declaration displaces it
+                            // (§26.3): a module's own `logic w` stays a variable.
                             if let Some(nt) = dd.net_type {
                                 for decl in &dd.declarators {
-                                    register_net_type(elab, &decl.name.name, nt);
+                                    if !elab.local_decl_displaces(&decl.name.name) {
+                                        register_net_type(elab, &decl.name.name, nt);
+                                    }
                                     register_net_type(
                                         elab,
                                         &format!("{}::{}", name, decl.name.name),
@@ -42751,7 +42757,8 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // §26.2: a package net driven by its qualified name (`assign
     // nets::w = ...`, a port connected to `nets::w`) is the hoisted bare net
     // `w`. Spelled `nets.w` its drivers were never counted together, so a
-    // `wand` kept the last write (#610).
+    // `wand` kept the last write (#610). Not when a local declaration
+    // displaces the bare name (`local_decl_displaces`): that is another net.
     if !elab.packages.is_empty() {
         for ca in elab.continuous_assigns.iter_mut() {
             if let ExprKind::Ident(h) = &ca.lhs.kind
@@ -42764,7 +42771,10 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                     .contains(&format!("{}::{}", h.path[0].name.name, h.path[1].name.name))
             {
                 let bare = h.path[1].name.name.clone();
-                if elab.nets.contains(&bare) {
+                if elab.nets.contains(&bare)
+                    && !elab.wildcard_shadowed.contains(&bare)
+                    && !elab.foreign_package_names.contains(&bare)
+                {
                     ca.lhs = make_ident_expr(&bare);
                 }
             }
@@ -47463,10 +47473,14 @@ fn process_import(
                         PackageItem::Data(dd) => {
                             // §26.2: a package net is registered as a net, so a
                             // supply net reads its constant and a wired net
-                            // resolves its drivers (#610).
+                            // resolves its drivers (#610). The bare name is the
+                            // net only where no local declaration displaces it
+                            // (§26.3): a module's own `logic w` stays a variable.
                             if let Some(nt) = dd.net_type {
                                 for decl in &dd.declarators {
-                                    register_net_type(elab, &decl.name.name, nt);
+                                    if !elab.local_decl_displaces(&decl.name.name) {
+                                        register_net_type(elab, &decl.name.name, nt);
+                                    }
                                     register_net_type(
                                         elab,
                                         &format!("{}::{}", pkg_name, decl.name.name),
@@ -47977,6 +47991,60 @@ mod nested_class_method_tests {
                     "{class}: {source}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod package_net_tests {
+    /// §26.2, §26.3: a package net is a net under its qualified name, and
+    /// under its bare name unless a local declaration displaces that name —
+    /// a module's own `logic w` is not the unimported (or shadowed) `pkg::w`.
+    #[test]
+    fn package_net_bare_name_yields_to_a_local_declaration() {
+        for (source, bare_is_net) in [
+            // Not imported: the bare name is the module's variable.
+            (
+                "package nets; wand w; supply1 s; endpackage
+                 module t; logic w, s; initial begin w = 0; s = 0; end endmodule",
+                false,
+            ),
+            // Wildcard-imported but shadowed by the local declaration.
+            (
+                "package nets; wand w; supply1 s; endpackage
+                 module t; import nets::*; logic w, s; endmodule",
+                false,
+            ),
+            (
+                "package nets; wand w; supply1 s; endpackage
+                 module t; logic w, s; import nets::*; endmodule",
+                false,
+            ),
+            // Referenced only qualified: the bare name is the package's net.
+            (
+                "package nets; wand w; supply1 s; endpackage
+                 module t; assign nets::w = 1'b1; assign nets::w = 1'b0;
+                 initial $display(nets::w, nets::s); endmodule",
+                true,
+            ),
+        ] {
+            let (_, elab) = crate::parse_and_elaborate_multi(
+                &[source.to_string()],
+                Some("t"),
+                &[],
+                &["t.sv".to_string()],
+                &[],
+            )
+            .expect("elaborate");
+            assert!(elab.nets.contains("nets::w"), "{source}");
+            assert!(elab.supply_nets.contains("nets::s"), "{source}");
+            assert_eq!(elab.nets.contains("w"), bare_is_net, "{source}");
+            assert_eq!(
+                elab.resolved_net_kinds.contains_key("w"),
+                bare_is_net,
+                "{source}"
+            );
+            assert_eq!(elab.supply_nets.contains("s"), bare_is_net, "{source}");
         }
     }
 }
