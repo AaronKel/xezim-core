@@ -19280,6 +19280,10 @@ fn lsdd_expr(e: &mut Expression, env: &HashMap<String, Value>) {
 }
 
 /// Replace a single delay expression with its tick-count equivalent.
+/// The elaborated form of a `1step` delay value (§3.14.3): one global tick,
+/// not rounded to the running scope's precision.
+pub const ONE_STEP_DELAY: &str = "$__xz_one_step";
+
 fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64) {
     use crate::ast::expr::NumberLiteral;
     // §3.14.3: a delay rounds to the DECLARING scope's time precision.
@@ -19299,6 +19303,22 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64)
         }
     };
     match &d.kind {
+        // §3.14.3 / A.2.2.3: `1step` is the global time precision, one tick,
+        // whatever the scope's own unit and precision (#615).
+        ExprKind::Ident(h)
+            if h.path.len() == 1 && h.path[0].name.name == crate::ast::decl::CLOCKING_ONE_STEP =>
+        {
+            // The runtime rounds a delay to the running scope's precision;
+            // a step is exempt, so it stays a marker the simulator reads as
+            // one unrounded tick.
+            *d = Expression::new(
+                ExprKind::SystemCall {
+                    name: ONE_STEP_DELAY.to_string(),
+                    args: Vec::new(),
+                },
+                d.span,
+            );
+        }
         ExprKind::Number(NumberLiteral::Time(s)) => {
             // Absolute time literal → ticks, on the precision grid.
             let ticks = quant(*s / tick_s);
@@ -25719,6 +25739,8 @@ fn const_eval_in_real_context(e: &Expression, params: &HashMap<String, Value>) -
 
 fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Value {
     let res = match &expr.kind {
+        // §3.14.3: an elaborated `1step` delay is one tick.
+        ExprKind::SystemCall { name, .. } if name == ONE_STEP_DELAY => Value::from_u64(1, 64),
         // §25.5: a parameter reached through an interface PORT formal
         // (`c.DEPTH`) parses as MemberAccess; the child's param map carries
         // it under the dotted spelling (seeded at inlining). Without this

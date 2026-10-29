@@ -69,8 +69,50 @@ pub struct Parser {
 }
 
 impl Parser {
+    /// A.2.2.3 `delay_value ::= ... | 1step`: the lexer reads `1` and an
+    /// adjacent `step`. Right after `#` or inside `#( )` they are one delay
+    /// value, the global time precision (§3.14.3): rejoin them as the
+    /// identifier `1step`, which no source identifier can spell, so every
+    /// delay form (`#1step;`, `a = #1step b;`, `assign #1step y = x;`, a gate
+    /// delay, a clocking skew) reads it alike. Anywhere else (`x = 1step;`)
+    /// they stay apart, an error. It was a delay of 1 and a stray `step`
+    /// (#615).
+    fn join_one_step(mut tokens: Vec<Token>) -> Vec<Token> {
+        let mut i = 1;
+        while i + 1 < tokens.len() {
+            let joinable = tokens[i].kind == TokenKind::IntegerLiteral
+                && tokens[i].text == "1"
+                && tokens[i + 1].kind == TokenKind::Identifier
+                && tokens[i + 1].text == "step"
+                && tokens[i + 1].span.start == tokens[i].span.end
+                && (tokens[i - 1].kind == TokenKind::Hash
+                    || (tokens[i - 1].kind == TokenKind::LParen
+                        && i >= 2
+                        && tokens[i - 2].kind == TokenKind::Hash
+                        && tokens.get(i + 2).is_some_and(|t| t.kind == TokenKind::RParen))
+                    // xezim canonicalizes `a = #d b;` to the internal call
+                    // `$__xz_intra_delay(d, b)` before parsing.
+                    || (tokens[i - 1].kind == TokenKind::LParen
+                        && i >= 2
+                        && tokens[i - 2].text == "$__xz_intra_delay"
+                        && tokens.get(i + 2).is_some_and(|t| t.kind == TokenKind::Comma)));
+            if joinable {
+                let end = tokens[i + 1].span.end;
+                let step = tokens.remove(i + 1);
+                let one = &mut tokens[i];
+                one.kind = TokenKind::Identifier;
+                one.text = crate::ast::decl::CLOCKING_ONE_STEP.to_string();
+                one.span.end = end;
+                let _ = step;
+            }
+            i += 1;
+        }
+        tokens
+    }
+
     pub fn new(tokens: Vec<Token>) -> Self {
         crate::record_reference_census(&tokens);
+        let tokens = Self::join_one_step(tokens);
         Self {
             tokens,
             pos: 0,
