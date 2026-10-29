@@ -5744,7 +5744,33 @@ impl Parser {
                 self.bump();
                 let mut ids = Vec::new();
                 loop {
-                    ids.push(self.parse_identifier());
+                    let mut id = self.parse_identifier();
+                    // XEZIM_RELAX_CROSS_HIER_ITEM (#629): a cross item is a
+                    // coverpoint label or a variable (A.2.11); read a
+                    // hierarchical reference (`vif.mode`) as a variable too,
+                    // kept as its dotted name for an implicit coverpoint.
+                    if self.at(TokenKind::Dot)
+                        && self.peek_kind() == TokenKind::Identifier
+                        && crate::RELAX_CROSS_HIER_ITEM.get()
+                    {
+                        while self.at(TokenKind::Dot) && self.peek_kind() == TokenKind::Identifier {
+                            self.bump();
+                            let next = self.parse_identifier();
+                            id.name = format!("{}.{}", id.name, next.name);
+                            id.span = crate::ast::Span::new(id.span.start, next.span.end);
+                        }
+                        self.diagnostics
+                            .push(crate::diagnostics::Diagnostic::warning(
+                                format!(
+                                    "a cross item is a coverpoint or a variable; '{}' gets an \
+                                     implicit coverpoint (IEEE 1800-2017 §19.6, A.2.11, \
+                                     XEZIM_RELAX_CROSS_HIER_ITEM)",
+                                    id.name
+                                ),
+                                id.span,
+                            ));
+                    }
+                    ids.push(id);
                     if !self.at(TokenKind::Comma) {
                         break;
                     }
