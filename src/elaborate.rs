@@ -16336,6 +16336,72 @@ fn collect_implicit_net_candidates(expr: &Expression, out: &mut Vec<String>) {
     }
 }
 
+/// §23.8: inside module or interface `own`, a name whose head is `own`
+/// itself (`parent_if.kids[0].clk` in `parent_if`) is resolved upward to the
+/// nearest scope with that definition name: this instance. A continuous
+/// assign binds its target and its operands' sensitivity at elaboration,
+/// where that head named no signal — the target drove nothing and an
+/// operand never woke the assign — so drop it from every name in `e`.
+/// Procedural code resolves it at run time.
+fn strip_own_definition_head(e: &mut Expression, own: &str) {
+    for_each_sub_expr_mut(e, &mut |e| {
+        let names_own = |e: &Expression| {
+            matches!(&e.kind, ExprKind::Ident(h) if h.root.is_none()
+                && h.path.len() == 1
+                && h.path[0].selects.is_empty()
+                && h.path[0].name.name == own)
+        };
+        let member = match &e.kind {
+            ExprKind::MemberAccess { expr, member } if names_own(expr) => Some(member.clone()),
+            _ => None,
+        };
+        if let Some(member) = member {
+            let mut bare = make_ident_expr(&member.name);
+            if let ExprKind::Ident(h) = &mut bare.kind {
+                h.path[0].name.span = member.span;
+                h.span = e.span;
+            }
+            bare.span = e.span;
+            *e = bare;
+        } else if let ExprKind::Ident(h) = &mut e.kind
+            && h.root.is_none()
+            && h.path.len() >= 2
+            && h.path[0].selects.is_empty()
+            && h.path[0].name.name == own
+        {
+            h.path.remove(0);
+        }
+    });
+}
+
+/// [`strip_own_definition_head`] over both sides of every continuous assign
+/// in `items`, through generate blocks.
+fn strip_own_definition_assign_targets(items: &mut [ModuleItem], own: &str) {
+    for it in items {
+        match it {
+            ModuleItem::ContinuousAssign(ca) => {
+                for (lhs, rhs) in &mut ca.assignments {
+                    strip_own_definition_head(lhs, own);
+                    strip_own_definition_head(rhs, own);
+                }
+            }
+            ModuleItem::GenerateRegion(r) => strip_own_definition_assign_targets(&mut r.items, own),
+            ModuleItem::GenerateIf(g) => {
+                for (_, b) in &mut g.branches {
+                    strip_own_definition_assign_targets(b, own);
+                }
+            }
+            ModuleItem::GenerateCase(g) => {
+                for arm in &mut g.arms {
+                    strip_own_definition_assign_targets(&mut arm.items, own);
+                }
+            }
+            ModuleItem::GenerateFor(g) => strip_own_definition_assign_targets(&mut g.items, own),
+            _ => {}
+        }
+    }
+}
+
 /// Collect all plain identifier names from an expression tree.
 fn collect_ident_names(expr: &Expression, out: &mut Vec<String>) {
     collect_ident_names_in(expr, out, true);
@@ -27560,6 +27626,109 @@ fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
     }
 }
 
+/// [`for_each_sub_expr`] with mutable access; `f` sees a node before its
+/// children, so it may replace the node it is given.
+fn for_each_sub_expr_mut(e: &mut Expression, f: &mut dyn FnMut(&mut Expression)) {
+    f(e);
+    match &mut e.kind {
+        ExprKind::Unary { operand, .. } => for_each_sub_expr_mut(operand, f),
+        ExprKind::Binary { left, right, .. } => {
+            for_each_sub_expr_mut(left, f);
+            for_each_sub_expr_mut(right, f);
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            for_each_sub_expr_mut(condition, f);
+            for_each_sub_expr_mut(then_expr, f);
+            for_each_sub_expr_mut(else_expr, f);
+        }
+        ExprKind::Concatenation(xs) | ExprKind::StreamOp { exprs: xs, .. } => {
+            for x in xs {
+                for_each_sub_expr_mut(x, f);
+            }
+        }
+        ExprKind::Replication { count, exprs } => {
+            for_each_sub_expr_mut(count, f);
+            for x in exprs {
+                for_each_sub_expr_mut(x, f);
+            }
+        }
+        ExprKind::AssignmentPattern(items) => {
+            for it in items {
+                match it {
+                    AssignmentPatternItem::Ordered(x)
+                    | AssignmentPatternItem::Named(_, x)
+                    | AssignmentPatternItem::Typed(_, x)
+                    | AssignmentPatternItem::Default(x) => for_each_sub_expr_mut(x, f),
+                    AssignmentPatternItem::Keyed(k, x) => {
+                        for_each_sub_expr_mut(k, f);
+                        for_each_sub_expr_mut(x, f);
+                    }
+                }
+            }
+        }
+        ExprKind::Call { func, args } => {
+            for_each_sub_expr_mut(func, f);
+            for a in args {
+                for_each_sub_expr_mut(a, f);
+            }
+        }
+        ExprKind::SystemCall { args, .. } => {
+            for a in args {
+                for_each_sub_expr_mut(a, f);
+            }
+        }
+        ExprKind::NamedArg { expr: Some(x), .. } => for_each_sub_expr_mut(x, f),
+        ExprKind::Inside { expr, ranges } => {
+            for_each_sub_expr_mut(expr, f);
+            for r in ranges {
+                for_each_sub_expr_mut(r, f);
+            }
+        }
+        ExprKind::MemberAccess { expr, .. }
+        | ExprKind::Specialization { base: expr, .. }
+        | ExprKind::Paren(expr)
+        | ExprKind::ShallowCopy { source: expr } => for_each_sub_expr_mut(expr, f),
+        ExprKind::Index { expr, index } => {
+            for_each_sub_expr_mut(expr, f);
+            for_each_sub_expr_mut(index, f);
+        }
+        ExprKind::RangeSelect {
+            expr, left, right, ..
+        } => {
+            for_each_sub_expr_mut(expr, f);
+            for_each_sub_expr_mut(left, f);
+            for_each_sub_expr_mut(right, f);
+        }
+        ExprKind::Range(a, b)
+        | ExprKind::AssignExpr {
+            lvalue: a,
+            rvalue: b,
+        } => {
+            for_each_sub_expr_mut(a, f);
+            for_each_sub_expr_mut(b, f);
+        }
+        ExprKind::WithClause { expr, filter } => {
+            for_each_sub_expr_mut(expr, f);
+            for_each_sub_expr_mut(filter, f);
+        }
+        ExprKind::RandomizeWith { call, .. } => for_each_sub_expr_mut(call, f),
+        ExprKind::SvaClocked { events, body } => {
+            for event in events {
+                for_each_sub_expr_mut(&mut event.expr, f);
+                if let Some(g) = &mut event.iff {
+                    for_each_sub_expr_mut(g, f);
+                }
+            }
+            for_each_sub_expr_mut(body, f);
+        }
+        _ => {}
+    }
+}
+
 /// Every name DECLARED anywhere in the design: ports, nets, variables,
 /// parameters, typedefs and their enum members, genvars, subroutines, class
 /// properties and methods, clocking/let/property/sequence/covergroup names —
@@ -32902,6 +33071,12 @@ fn prepare_module_items(
         }
     }
 
+    // §23.8: `<own definition name>.x` in a continuous assign is this
+    // instance's `x`.
+    // A local declaration of that name would be what the head names instead.
+    if !local_names.contains(source_def.name()) {
+        strip_own_definition_assign_targets(&mut effective_items, source_def.name());
+    }
     // IEEE 1800-2017 §6.10: a bare identifier on the LHS of a continuous
     // assign (or gate output) that has no explicit net declaration
     // implicitly declares a 1-bit net in this scope. Register such names in
