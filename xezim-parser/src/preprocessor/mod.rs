@@ -1007,6 +1007,9 @@ impl Preprocessor {
             ("`elsif", true),
             ("`endif", false),
             ("`else", false),
+            // §22.5.2: `undef names one macro; the text after it on the line
+            // is ordinary source, split off like a conditional's (#619).
+            ("`undef", true),
         ] {
             if let Some(rest) = s.strip_prefix(kw) {
                 // §22: the directive name is an identifier — it ends at the
@@ -2429,6 +2432,16 @@ impl Preprocessor {
         result
     }
 
+    /// Whether `text` holds a `` `define `` of `name`.
+    fn line_defines(text: &str, name: &str) -> bool {
+        text.match_indices("`define").any(|(i, d)| {
+            let rest = text[i + d.len()..].trim_start();
+            rest.strip_prefix(name).is_some_and(|after| {
+                !after.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$')
+            })
+        })
+    }
+
     fn expand_macros_once(&self, line: &str) -> String {
         let line_pasted;
         let line: &str = if line.contains("``") {
@@ -2637,7 +2650,12 @@ impl Preprocessor {
                     // reached the parser as literal text and produced ten
                     // "expected RParen, found Comma" errors that named neither
                     // the macro nor the reason.
-                    self.note_undefined_macro(macro_name);
+                    // A macro an expansion on this line defines (`` `define CUR n
+                    // `CUR `undef CUR ``) is defined once the expansion's
+                    // directives run; it is expanded then, not undefined.
+                    if !Self::line_defines(line, macro_name) {
+                        self.note_undefined_macro(macro_name);
+                    }
                     result.push('`');
                     result.push_str(macro_name);
                 }
