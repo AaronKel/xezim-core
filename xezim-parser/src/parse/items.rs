@@ -144,8 +144,18 @@ impl Parser {
             loop {
                 let name = self.parse_identifier();
                 let span = name.span;
+                // A.2.4 / §16.10: `variable_identifier { variable_dimension }`:
+                // a local may be an unpacked array (`bit flags[3:0];`). It was
+                // a parse error (#618). Its element selects read as the packed
+                // equivalent's, so the dimensions fold into the type.
+                let dims = if self.at(TokenKind::LBracket) {
+                    self.parse_unpacked_dimensions()
+                } else {
+                    Vec::new()
+                };
+                let local_type = Self::sva_local_array_type(&data_type, dims);
                 let mut args = vec![
-                    Expression::new(ExprKind::TypeLiteral(Box::new(data_type.clone())), span),
+                    Expression::new(ExprKind::TypeLiteral(Box::new(local_type)), span),
                     Self::sva_ident(name),
                 ];
                 if self.eat(TokenKind::Assign).is_some() {
@@ -163,6 +173,96 @@ impl Parser {
                 }
             }
             self.expect(TokenKind::Semicolon);
+        }
+    }
+
+    /// An assertion local declared with unpacked dimensions, as the packed
+    /// type that selects the same elements: each fixed unpacked dimension
+    /// (`[3:0]`, `[N]` as `[0:N-1]`) outside the element's own packed ones,
+    /// an integer atom element as its sized vector. Any other element type,
+    /// or a dynamic dimension, keeps the declared element type.
+    fn sva_local_array_type(dt: &DataType, dims: Vec<UnpackedDimension>) -> DataType {
+        if dims.is_empty() {
+            return dt.clone();
+        }
+        let int = |v: i64, span: crate::ast::Span| {
+            Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }),
+                span,
+            )
+        };
+        let mut outer = Vec::new();
+        for d in dims {
+            match d {
+                UnpackedDimension::Range { left, right, span } => {
+                    outer.push(PackedDimension::Range { left, right, span });
+                }
+                UnpackedDimension::Expression { expr, span } => {
+                    let hi = Expression::new(
+                        ExprKind::Binary {
+                            op: crate::ast::expr::BinaryOp::Sub,
+                            left: expr,
+                            right: Box::new(int(1, span)),
+                        },
+                        span,
+                    );
+                    outer.push(PackedDimension::Range {
+                        left: Box::new(int(0, span)),
+                        right: Box::new(hi),
+                        span,
+                    });
+                }
+                _ => return dt.clone(),
+            }
+        }
+        let (kind, signing, inner, span) = match dt {
+            DataType::IntegerVector {
+                kind,
+                signing,
+                dimensions,
+                span,
+            } => (*kind, *signing, dimensions.clone(), *span),
+            DataType::IntegerAtom {
+                kind,
+                signing,
+                span,
+            } => {
+                use crate::ast::types::IntegerAtomType as A;
+                let (w, four, signed) = match kind {
+                    A::Byte => (8, false, true),
+                    A::ShortInt => (16, false, true),
+                    A::Int => (32, false, true),
+                    A::LongInt => (64, false, true),
+                    A::Integer => (32, true, true),
+                    A::Time => (64, true, false),
+                };
+                let sign = signing.or(signed.then_some(crate::ast::types::Signing::Signed));
+                let elem = PackedDimension::Range {
+                    left: Box::new(int(w - 1, *span)),
+                    right: Box::new(int(0, *span)),
+                    span: *span,
+                };
+                let k = if four {
+                    crate::ast::types::IntegerVectorType::Logic
+                } else {
+                    crate::ast::types::IntegerVectorType::Bit
+                };
+                (k, sign, vec![elem], *span)
+            }
+            _ => return dt.clone(),
+        };
+        outer.extend(inner);
+        DataType::IntegerVector {
+            kind,
+            signing,
+            dimensions: outer,
+            span,
         }
     }
 
