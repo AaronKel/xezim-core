@@ -34,6 +34,24 @@ fn remember_default(
     DEFAULTS.with(|values| values.borrow_mut().insert(name.to_string(), value));
 }
 
+/// An instance's local parameter environment lacks the names its module
+/// imports from a package (`import pkg::*; ... A [N]`). The elaboration-wide
+/// map has them, so resolve the declared shape against it, overlaid with the
+/// local environment, when the local environment alone does not.
+fn shape_params<'a>(
+    elab: &ElaboratedModule,
+    dims: &[UnpackedDimension],
+    params: &'a HashMap<String, Value>,
+) -> std::borrow::Cow<'a, HashMap<String, Value>> {
+    let local = normalize_unpacked_dims(dims, params, &elab.typedef_types);
+    if declared_unpacked_dims(&local, params).is_some() {
+        return std::borrow::Cow::Borrowed(params);
+    }
+    let mut merged = elab.parameters.clone();
+    merged.extend(params.iter().map(|(k, v)| (k.clone(), v.clone())));
+    std::borrow::Cow::Owned(merged)
+}
+
 /// Share element folding with the instance-local parameter environment, so
 /// dependent constants and the eventual signal storage see the same values.
 pub(super) fn elements(
@@ -46,6 +64,8 @@ pub(super) fn elements(
     params: &HashMap<String, Value>,
     init_params: &HashMap<String, Value>,
 ) -> Option<Vec<(String, Value)>> {
+    let shape_params = shape_params(elab, dims, params);
+    let params = &*shape_params;
     remember_default(name, data_type, params, elab);
     let dims = normalize_unpacked_dims(dims, params, &elab.typedef_types);
     let shape = declared_unpacked_dims(&dims, params)?;
@@ -266,6 +286,8 @@ pub(super) fn register(
     params: &HashMap<String, Value>,
     init_params: &HashMap<String, Value>,
 ) -> bool {
+    let shape_params = shape_params(elab, dims, params);
+    let params = &*shape_params;
     remember_default(&format!("{prefix}{name}"), data_type, params, elab);
     let Some(values) = elements(
         elab,
