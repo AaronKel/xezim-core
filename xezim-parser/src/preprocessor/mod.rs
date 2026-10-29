@@ -1140,6 +1140,10 @@ impl Preprocessor {
         // their column is approximate; only text pieces need it exact.
         let mut pos: Vec<(u32, u32)> = Vec::new();
         let mut in_define_cont = false;
+        // The `define text so far while its formal list is still open over
+        // several lines (§22.5.1): those lines belong to the define even
+        // without a `\`, and so do the body lines after them (#656).
+        let mut open_formals: Option<String> = None;
         for (ln, line) in source.lines().enumerate() {
             let ln = ln as u32;
             // A line with no backtick outside a `define body passes through
@@ -1152,7 +1156,21 @@ impl Preprocessor {
             }
             let trimmed = fast_trim_start(line);
             if in_define_cont || directive_word(trimmed, "`define") {
-                in_define_cont = line.trim_end().ends_with('\\');
+                let text = match open_formals.take() {
+                    Some(mut t) => {
+                        t.push(' ');
+                        t.push_str(line);
+                        t
+                    }
+                    None if directive_word(trimmed, "`define") => line.to_string(),
+                    None => String::new(),
+                };
+                if !text.is_empty() && Self::define_formals_open(&text) {
+                    open_formals = Some(text);
+                    in_define_cont = true;
+                } else {
+                    in_define_cont = line.trim_end().ends_with('\\');
+                }
                 out.push_str(line);
                 out.push('\n');
                 pos.push((ln, 0));
