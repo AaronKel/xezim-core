@@ -59,6 +59,19 @@ impl Parser {
         )
     }
 
+    /// The identifier spelling of a `virtual <iface>` type argument
+    /// (`virtual mem_if#(8,8)`) from the tokens that follow `virtual`.
+    pub(super) fn virtual_type_arg_text(toks: &[String]) -> String {
+        let compact = toks
+            .join(" ")
+            .replace(" # ", "#")
+            .replace("# (", "#(")
+            .replace("( ", "(")
+            .replace(" )", ")")
+            .replace(" ,", ",");
+        format!("virtual {}", compact)
+    }
+
     pub(super) fn parse_data_type(&mut self) -> DataType {
         let start = self.current().span.start;
         match self.current_kind() {
@@ -376,14 +389,7 @@ impl Parser {
                             if toks.is_empty() {
                                 toks.push(tok_text.clone());
                             }
-                            let raw = toks.join(" ");
-                            let compact = raw
-                                .replace(" # ", "#")
-                                .replace("# (", "#(")
-                                .replace("( ", "(")
-                                .replace(" )", ")")
-                                .replace(" ,", ",");
-                            let full_name = format!("virtual {}", compact);
+                            let full_name = Self::virtual_type_arg_text(&toks);
                             let sp = self.span_from(start);
                             let id = crate::ast::Identifier {
                                 name: full_name,

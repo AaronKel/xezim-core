@@ -4269,6 +4269,21 @@ impl Parser {
                     kind: crate::ast::types::SimpleType::String,
                     span,
                 } => ("string".to_string(), *span),
+                // §25.9: `C #(virtual bus_if) x;` — the same identifier
+                // `parse_type_args_hash` builds for a procedural declaration.
+                // Dropped, the module-scope variable was built as the
+                // default specialization, so its type-parameter property was
+                // no virtual interface.
+                DataType::Interface { span, .. } => {
+                    let toks: Vec<String> = self
+                        .tokens
+                        .iter()
+                        .filter(|t| t.span.start >= span.start && t.span.end <= span.end)
+                        .skip_while(|t| t.kind == TokenKind::KwVirtual)
+                        .map(|t| t.text.clone())
+                        .collect();
+                    (Self::virtual_type_arg_text(&toks), *span)
+                }
                 // §6.12: `C #(real) x;` — dropping the argument built the
                 // object as the default specialization.
                 DataType::Real { kind, span } => (
