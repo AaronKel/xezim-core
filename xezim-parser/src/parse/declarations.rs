@@ -980,7 +980,7 @@ impl Parser {
         let ports = if default_args {
             Vec::new()
         } else {
-            self.parse_function_ports()
+            self.parse_prototype_ports()
         };
         self.expect(TokenKind::Semicolon);
         FunctionDeclaration {
@@ -1003,7 +1003,7 @@ impl Parser {
         let specifier = self.parse_optional_method_specifier();
         let lifetime = self.parse_optional_lifetime();
         let name = self.parse_method_name();
-        let ports = self.parse_function_ports();
+        let ports = self.parse_prototype_ports();
         self.expect(TokenKind::Semicolon);
         TaskDeclaration {
             lifetime,
@@ -1114,6 +1114,16 @@ impl Parser {
         self.expect(TokenKind::RParen);
         args
     }
+    /// A prototype's ports (an `extern`, `pure virtual` or DPI import): a
+    /// formal may give only its type, `import "DPI-C" function int f(int);`
+    /// (A.2.7 footnote 28, #655).
+    fn parse_prototype_ports(&mut self) -> Vec<FunctionPort> {
+        let saved = std::mem::replace(&mut self.prototype_ports, true);
+        let ports = self.parse_function_ports();
+        self.prototype_ports = saved;
+        ports
+    }
+
     pub(super) fn parse_function_ports(&mut self) -> Vec<FunctionPort> {
         let mut ports = Vec::new();
         if self.eat(TokenKind::LParen).is_none() {
@@ -1336,7 +1346,21 @@ impl Parser {
                     span: self.span_from(start),
                 }
             };
-            let name = self.parse_identifier();
+            // An unnamed formal of a prototype: a placeholder name by position.
+            let name = if self.prototype_ports
+                && matches!(
+                    self.current_kind(),
+                    TokenKind::RParen | TokenKind::Comma | TokenKind::LBracket
+                )
+                && !matches!(data_type, DataType::Implicit { .. })
+            {
+                Identifier {
+                    name: format!("__arg{}", ports.len()),
+                    span: self.current().span,
+                }
+            } else {
+                self.parse_identifier()
+            };
             let dimensions = self.parse_unpacked_dimensions();
             let default = if self.eat(TokenKind::Assign).is_some() {
                 Some(self.parse_expression())

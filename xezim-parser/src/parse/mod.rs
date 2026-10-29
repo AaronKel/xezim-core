@@ -36,6 +36,9 @@ pub struct Parser {
     /// primary: a name followed by `(` there is the count, and the
     /// parenthesis starts the next sequence (`##N (x)`), not a call.
     sva_delay_count: bool,
+    /// Parsing a function or task prototype's ports, where a formal's name
+    /// may be omitted (A.2.7 footnote 28).
+    prototype_ports: bool,
     /// The classes of this file so far, for the strict inheritance checks.
     pub(super) class_infos: Vec<ClassInfo>,
     /// `pure constraint` names of the class being parsed.
@@ -130,6 +133,7 @@ impl Parser {
             plain_loop_vars: Vec::new(),
             in_sva_seq: false,
             sva_delay_count: false,
+            prototype_ports: false,
             class_infos: Vec::new(),
             pure_constraints: Vec::new(),
             in_constraint: false,
