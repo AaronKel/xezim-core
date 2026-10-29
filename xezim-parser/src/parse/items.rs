@@ -1136,6 +1136,59 @@ impl Parser {
         )
     }
 
+    /// §18.5.1, A.1.11: `constraint C::name { ... }` in a package defines the
+    /// body of the `extern constraint name;` its class `C` of the same package
+    /// declares; the body is put on that prototype (#654).
+    fn parse_package_ooc_constraint(&mut self, items: &mut [PackageItem]) {
+        let start = self.current().span.start;
+        self.expect(TokenKind::KwConstraint);
+        let hid = self.parse_hierarchical_identifier();
+        let mut body = Vec::new();
+        if self.at(TokenKind::LBrace) {
+            self.bump();
+            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                body.push(self.parse_constraint_item(ConstraintPos::BlockItem));
+            }
+            self.expect(TokenKind::RBrace);
+        }
+        self.eat(TokenKind::Semicolon);
+        let [.., class, name] = hid.path.as_slice() else {
+            self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                "an out-of-block constraint names its class: `constraint C::name { ... }` \
+                 (IEEE 1800-2023 §18.5.1)",
+                self.span_from(start),
+            ));
+            return;
+        };
+        let prototype = items.iter_mut().find_map(|it| match it {
+            PackageItem::Class(c) if c.name.name == class.name.name => {
+                c.items.iter_mut().find_map(|ci| match ci {
+                    crate::ast::decl::ClassItem::Constraint(k)
+                        if k.name.name == name.name.name && !k.has_body =>
+                    {
+                        Some(k)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        });
+        match prototype {
+            Some(k) => {
+                k.items = body;
+                k.has_body = true;
+            }
+            None => self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                format!(
+                    "class '{}' of this package declares no `extern constraint {};` \
+                     (IEEE 1800-2023 §18.5.1)",
+                    class.name.name, name.name.name
+                ),
+                self.span_from(start),
+            )),
+        }
+    }
+
     pub(super) fn parse_package_declaration(&mut self) -> PackageDeclaration {
         let start = self.current().span.start;
         self.expect(TokenKind::KwPackage);
@@ -1146,6 +1199,10 @@ impl Parser {
         let mut items = Vec::new();
         self.push_let_scope();
         while !self.at(TokenKind::KwEndpackage) && !self.at(TokenKind::Eof) {
+            if self.at(TokenKind::KwConstraint) {
+                self.parse_package_ooc_constraint(&mut items);
+                continue;
+            }
             if let Some(item) = self.parse_package_item() {
                 items.push(item);
             } else {
