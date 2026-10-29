@@ -1981,8 +1981,23 @@ impl Parser {
                 ));
             EventControl::EventExpr(self.parse_event_expression_term())
         } else {
+            let start = self.current().span.start;
             let expr = self.parse_hierarchical_identifier_expr();
-            EventControl::HierIdentifier(expr)
+            // §9.4.2: `@name` is `@(name)`. A plain identifier keeps the bare
+            // form; a member name (`@vif.cb`, `@h.ev`) takes the one-term
+            // event expression the parenthesized spelling builds, so it
+            // resolves through bound vifs and clocking blocks the same way.
+            // As a bare form `@vif.cb` had no sensitivity and returned at once.
+            if matches!(expr.kind, ExprKind::Ident(_)) {
+                EventControl::HierIdentifier(expr)
+            } else {
+                EventControl::EventExpr(vec![EventExpr {
+                    edge: None,
+                    expr,
+                    iff: None,
+                    span: self.span_from(start),
+                }])
+            }
         }
     }
 
