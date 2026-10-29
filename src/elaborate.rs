@@ -21491,6 +21491,11 @@ pub fn const_eval_i64_with_params(
             let p = params?;
             eval_const_expr_val(expr, p).to_u64().map(|u| u as i64)
         }
+        // §11.4.12: a constant concatenation or replication, such as the
+        // `{Width{1'b1}}` bound of a covergroup bin range.
+        ExprKind::Concatenation(_) | ExprKind::Replication { .. } => {
+            const_concat_bits(expr, params).and_then(|(v, w)| (w > 0).then_some(v as i64))
+        }
         // §13.4.3: a user sizing function called directly in a dimension.
         // Interpret its REAL body (FUNCS_TLS) — the name-based ceil-log2
         // fallback below only fires when the declaration isn't visible, and
@@ -21513,6 +21518,57 @@ pub fn const_eval_i64_with_params(
         }
         _ => None,
     }
+}
+
+/// Value and width of a constant concatenation operand (§11.4.12), when
+/// every operand is a sized literal, a parameter, or a nested concatenation
+/// or replication, and the whole fits in 64 bits. A zero replication has
+/// width 0 (§11.4.12.1); 65 copies of a nonzero width are already too wide.
+fn const_concat_bits(
+    e: &Expression,
+    params: Option<&HashMap<String, Value>>,
+) -> Option<(u64, u32)> {
+    let mask = |v: u64, w: u32| if w >= 64 { v } else { v & ((1u64 << w) - 1) };
+    let (v, w) = match &e.kind {
+        ExprKind::Paren(x) => return const_concat_bits(x, params),
+        ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => {
+            let lit = eval_const_expr_val(e, params.unwrap_or(&HashMap::default()));
+            (lit.to_u64().filter(|_| !lit.has_xz())?, *s)
+        }
+        ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+            let p = params?.get(&h.path[0].name.name)?;
+            if p.has_xz() || p.is_real {
+                return None;
+            }
+            (p.to_u64()?, p.width)
+        }
+        ExprKind::Concatenation(parts) => {
+            let (mut v, mut w) = (0u64, 0u32);
+            for part in parts {
+                let (pv, pw) = const_concat_bits(part, params)?;
+                w = w.checked_add(pw).filter(|&w| w <= 64)?;
+                v = v.checked_shl(pw).unwrap_or(0) | pv;
+            }
+            (v, w)
+        }
+        ExprKind::Replication { count, exprs } => {
+            let n = u32::try_from(const_eval_i64_with_params(count, params)?).ok()?;
+            let mut inner = Vec::with_capacity(exprs.len());
+            for x in exprs {
+                inner.push(const_concat_bits(x, params)?);
+            }
+            let (mut v, mut w) = (0u64, 0u32);
+            for _ in 0..n.min(65) {
+                for &(pv, pw) in &inner {
+                    w = w.checked_add(pw).filter(|&w| w <= 64)?;
+                    v = v.checked_shl(pw).unwrap_or(0) | pv;
+                }
+            }
+            (v, w)
+        }
+        _ => return None,
+    };
+    (w <= 64).then(|| (mask(v, w), w))
 }
 
 // §13.4.3 — thread-local FUNCTION table consulted by
