@@ -5503,6 +5503,79 @@ impl Parser {
     }
 
     /// §19.6.1 select_expression, `||` level.
+    /// §19.6.1.4: a cross bin given as a list of value tuples,
+    /// `'{'{1,2}, '{3,4}}`, one value per crossed item in order: the product
+    /// bins holding one of the tuples, i.e. the `||` over the tuples of the
+    /// `&&` of `binsof(item) intersect {value}` (#651).
+    fn cross_tuple_select(
+        &mut self,
+        set: &Expression,
+        items: &[Identifier],
+    ) -> crate::ast::decl::CrossSelect {
+        use crate::ast::decl::{ConstraintRange, CrossSelect};
+        let tuples: Option<Vec<Vec<Expression>>> = match &set.kind {
+            ExprKind::AssignmentPattern(list) => list
+                .iter()
+                .map(|t| match t {
+                    AssignmentPatternItem::Ordered(e) => match &e.kind {
+                        ExprKind::AssignmentPattern(vals) => vals
+                            .iter()
+                            .map(|v| match v {
+                                AssignmentPatternItem::Ordered(x) => Some(x.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        };
+        let Some(tuples) = tuples else {
+            self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                "a cross bin's tuple list is an ordered list of ordered tuples, \
+                 '{'{v1, v2}, ...} (IEEE 1800-2023 §19.6.1.4)",
+                set.span,
+            ));
+            return CrossSelect::All;
+        };
+        let mut any: Option<CrossSelect> = None;
+        for t in tuples {
+            if t.len() != items.len() {
+                self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                    format!(
+                        "a tuple of {} values for a cross of {} items (IEEE 1800-2023 §19.6.1.4)",
+                        t.len(),
+                        items.len()
+                    ),
+                    set.span,
+                ));
+                continue;
+            }
+            let mut all: Option<CrossSelect> = None;
+            for (cp, v) in items.iter().zip(t) {
+                let term = CrossSelect::Binsof {
+                    cp: cp.clone(),
+                    bin: None,
+                    intersect: Some(vec![ConstraintRange::Value(v)]),
+                };
+                all = Some(match all {
+                    Some(a) => CrossSelect::And(Box::new(a), Box::new(term)),
+                    None => term,
+                });
+            }
+            if let Some(all) = all {
+                any = Some(match any {
+                    Some(a) => CrossSelect::Or(Box::new(a), Box::new(all)),
+                    None => all,
+                });
+            }
+        }
+        // An empty list selects no product bin.
+        any.unwrap_or_else(|| CrossSelect::Not(Box::new(CrossSelect::All)))
+    }
+
     fn parse_cross_select_or(&mut self) -> crate::ast::decl::CrossSelect {
         let mut l = self.parse_cross_select_and();
         while self.eat(TokenKind::LogOr).is_some() {
@@ -5952,7 +6025,12 @@ impl Parser {
                             }
                             let bin_name = self.parse_identifier();
                             self.expect(TokenKind::Assign);
-                            let select = self.parse_cross_select_or();
+                            let select = if self.at(TokenKind::ApostropheLBrace) {
+                                let set = self.parse_expression();
+                                self.cross_tuple_select(&set, &ids)
+                            } else {
+                                self.parse_cross_select_or()
+                            };
                             let mut iff_guard = None;
                             if self.eat(TokenKind::KwIff).is_some() {
                                 self.expect(TokenKind::LParen);
