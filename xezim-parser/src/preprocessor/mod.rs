@@ -2702,8 +2702,14 @@ impl Preprocessor {
                     if def.params.is_some() && p < bytes.len() && bytes[p] == b'(' {
                         i = p;
                         // Parameterized macro: find arguments
-                        let args = Self::extract_macro_args(line, &mut i);
+                        let mut args = Self::extract_macro_args(line, &mut i);
                         let params = def.params.as_ref().unwrap();
+                        // §22.5.1: () supplies one empty actual when there
+                        // are formals, just as (,) supplies two. Preserve a
+                        // genuinely zero-argument invocation of `define M().
+                        if args.is_empty() && !params.is_empty() {
+                            args.push(String::new());
+                        }
                         // §22.5.1 strict argument-count validation: too many
                         // actuals, or a non-defaulted formal left without one.
                         if crate::strict_checks() {
