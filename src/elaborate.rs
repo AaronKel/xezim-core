@@ -12690,20 +12690,27 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
     // `extern`/pure prototype, or inserting if none). Returns true if it was
     // an out-of-body method (had a `ClassName::` scope).
     let mut attach = |class_name: String, method_name: String, kind: ClassMethodKind, span: _| {
-        if let Some(cls) = elab
-            .classes
-            .get_mut(&class_name)
-            .map(std::sync::Arc::make_mut)
+        // §8.24/§8.23: `outer::inner::m` names the nested class, which is
+        // registered both under its chain and its own name: attach to each.
+        let mut keys: Vec<String> = vec![class_name.clone()];
+        if let Some(last) = class_name.rsplit("::").next()
+            && last != class_name
         {
+            keys.push(last.to_string());
+        }
+        for key in keys {
+            let Some(cls) = elab.classes.get_mut(&key).map(std::sync::Arc::make_mut) else {
+                continue;
+            };
             let methods = std::sync::Arc::make_mut(&mut cls.methods);
             if let Some(existing) = methods.get_mut(&method_name) {
-                existing.kind = kind;
+                existing.kind = kind.clone();
             } else {
                 methods.insert(
-                    method_name,
+                    method_name.clone(),
                     ClassMethod {
                         qualifiers: Vec::new(),
-                        kind,
+                        kind: kind.clone(),
                         span,
                     },
                 );
@@ -12727,18 +12734,30 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
                 for item in &p.items {
                     match item {
                         PackageItem::Function(f) if f.name.has_scope() => {
-                            let scope = &f.name.scopes[0].name;
+                            let scope = f
+                                .name
+                                .scopes
+                                .iter()
+                                .map(|s| s.name.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join("::");
                             attach(
-                                scope.name.clone(),
+                                scope,
                                 f.name.name.name.clone(),
                                 ClassMethodKind::Function(f.clone()),
                                 f.span,
                             );
                         }
                         PackageItem::Task(t) if t.name.has_scope() => {
-                            let scope = &t.name.scopes[0].name;
+                            let scope = t
+                                .name
+                                .scopes
+                                .iter()
+                                .map(|s| s.name.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join("::");
                             attach(
-                                scope.name.clone(),
+                                scope,
                                 t.name.name.name.clone(),
                                 ClassMethodKind::Task(t.clone()),
                                 t.span,
@@ -12769,18 +12788,30 @@ where
     for item in items {
         match item {
             ModuleItem::FunctionDeclaration(f) if f.name.has_scope() => {
-                let scope = &f.name.scopes[0].name;
+                let scope = f
+                    .name
+                    .scopes
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("::");
                 attach(
-                    scope.name.clone(),
+                    scope,
                     f.name.name.name.clone(),
                     ClassMethodKind::Function(f.clone()),
                     f.span,
                 );
             }
             ModuleItem::TaskDeclaration(t) if t.name.has_scope() => {
-                let scope = &t.name.scopes[0].name;
+                let scope = t
+                    .name
+                    .scopes
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("::");
                 attach(
-                    scope.name.clone(),
+                    scope,
                     t.name.name.name.clone(),
                     ClassMethodKind::Task(t.clone()),
                     t.span,

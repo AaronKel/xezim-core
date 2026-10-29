@@ -799,15 +799,26 @@ impl Parser {
     /// type is present the next token is that name instead
     /// (`function pkg::t_e cls::m();`), and this stays false.
     fn scoped_name_is_the_method_name(&self) -> bool {
-        matches!(
-            self.peek_kind_n(3),
-            TokenKind::LParen | TokenKind::Semicolon
-        )
+        // `a::b(`, and a longer chain `a::b::c(` (a nested class, §8.23).
+        let mut n = 1;
+        while self.peek_kind_n(n) == TokenKind::DoubleColon
+            && matches!(
+                self.peek_kind_n(n + 1),
+                TokenKind::Identifier | TokenKind::KwNew
+            )
+        {
+            n += 2;
+        }
+        n >= 3
+            && matches!(
+                self.peek_kind_n(n),
+                TokenKind::LParen | TokenKind::Semicolon
+            )
     }
 
     pub(super) fn parse_method_name(&mut self) -> TypeName {
         let start = self.current().span.start;
-        let first = if self.at(TokenKind::KwNew) {
+        let mut name = if self.at(TokenKind::KwNew) {
             let tok = self.bump();
             Identifier {
                 name: tok.text.clone(),
@@ -816,10 +827,14 @@ impl Parser {
         } else {
             self.parse_identifier()
         };
-
-        if self.at(TokenKind::DoubleColon) {
+        // §8.24 out-of-block declaration, §8.23 class scope: the scope may
+        // name a nested class (`function int outer::inner::m(...)`), so every
+        // `::` link is a scope, the last name the method. Only one link was
+        // read, and the second `::` was a parse error (#617).
+        let mut scopes = Vec::new();
+        while self.at(TokenKind::DoubleColon) {
             self.bump();
-            let second = if self.at(TokenKind::KwNew) {
+            let next = if self.at(TokenKind::KwNew) {
                 let tok = self.bump();
                 Identifier {
                     name: tok.text.clone(),
@@ -828,20 +843,15 @@ impl Parser {
             } else {
                 self.parse_identifier()
             };
-            TypeName {
-                scopes: vec![crate::ast::types::TypeScope {
-                    name: first,
-                    type_args: Vec::new(),
-                }],
-                name: second,
-                span: self.span_from(start),
-            }
-        } else {
-            TypeName {
-                scopes: Vec::new(),
-                name: first,
-                span: self.span_from(start),
-            }
+            scopes.push(crate::ast::types::TypeScope {
+                name: std::mem::replace(&mut name, next),
+                type_args: Vec::new(),
+            });
+        }
+        TypeName {
+            scopes,
+            name,
+            span: self.span_from(start),
         }
     }
     /// The return type of a function declaration or prototype: an explicit
