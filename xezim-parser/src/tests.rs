@@ -303,6 +303,28 @@ fn test_processes_events() {
     assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
 }
 
+/// §9.4.2: a bare event control naming a member (`@vif.cb`, `@h.ev`) builds
+/// the same one-term event expression as the parenthesized form. A plain name
+/// keeps the bare form.
+#[test]
+fn bare_event_control_on_a_member() {
+    for ctrl in ["@vif.cb", "@h.ev", "@cfg.vif.cb"] {
+        let source = format!(
+            "class E; event ev; endclass
+             class D; E h; task t(); {ctrl}; endtask endclass"
+        );
+        let result = parse(&source);
+        assert!(result.errors.is_empty(), "{ctrl}: {:?}", result.errors);
+        let ast = format!("{:?}", result.source);
+        assert!(ast.contains("EventExpr("), "{ctrl}: {ast}");
+        assert!(!ast.contains("HierIdentifier("), "{ctrl}: {ast}");
+        assert!(ast.contains("MemberAccess"), "{ctrl}: {ast}");
+    }
+    let result = parse("module m; event ev; initial @ev; endmodule");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(format!("{:?}", result.source).contains("HierIdentifier("));
+}
+
 #[test]
 fn test_semaphores() {
     let source = "
