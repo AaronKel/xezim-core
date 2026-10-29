@@ -1141,6 +1141,14 @@ impl Parser {
                     }
                     clk = self.parse_expression();
                     self.expect(TokenKind::RParen);
+                } else if matches!(
+                    self.current_kind(),
+                    TokenKind::Identifier | TokenKind::EscapedIdentifier
+                ) {
+                    // §9.4.2, §16.9.3: `@clk` without parentheses names the
+                    // event, any change of it (#652).
+                    let hier = self.parse_hierarchical_identifier();
+                    clk = Expression::new(ExprKind::Ident(hier), self.span_from(start));
                 }
                 let span = self.span_from(start);
                 let edge_lit = Expression::new(
