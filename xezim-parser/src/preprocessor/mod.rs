@@ -3014,11 +3014,11 @@ impl Preprocessor {
                 continue;
             }
             if !in_string && i + 1 < bytes.len() && bytes[i + 1] == b'*'
-                // `@(*)` is the implicit-sensitivity-list construct, not an
-                // attribute. Skip if the byte after `(*` is `)`. Likewise
+                // §5.3 / §9.4.2.2: `@(* )` is an implicit event control,
+                // also with white space or comments before `)`. Likewise
                 // skip `(**` (e.g. an exponent inside parens) where the
                 // payload starts with another `*`.
-                && bytes.get(i + 2).copied() != Some(b')')
+                && bytes.get(Self::skip_space_and_comments(bytes, i + 2)) != Some(&b')')
                 && bytes.get(i + 2).copied() != Some(b'*')
             {
                 // Find matching *)
