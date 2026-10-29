@@ -245,6 +245,47 @@ fn assertion_local_with_unpacked_dimensions() {
          assert property (p);\n cover property (@(posedge clk) s);\n assert property (q);\n\
          endmodule\n",
     );
+    let diagnostics_for = |local: &str| {
+        let result = parse(&format!(
+            "module m; bit clk, go;\n property p;\n  {local}\n  \
+             @(posedge clk) go |-> go;\n endproperty\nendmodule\n"
+        ));
+        let text = |ds: &[sv_parser::diagnostics::Diagnostic]| {
+            ds.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        };
+        (text(&result.errors), text(&result.warnings))
+    };
+    // §11.8.1: a signed element folds into a packed array whose element
+    // selects read unsigned; it is accepted with a warning.
+    for local in ["int counts[4];", "bit signed [7:0] s[2];", "integer i[2];"] {
+        let (errors, warnings) = diagnostics_for(local);
+        assert!(errors.is_empty(), "{local}: {errors:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("read unsigned")),
+            "{local}: {warnings:?}"
+        );
+    }
+    for local in ["bit flags[3:0];", "int unsigned u[4];", "int scalar;"] {
+        let (errors, warnings) = diagnostics_for(local);
+        assert!(
+            errors.is_empty() && warnings.is_empty(),
+            "{local}: {errors:?} {warnings:?}"
+        );
+    }
+    // A type that does not fold, or a dimension that is not fixed-size, is
+    // an error rather than a silently scalar local.
+    for local in [
+        "struct packed { bit a; } pairs[2];",
+        "real samples[2];",
+        "bit queue_of[$];",
+        "int dyn[];",
+    ] {
+        let (errors, _) = diagnostics_for(local);
+        assert!(
+            errors.iter().any(|e| e.contains("not supported")),
+            "{local}: {errors:?}"
+        );
+    }
 }
 
 /// §22.5.2: `` `undef `` names one macro; the text after the name on its line

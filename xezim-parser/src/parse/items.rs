@@ -153,7 +153,7 @@ impl Parser {
                 } else {
                     Vec::new()
                 };
-                let local_type = Self::sva_local_array_type(&data_type, dims);
+                let local_type = self.sva_local_array_type(&data_type, &name, dims);
                 let mut args = vec![
                     Expression::new(ExprKind::TypeLiteral(Box::new(local_type)), span),
                     Self::sva_ident(name),
@@ -180,11 +180,27 @@ impl Parser {
     /// type that selects the same elements: each fixed unpacked dimension
     /// (`[3:0]`, `[N]` as `[0:N-1]`) outside the element's own packed ones,
     /// an integer atom element as its sized vector. Any other element type,
-    /// or a dynamic dimension, keeps the declared element type.
-    fn sva_local_array_type(dt: &DataType, dims: Vec<UnpackedDimension>) -> DataType {
+    /// or a dynamic dimension, is an error rather than a silently scalar local.
+    fn sva_local_array_type(
+        &mut self,
+        dt: &DataType,
+        name: &Identifier,
+        dims: Vec<UnpackedDimension>,
+    ) -> DataType {
         if dims.is_empty() {
             return dt.clone();
         }
+        let unsupported = |this: &mut Self, what: &str| {
+            this.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                format!(
+                    "unpacked dimensions on assertion local '{}' {what} are not supported \
+                     (IEEE 1800-2023 §16.10)",
+                    name.name
+                ),
+                name.span,
+            ));
+            dt.clone()
+        };
         let int = |v: i64, span: crate::ast::Span| {
             Expression::new(
                 ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
@@ -218,7 +234,7 @@ impl Parser {
                         span,
                     });
                 }
-                _ => return dt.clone(),
+                _ => return unsupported(self, "that are not fixed-size"),
             }
         }
         let (kind, signing, inner, span) = match dt {
@@ -255,8 +271,21 @@ impl Parser {
                 };
                 (k, sign, vec![elem], *span)
             }
-            _ => return dt.clone(),
+            _ => return unsupported(self, "of this element type"),
         };
+        // §11.8.1: a select of a packed array is unsigned, so a signed
+        // element (`int counts[4]`) reads back unsigned.
+        if signing == Some(crate::ast::types::Signing::Signed) {
+            self.diagnostics
+                .push(crate::diagnostics::Diagnostic::warning(
+                    format!(
+                        "element selects of assertion local '{}' read unsigned: its unpacked \
+                         dimensions fold into a packed array (IEEE 1800-2023 §16.10, §11.8.1)",
+                        name.name
+                    ),
+                    name.span,
+                ));
+        }
         outer.extend(inner);
         DataType::IntegerVector {
             kind,
