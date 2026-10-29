@@ -43916,6 +43916,69 @@ pub fn whole_array_assign_parts_dir(
     )
 }
 
+/// §7.6: `assign dst = src[row];` drives a 1-D unpacked array from one row of
+/// a 2-D unpacked array with the same inner count, element by element. Like
+/// the 1-D form, it has no single target signal to assign.
+#[allow(clippy::too_many_arguments)]
+pub fn whole_array_row_assign_parts(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    arrays: &HashMap<String, (i64, i64, u32)>,
+    arrays_2d: &HashMap<String, ((i64, i64), (i64, i64), u32)>,
+    params: &HashMap<String, Value>,
+    descending: Option<&HashSet<String>>,
+    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+) -> Option<Vec<ContinuousAssignment>> {
+    let (ExprKind::Ident(lh), ExprKind::Index { expr, index }) = (&lhs.kind, &rhs.kind) else {
+        return None;
+    };
+    let ExprKind::Ident(rh) = &expr.kind else {
+        return None;
+    };
+    let ([l], [r]) = (lh.path.as_slice(), rh.path.as_slice()) else {
+        return None;
+    };
+    if !l.selects.is_empty() || !r.selects.is_empty() {
+        return None;
+    }
+    let (ln, rn) = (&l.name.name, &r.name.name);
+    let &(llo, lhi, _) = arrays.get(ln)?;
+    let &((olo, ohi), (ilo, ihi), _) = arrays_2d.get(rn)?;
+    if lhi < llo || ihi < ilo || (lhi - llo) != (ihi - ilo) {
+        return None;
+    }
+    if eval_const_expr_val(index, params).has_xz() {
+        return None;
+    }
+    let row = const_eval_i64_with_params(index, Some(params))?;
+    if row < olo.min(ohi) || row > olo.max(ohi) {
+        return None;
+    }
+    let n = lhi - llo;
+    if n > 4096 {
+        return None;
+    }
+    let desc = |nm: &str, dim: usize| match decl_dims.and_then(|d| d.get(nm)?.get(dim)) {
+        Some(&(left, right)) => left > right,
+        None => dim == 0 && descending.is_some_and(|d| d.contains(nm)),
+    };
+    let (ld, rd) = (desc(ln, 0), desc(rn, 1));
+    Some(
+        (0..=n)
+            .map(|k| ContinuousAssignment {
+                origin: None,
+                lhs: make_index_expr(ln, if ld { lhi - k } else { llo + k }),
+                rhs: make_multi_index_expr(rn, &[row, if rd { ihi - k } else { ilo + k }]),
+                delay,
+                rhs_parent_scoped: false,
+                delay_fall: None,
+                delay_off: None,
+            })
+            .collect(),
+    )
+}
+
 /// §10.3 / §10.9: `assign arr = '{...};` — a continuous assignment of an
 /// assignment pattern to a whole unpacked array drives each element with
 /// its item: positional (`'{3, 4}`, the first item at the LEFT bound),
