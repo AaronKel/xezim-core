@@ -7937,7 +7937,9 @@ pub fn elaborate_module_with_defs(
     // §13.4.3: register module-body function declarations before the
     // parameter pass so a header `parameter LOG_X = log2(X)` const-evaluates.
     for it in module.items() {
-        if let ModuleItem::FunctionDeclaration(fd) = it {
+        if let ModuleItem::FunctionDeclaration(fd) = it
+            && fd.name.scopes.is_empty()
+        {
             elab.functions
                 .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
         }
@@ -8445,9 +8447,13 @@ pub fn elaborate_module_with_defs(
     // Process items
     if let Definition::Package(p) = module {
         // §13.4.3: package functions first, so a package parameter whose
-        // initializer calls a sizing helper const-evaluates.
+        // initializer calls a sizing helper const-evaluates. §8.24: scoped
+        // definitions are class methods, not free package functions; their
+        // signatures must not enter the bare-name function table.
         for item in &p.items {
-            if let crate::ast::decl::PackageItem::Function(fd) = item {
+            if let crate::ast::decl::PackageItem::Function(fd) = item
+                && fd.name.scopes.is_empty()
+            {
                 elab.functions
                     .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
             }
@@ -29680,7 +29686,9 @@ fn inline_instantiations_inner(
                 // §13.4.3: package sizing functions must be visible to the
                 // parameter passes below.
                 for item in &p.items {
-                    if let crate::ast::decl::PackageItem::Function(fd) = item {
+                    if let crate::ast::decl::PackageItem::Function(fd) = item
+                        && fd.name.scopes.is_empty()
+                    {
                         elab.functions
                             .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
                     }
@@ -35951,7 +35959,9 @@ fn inline_module_items(
                 // BEFORE the parameter passes so `parameter LOG_X = log2(X)`
                 // const-evaluates instead of collapsing to 0.
                 for it in sub_mod.items() {
-                    if let ModuleItem::FunctionDeclaration(fd) = it {
+                    if let ModuleItem::FunctionDeclaration(fd) = it
+                        && fd.name.scopes.is_empty()
+                    {
                         elab.functions
                             .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
                     }
@@ -35961,7 +35971,9 @@ fn inline_module_items(
                 funcs_tls_add(
                     &elab.functions,
                     sub_mod.items().iter().filter_map(|it| match it {
-                        ModuleItem::FunctionDeclaration(fd) => Some(&fd.name.name.name),
+                        ModuleItem::FunctionDeclaration(fd) if fd.name.scopes.is_empty() => {
+                            Some(&fd.name.name.name)
+                        }
                         _ => None,
                     }),
                 );
@@ -47212,8 +47224,8 @@ fn package_item_names(pi: &PackageItem) -> Vec<String> {
             }
             v
         }
-        PackageItem::Function(fd) => vec![fd.name.name.name.clone()],
-        PackageItem::Task(td) => vec![td.name.name.name.clone()],
+        PackageItem::Function(fd) if fd.name.scopes.is_empty() => vec![fd.name.name.name.clone()],
+        PackageItem::Task(td) if td.name.scopes.is_empty() => vec![td.name.name.name.clone()],
         PackageItem::Data(dd) => dd.declarators.iter().map(|d| d.name.name.clone()).collect(),
         PackageItem::Class(cd) => vec![cd.name.name.clone()],
         _ => Vec::new(),
@@ -47971,7 +47983,9 @@ fn process_import(
                 // §13.4.3: package sizing functions must be registered before
                 // the parameters that call them are evaluated.
                 for pi in &pkg.items {
-                    if let PackageItem::Function(fd) = pi {
+                    if let PackageItem::Function(fd) = pi
+                        && fd.name.scopes.is_empty()
+                    {
                         elab.functions
                             .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
                     }
