@@ -292,6 +292,21 @@ impl Parser {
                         self.bump();
                     }
                 }
+                // XEZIM_RELAX_STATIC_CONST (#624): `static const int k = 3;`
+                // puts `const` after the lifetime, which A.2.1.3 does not
+                // allow; read it as `const static`, as other tools do.
+                if lifetime.is_some()
+                    && self.at(TokenKind::KwConst)
+                    && crate::RELAX_STATIC_CONST.get()
+                {
+                    let span = self.bump().span;
+                    self.diagnostics
+                        .push(crate::diagnostics::Diagnostic::warning(
+                            "`const` belongs before the lifetime; read as `const static` \
+                             (IEEE 1800-2023 §6.20.6, A.2.1.3, XEZIM_RELAX_STATIC_CONST)",
+                            span,
+                        ));
+                }
                 let data_type = if self.is_data_type_keyword() || self.at(TokenKind::Identifier) {
                     self.parse_data_type()
                 } else {
