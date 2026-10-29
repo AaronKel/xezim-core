@@ -325,6 +325,30 @@ fn bare_event_control_on_a_member() {
     assert!(format!("{:?}", result.source).contains("HierIdentifier("));
 }
 
+/// §8.25, §25.9: a module-scope class variable specialized by a virtual
+/// interface type (`holder #(virtual bus_if) h;`) keeps that type argument,
+/// spelled as the procedural declaration spells it. It was dropped, so the
+/// variable was built as the default specialization.
+#[test]
+fn module_class_var_keeps_virtual_interface_type_arg() {
+    for (decl, arg) in [
+        ("holder #(virtual bus_if) h;", "virtual bus_if"),
+        ("holder #(virtual interface bus_if) h;", "virtual interface bus_if"),
+        ("holder #(virtual bus_if.mon) h;", "virtual bus_if . mon"),
+        ("holder #(virtual bus_if #(4)) h;", "virtual bus_if#(4)"),
+    ] {
+        for source in [
+            format!("module m; {decl} endmodule"),
+            format!("module m; initial begin {decl} end endmodule"),
+        ] {
+            let result = parse(&source);
+            assert!(result.errors.is_empty(), "{source}: {:?}", result.errors);
+            let ast = format!("{:?}", result.source);
+            assert!(ast.contains(&format!("name: {arg:?}")), "{source}: {ast}");
+        }
+    }
+}
+
 #[test]
 fn test_semaphores() {
     let source = "
