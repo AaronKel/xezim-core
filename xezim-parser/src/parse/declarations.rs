@@ -1548,9 +1548,12 @@ impl Parser {
                 self.bump();
                 self.parse_package_item()
             }
+            // A.1.11: `;` is an empty package item. It used to skip ahead to
+            // the next item, so at the end of a package the caller, given
+            // none, consumed `endpackage` itself (#658).
             TokenKind::Semicolon => {
                 self.bump();
-                self.parse_package_item()
+                Some(PackageItem::Null)
             }
             _ => None,
         }
