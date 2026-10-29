@@ -303,3 +303,45 @@ fn undef_keeps_the_rest_of_its_line() {
     assert!(!out.contains("wrong"), "{out}");
     assert!(!pp.is_defined("LIMIT"));
 }
+
+/// §22.14, Table 22-2: a `begin_keywords` set reserves its own version's
+/// words only, so a word a later version added is a name there (#608).
+#[test]
+fn keyword_set_frees_later_words() {
+    use sv_parser::lexer::{Lexer, TokenKind};
+    let reserved = |version: &str, word: &str| {
+        let src = format!("`begin_keywords \"{version}\"\n{word}\n`end_keywords\n");
+        let tokens = Lexer::new(&src).tokenize();
+        let tok = tokens.iter().find(|t| t.text == word).expect("word token");
+        tok.kind != TokenKind::Identifier
+    };
+    for (version, names, keywords) in [
+        (
+            "1364-1995",
+            &["generate", "cell", "uwire"][..],
+            &["reg"][..],
+        ),
+        ("1364-2001", &["uwire", "logic"], &["generate", "cell"]),
+        ("1364-2001-noconfig", &["cell"], &["generate"]),
+        ("1364-2005", &["logic", "until"], &["uwire", "cell"]),
+        (
+            "1800-2005",
+            &["until", "checker", "unique0", "nettype"],
+            &["logic", "uwire"],
+        ),
+        (
+            "1800-2009",
+            &["nettype", "soft", "implements", "interconnect"],
+            &["until", "let"],
+        ),
+        ("1800-2012", &[], &["nettype", "soft", "untyped", "logic"]),
+        ("1800-2023", &[], &["nettype", "cell"]),
+    ] {
+        for w in names {
+            assert!(!reserved(version, w), "{version}: {w} is a name");
+        }
+        for w in keywords {
+            assert!(reserved(version, w), "{version}: {w} is reserved");
+        }
+    }
+}
