@@ -24,6 +24,7 @@ impl Parser {
             let stmt_starter = matches!(
                 after_colon,
                 TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover
+                    | TokenKind::KwRestrict
                     | TokenKind::KwExpect | TokenKind::KwBegin | TokenKind::KwFork
                     | TokenKind::KwIf | TokenKind::KwCase | TokenKind::KwCasex
                     | TokenKind::KwCasez | TokenKind::KwFor | TokenKind::KwForeach
@@ -361,6 +362,12 @@ impl Parser {
                     Some(lowered) => lowered,
                     None => Statement::new(StatementKind::Assertion(a), span),
                 }
+            }
+            // §16.14.4: a restriction is for formal tools; a simulator
+            // reads it and checks nothing (#614).
+            TokenKind::KwRestrict => {
+                self.skip_restrict_property();
+                Statement::new(StatementKind::Null, self.span_from(start))
             }
             TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover => {
                 let mut a = self.parse_assertion_statement();
@@ -2000,6 +2007,25 @@ impl Parser {
             iff,
             span: self.span_from(start),
         }]
+    }
+
+    /// §16.14.4 `restrict property ( property_spec ) ;`: a constraint for
+    /// formal tools, which a simulator does not check. Consumed whole.
+    pub(super) fn skip_restrict_property(&mut self) {
+        self.bump(); // restrict
+        self.expect(TokenKind::KwProperty);
+        if self.eat(TokenKind::LParen).is_some() {
+            let mut depth = 1usize;
+            while depth > 0 && !self.at(TokenKind::Eof) {
+                match self.current_kind() {
+                    TokenKind::LParen => depth += 1,
+                    TokenKind::RParen => depth -= 1,
+                    _ => {}
+                }
+                self.bump();
+            }
+        }
+        self.expect(TokenKind::Semicolon);
     }
 
     pub(super) fn parse_assertion_statement(&mut self) -> AssertionStatement {

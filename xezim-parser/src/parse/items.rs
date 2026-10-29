@@ -2538,6 +2538,13 @@ impl Parser {
                     span: self.span_from(start),
                 }))
             }
+            // §16.14.4: read and set aside, as a simulator checks no
+            // restriction; it was a parse error that lost the rest of the
+            // module (#614).
+            TokenKind::KwRestrict if self.peek_kind() == TokenKind::KwProperty => {
+                self.skip_restrict_property();
+                Some(ModuleItem::Null)
+            }
             TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover => {
                 Some(ModuleItem::AssertionItem(self.parse_assertion_statement()))
             }
