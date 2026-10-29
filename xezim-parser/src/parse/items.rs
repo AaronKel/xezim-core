@@ -1108,6 +1108,34 @@ impl Parser {
         (ports, local_ports)
     }
 
+    /// Whether the bracket groups starting `n` tokens ahead are followed by
+    /// an identifier: `my_t [3:0] x` (a type, packed dimensions, a name), not
+    /// `a [4]` (a name and its unpacked dimensions, §7.4.2, #657).
+    fn dims_then_identifier(&self, mut n: usize) -> bool {
+        while self.peek_kind_n(n) == TokenKind::LBracket {
+            let mut depth = 0usize;
+            loop {
+                match self.peek_kind_n(n) {
+                    TokenKind::LBracket => depth += 1,
+                    TokenKind::RBracket => {
+                        depth -= 1;
+                        if depth == 0 {
+                            n += 1;
+                            break;
+                        }
+                    }
+                    TokenKind::Eof | TokenKind::Semicolon => return false,
+                    _ => {}
+                }
+                n += 1;
+            }
+        }
+        matches!(
+            self.peek_kind_n(n),
+            TokenKind::Identifier | TokenKind::EscapedIdentifier
+        )
+    }
+
     pub(super) fn parse_package_declaration(&mut self) -> PackageDeclaration {
         let start = self.current().span.start;
         self.expect(TokenKind::KwPackage);
@@ -1992,13 +2020,11 @@ impl Parser {
                 {
                     self.parse_data_type()
                 } else if self.at(TokenKind::Identifier)
-                    && matches!(
+                    && (matches!(
                         self.peek_kind(),
-                        TokenKind::Identifier
-                            | TokenKind::DoubleColon
-                            | TokenKind::Hash
-                            | TokenKind::LBracket
-                    )
+                        TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash
+                    ) || (self.peek_kind() == TokenKind::LBracket
+                        && self.dims_then_identifier(1)))
                 {
                     self.parse_data_type()
                 } else if self.at(TokenKind::LBracket) {
