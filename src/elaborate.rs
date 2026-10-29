@@ -13103,6 +13103,83 @@ fn is_lvalue_expr(e: &crate::ast::expr::Expression) -> bool {
 fn validate_ref_arg_lvalues(elab: &ElaboratedModule) -> Result<(), String> {
     use crate::ast::expr::{ExprKind, Expression};
     use crate::ast::stmt::{Statement, StatementKind};
+    // §26.3: package subroutines have both qualified registrations and bare
+    // aliases. An alias still belongs to its declaration's package, even
+    // when another package supplied the bare entry for a callee in its body.
+    fn declaring_package<'a>(
+        key: &'a str,
+        span: crate::ast::Span,
+        is_task: bool,
+        elab: &'a ElaboratedModule,
+    ) -> Option<&'a str> {
+        if let Some((pkg, _)) = key.split_once("::")
+            && elab.packages.contains(pkg)
+        {
+            return Some(pkg);
+        }
+        elab.packages.iter().find_map(|pkg| {
+            let qualified = format!("{pkg}::{key}");
+            let registered_span = if is_task {
+                elab.tasks.get(&qualified).map(|t| t.span)
+            } else {
+                elab.functions.get(&qualified).map(|f| f.span)
+            };
+            (registered_span == Some(span)).then_some(pkg.as_str())
+        })
+    }
+    fn callee_key(
+        func: &Expression,
+        package: Option<&str>,
+        locals: &HashMap<String, DataType>,
+        elab: &ElaboratedModule,
+    ) -> Option<String> {
+        // §23.8 / §26.3: `p.route(...)` can name an object variable p,
+        // even when a package p exists. Never borrow the package signature
+        // for a receiver declared in this call's scope.
+        let is_package = |name: &str| {
+            elab.packages.contains(name)
+                && !locals.contains_key(name)
+                && !elab.signals.contains_key(name)
+        };
+        match &func.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                let first = h.path.first()?.name.name.as_str();
+                if h.path.len() == 1 {
+                    if let Some(pkg) = package {
+                        let key = format!("{pkg}::{first}");
+                        if elab.functions.contains_key(&key) || elab.tasks.contains_key(&key) {
+                            return Some(key);
+                        }
+                    }
+                    return Some(first.to_string());
+                }
+                // A qualified call must never borrow an unrelated bare
+                // function's signature (§13.5.2 / §26.3 / §23.8).
+                let sep = if is_package(first) {
+                    "::"
+                } else {
+                    "."
+                };
+                Some(
+                    h.path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(sep),
+                )
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let base = callee_key(expr, None, locals, elab)?;
+                let sep = if is_package(&base) {
+                    "::"
+                } else {
+                    "."
+                };
+                Some(format!("{base}{sep}{}", member.name))
+            }
+            _ => None,
+        }
+    }
     fn check_call(
         callee_name: &str,
         args: &[Expression],
@@ -13156,26 +13233,34 @@ fn validate_ref_arg_lvalues(elab: &ElaboratedModule) -> Result<(), String> {
         }
         Ok(())
     }
-    fn walk_expr(e: &Expression, elab: &ElaboratedModule) -> Result<(), String> {
+    fn walk_expr(
+        e: &Expression,
+        elab: &ElaboratedModule,
+        package: Option<&str>,
+        locals: &HashMap<String, DataType>,
+    ) -> Result<(), String> {
         if let ExprKind::Call { func, args } = &e.kind {
-            if let ExprKind::Ident(h) = &func.kind {
-                if let Some(seg) = h.path.last() {
-                    check_call(&seg.name.name, args, elab)?;
-                }
+            if let Some(key) = callee_key(func, package, locals, elab) {
+                check_call(&key, args, elab)?;
             }
             for a in args {
-                walk_expr(a, elab)?;
+                walk_expr(a, elab, package, locals)?;
             }
             return Ok(());
         }
         Ok(())
     }
-    fn walk_stmt(s: &Statement, elab: &ElaboratedModule) -> Result<(), String> {
+    fn walk_stmt(
+        s: &Statement,
+        elab: &ElaboratedModule,
+        package: Option<&str>,
+        locals: &HashMap<String, DataType>,
+    ) -> Result<(), String> {
         match &s.kind {
-            StatementKind::Expr(e) => walk_expr(e, elab)?,
+            StatementKind::Expr(e) => walk_expr(e, elab, package, locals)?,
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                 for s in stmts {
-                    walk_stmt(s, elab)?;
+                    walk_stmt(s, elab, package, locals)?;
                 }
             }
             StatementKind::If {
@@ -13184,9 +13269,9 @@ fn validate_ref_arg_lvalues(elab: &ElaboratedModule) -> Result<(), String> {
                 condition: _,
                 ..
             } => {
-                walk_stmt(then_stmt, elab)?;
+                walk_stmt(then_stmt, elab, package, locals)?;
                 if let Some(e) = else_stmt {
-                    walk_stmt(e, elab)?;
+                    walk_stmt(e, elab, package, locals)?;
                 }
             }
             StatementKind::For { body, .. }
@@ -13194,31 +13279,51 @@ fn validate_ref_arg_lvalues(elab: &ElaboratedModule) -> Result<(), String> {
             | StatementKind::DoWhile { body, .. }
             | StatementKind::Forever { body }
             | StatementKind::Repeat { body, .. }
-            | StatementKind::Foreach { body, .. } => walk_stmt(body, elab)?,
+            | StatementKind::Foreach { body, .. } => walk_stmt(body, elab, package, locals)?,
             StatementKind::Case { items, .. } => {
                 for it in items {
-                    walk_stmt(&it.stmt, elab)?;
+                    walk_stmt(&it.stmt, elab, package, locals)?;
                 }
             }
-            StatementKind::TimingControl { stmt, .. } => walk_stmt(stmt, elab)?,
+            StatementKind::TimingControl { stmt, .. } => walk_stmt(stmt, elab, package, locals)?,
             _ => {}
         }
         Ok(())
     }
     for ib in &elab.initial_blocks {
-        walk_stmt(&ib.stmt, elab)?;
+        let mut locals = HashMap::default();
+        collect_stmt_declared_types(&ib.stmt, &mut locals);
+        walk_stmt(&ib.stmt, elab, None, &locals)?;
     }
     for ab in &elab.always_blocks {
-        walk_stmt(&ab.stmt, elab)?;
+        let mut locals = HashMap::default();
+        collect_stmt_declared_types(&ab.stmt, &mut locals);
+        walk_stmt(&ab.stmt, elab, None, &locals)?;
     }
-    for f in elab.functions.values() {
+    for (key, f) in elab.functions.iter() {
+        let package = declaring_package(key, f.span, false, elab);
+        let mut locals = HashMap::default();
+        for p in &f.ports {
+            locals.insert(p.name.name.clone(), p.data_type.clone());
+        }
         for s in &f.items {
-            walk_stmt(s, elab)?;
+            collect_stmt_declared_types(s, &mut locals);
+        }
+        for s in &f.items {
+            walk_stmt(s, elab, package, &locals)?;
         }
     }
-    for t in elab.tasks.values() {
+    for (key, t) in &elab.tasks {
+        let package = declaring_package(key, t.span, true, elab);
+        let mut locals = HashMap::default();
+        for p in &t.ports {
+            locals.insert(p.name.name.clone(), p.data_type.clone());
+        }
         for s in &t.items {
-            walk_stmt(s, elab)?;
+            collect_stmt_declared_types(s, &mut locals);
+        }
+        for s in &t.items {
+            walk_stmt(s, elab, package, &locals)?;
         }
     }
     Ok(())
