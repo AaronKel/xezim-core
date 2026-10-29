@@ -19,6 +19,10 @@ pub struct MacroDef {
     pub body: String,
 }
 
+/// Ends a macro usage at a `` paste and is removed once usages expand
+/// (`apply_token_pasting`). A character no source text holds.
+const PASTE_SEPARATOR: char = '\u{1}';
+
 pub struct Preprocessor {
     defines: HashMap<String, MacroDef>,
     /// Directories to search for `include files (in order).
@@ -2342,10 +2346,13 @@ impl Preprocessor {
             }
             result = next;
         }
+        if result.contains(PASTE_SEPARATOR) {
+            result.retain(|c| c != PASTE_SEPARATOR);
+        }
         result
     }
 
-    fn apply_token_pasting(text: &str) -> String {
+    fn apply_token_pasting(&self, text: &str) -> String {
         if !text.contains("``") {
             return text.to_string();
         }
@@ -2381,6 +2388,33 @@ impl Preprocessor {
                 // after `localparam` (br979), while `i``a` glues because there
                 // was no whitespace between the tokens to begin with.
                 i += 2;
+                // A usage of a defined macro ends at the `` (`` unit_`TAG``_n ``
+                // is `TAG then _n): keep a separator so the name does not run
+                // on into `TAG_n; `expand_macros` drops it after expansion,
+                // gluing the result (#616). A name the paste itself forms
+                // (`` `ID_``n `` with `ID_` no macro) is still pasted whole.
+                let ident_len = result
+                    .bytes()
+                    .rev()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$')
+                    .count();
+                if ident_len > 0 {
+                    let head = &result[..result.len() - ident_len];
+                    let name = &result[result.len() - ident_len..];
+                    // ...unless the pasted name is itself a macro: `` `x``y ``
+                    // with `AB` defined is `AB`.
+                    let next: String = text[i..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+                        .collect();
+                    if head.ends_with('`')
+                        && !head.ends_with("``")
+                        && self.defines.contains_key(name)
+                        && !self.defines.contains_key(&format!("{name}{next}"))
+                    {
+                        result.push(PASTE_SEPARATOR);
+                    }
+                }
                 continue;
             }
 
@@ -2398,7 +2432,7 @@ impl Preprocessor {
     fn expand_macros_once(&self, line: &str) -> String {
         let line_pasted;
         let line: &str = if line.contains("``") {
-            line_pasted = Self::apply_token_pasting(line);
+            line_pasted = self.apply_token_pasting(line);
             &line_pasted
         } else {
             line
@@ -2575,7 +2609,7 @@ impl Preprocessor {
                             actuals.push((pname.as_str(), arg));
                         }
                         let body = Self::substitute_formals(&def.body, &actuals);
-                        let body_pasted = Self::apply_token_pasting(&body);
+                        let body_pasted = self.apply_token_pasting(&body);
                         result.push_str(&body_pasted);
                     } else {
                         // §22.5.1: a macro defined with a formal list must be
@@ -2590,7 +2624,7 @@ impl Preprocessor {
                                 ),
                             ));
                         }
-                        let body_pasted = Self::apply_token_pasting(&def.body);
+                        let body_pasted = self.apply_token_pasting(&def.body);
                         result.push_str(&body_pasted);
                     }
                 } else {
