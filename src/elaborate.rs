@@ -6589,8 +6589,8 @@ fn collect_enum_member_names(td: &TypedefDeclaration, allowed: &mut HashSet<Stri
 
 /// Collect identifier names that are legal to reference from any class
 /// constraint regardless of class membership: package- and top-level enum
-/// constants, parameters/localparams, and `const` data declarations. Without
-/// these, a constraint such as `reg != ZERO` (where `ZERO` is a package enum
+/// constants, class names, parameters/localparams, and `const` data declarations.
+/// Without these, a constraint such as `reg != ZERO` (where `ZERO` is a package enum
 /// literal) is wrongly rejected as an undeclared identifier.
 fn collect_global_constraint_names(
     all_defs: &HashMap<String, Definition>,
@@ -6605,6 +6605,12 @@ fn collect_global_constraint_names(
             Definition::Package(p) => {
                 for item in &p.items {
                     match item {
+                        // §8.23 / §18.3 / §26.3: a package class is a legal
+                        // root of a scoped reference (`codes::REQUEST`), just
+                        // like a class recorded as a top-level definition.
+                        crate::ast::decl::PackageItem::Class(c) => {
+                            allowed.insert(c.name.name.clone());
+                        }
                         crate::ast::decl::PackageItem::Typedef(td) => {
                             allowed.insert(td.name.name.clone());
                             collect_enum_member_names(td, allowed);
