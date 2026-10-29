@@ -1436,6 +1436,20 @@ impl Parser {
         // Check for "inside" keyword
         let kind = if kind == CaseKind::Case && self.eat(TokenKind::KwInside).is_some() {
             CaseKind::CaseInside
+        } else if matches!(kind, CaseKind::Casex | CaseKind::Casez)
+            && self.at(TokenKind::KwInside)
+            && crate::RELAX_CASEX_INSIDE.get()
+        {
+            // XEZIM_RELAX_CASEX_INSIDE (#626): only `case` takes `inside`
+            // (A.6.7); read `casex (e) inside` as `case (e) inside`.
+            let span = self.bump().span;
+            self.diagnostics
+                .push(crate::diagnostics::Diagnostic::warning(
+                    "`inside` follows only `case`; read as `case (...) inside` \
+                     (IEEE 1800-2023 §12.5.4, A.6.7, XEZIM_RELAX_CASEX_INSIDE)",
+                    span,
+                ));
+            CaseKind::CaseInside
         } else {
             kind
         };
