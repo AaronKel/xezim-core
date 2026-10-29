@@ -1954,6 +1954,18 @@ impl Parser {
             let events = self.parse_event_expression_list();
             self.expect(TokenKind::RParen);
             EventControl::EventExpr(events)
+        } else if self.at(TokenKind::KwThis) && crate::RELAX_EVENT_THIS.get() {
+            // XEZIM_RELAX_EVENT_THIS (#625): a hierarchical identifier cannot
+            // start with `this` (A.6.5), so `@this.ev` needs parentheses;
+            // read it as `@(this.ev)`, as other tools do.
+            let span = self.current().span;
+            self.diagnostics
+                .push(crate::diagnostics::Diagnostic::warning(
+                    "an event control on `this.` needs parentheses; read as `@(this. ...)` \
+                     (IEEE 1800-2017 §9.4.2, A.6.5, XEZIM_RELAX_EVENT_THIS)",
+                    span,
+                ));
+            EventControl::EventExpr(self.parse_event_expression_term())
         } else {
             let expr = self.parse_hierarchical_identifier_expr();
             EventControl::HierIdentifier(expr)
