@@ -1833,6 +1833,8 @@ fn parse_and_elaborate(
     // §19.3 $unit-scope covergroups, injected into every module like the
     // $unit subroutines.
     let mut top_level_covergroups: Vec<ast::decl::CovergroupDeclaration> = Vec::new();
+    // §3.12.1, A.1.11: `$unit` property and sequence declarations (#653).
+    let mut top_level_assertion_decls: Vec<ast::decl::ModuleItem> = Vec::new();
     let mut top_level_binds: Vec<ast::decl::BindDirective> = Vec::new();
     // §18.5.1 $unit-scope out-of-class constraint definitions (class, name).
     let mut top_level_ooc_constraints: Vec<(String, String, Vec<ast::decl::ConstraintItem>)> =
@@ -2164,6 +2166,12 @@ fn parse_and_elaborate(
             ast::Description::PackageItem(ast::decl::PackageItem::Covergroup(cg)) => {
                 top_level_covergroups.push(cg);
             }
+            ast::Description::PackageItem(ast::decl::PackageItem::Property(pd)) => {
+                top_level_assertion_decls.push(ast::decl::ModuleItem::PropertyDeclaration(pd));
+            }
+            ast::Description::PackageItem(ast::decl::PackageItem::Sequence(sd)) => {
+                top_level_assertion_decls.push(ast::decl::ModuleItem::SequenceDeclaration(sd));
+            }
             ast::Description::Bind(b) => {
                 top_level_binds.push(b);
             }
@@ -2217,6 +2225,7 @@ fn parse_and_elaborate(
         || !top_level_vars.is_empty()
         || !top_level_nets.is_empty()
         || !top_level_covergroups.is_empty()
+        || !top_level_assertion_decls.is_empty()
         || !top_level_dpi_imports.is_empty()
         || !top_level_dpi_exports.is_empty()
     {
@@ -2339,6 +2348,22 @@ fn parse_and_elaborate(
                 }
                 for e in top_level_dpi_exports.iter() {
                     items.push(ast::decl::ModuleItem::DPIExport(e.clone()));
+                }
+                // A module's own property or sequence of the same name
+                // shadows the $unit one.
+                let decl_name = |it: &ast::decl::ModuleItem| match it {
+                    ast::decl::ModuleItem::PropertyDeclaration(p) => Some(p.name.name.clone()),
+                    ast::decl::ModuleItem::SequenceDeclaration(s) => Some(s.name.name.clone()),
+                    _ => None,
+                };
+                for d in top_level_assertion_decls.iter().rev() {
+                    let n = decl_name(d);
+                    if !items
+                        .iter()
+                        .any(|it| decl_name(it).is_some() && decl_name(it) == n)
+                    {
+                        items.insert(0, d.clone());
+                    }
                 }
                 // A module's own covergroup of the same name shadows the
                 // $unit one.

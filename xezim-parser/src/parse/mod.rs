@@ -547,6 +547,11 @@ impl Parser {
                 Some(Description::PackageItem(self.parse_package_item().unwrap()))
             }
             TokenKind::KwTask => Some(Description::PackageItem(self.parse_package_item().unwrap())),
+            // §3.12.1, A.1.11: a property or sequence declaration is a
+            // package item, so it may sit at compilation-unit scope (#653).
+            TokenKind::KwProperty | TokenKind::KwSequence => {
+                self.parse_package_item().map(Description::PackageItem)
+            }
             TokenKind::Directive => {
                 if !self.recover_undefined_macro() {
                     self.bump();
