@@ -530,7 +530,7 @@ impl Parser {
         self.pop_let_scope();
         self.expect(TokenKind::KwEndfunction);
         let endlabel = self.parse_end_label_checked(&name.name.name);
-        self.check_tf_body_redeclarations(&ports[ansi_ports..], &items);
+        self.check_tf_body_redeclarations(&ports[ansi_ports..], &mut items);
         Self::merge_nonansi_port_types(&mut ports, &mut items);
         // §8.7: a class constructor takes its arguments in a port list only;
         // its body has no tf_item_declaration.
@@ -678,7 +678,7 @@ impl Parser {
         self.pop_let_scope();
         self.expect(TokenKind::KwEndtask);
         let endlabel = self.parse_end_label();
-        self.check_tf_body_redeclarations(&ports[ansi_ports..], &items);
+        self.check_tf_body_redeclarations(&ports[ansi_ports..], &mut items);
         Self::merge_nonansi_port_types(&mut ports, &mut items);
         TaskDeclaration {
             lifetime,
@@ -700,42 +700,108 @@ impl Parser {
     fn check_tf_body_redeclarations(
         &mut self,
         body_ports: &[FunctionPort],
-        items: &[super::super::ast::stmt::Statement],
+        items: &mut Vec<super::super::ast::stmt::Statement>,
+    ) {
+        if crate::strict_checks() || crate::RELAX_DUPLICATE_DECLS.get() {
+            self.redeclarations(body_ports, items, "subroutine");
+        }
+    }
+
+    /// `XEZIM_RELAX_DUPLICATE_DECLS`: a repeated name in a `begin ... end` or
+    /// `fork ... join` block's declarations is ignored with a warning. Without
+    /// it a block is not checked.
+    pub(super) fn check_block_redeclarations(
+        &mut self,
+        items: &mut Vec<super::super::ast::stmt::Statement>,
+    ) {
+        if crate::RELAX_DUPLICATE_DECLS.get() {
+            self.redeclarations(&[], items, "block");
+        }
+    }
+
+    /// §3.13: a name already declared in a subroutine's or block's
+    /// declarations may not be declared again. An error; with
+    /// `XEZIM_RELAX_DUPLICATE_DECLS` a warning, and the second variable
+    /// declaration is dropped so the first's type and initializer stay (a
+    /// port declared after the variable is kept).
+    fn redeclarations(
+        &mut self,
+        body_ports: &[FunctionPort],
+        items: &mut Vec<super::super::ast::stmt::Statement>,
+        scope: &str,
     ) {
         use super::super::ast::stmt::StatementKind;
-        if !crate::strict_checks() {
-            return;
-        }
-        let mut decls: Vec<(&Identifier, bool)> =
-            body_ports.iter().map(|p| (&p.name, true)).collect();
-        for it in items {
+        let relax = crate::RELAX_DUPLICATE_DECLS.get();
+        // (name, span start, statement and declarator index of a variable)
+        let mut decls: Vec<(&Identifier, Option<(usize, usize)>)> =
+            body_ports.iter().map(|p| (&p.name, None)).collect();
+        for (si, it) in items.iter().enumerate() {
             if let StatementKind::VarDecl { declarators, .. } = &it.kind {
-                decls.extend(declarators.iter().map(|d| (&d.name, false)));
+                decls.extend(
+                    declarators
+                        .iter()
+                        .enumerate()
+                        .map(|(di, d)| (&d.name, Some((si, di)))),
+                );
             }
         }
         decls.sort_by_key(|(id, _)| id.span.start);
         // name -> variable declarations seen so far
         let mut vars: std::collections::HashMap<&str, u32> = Default::default();
-        let mut errs = Vec::new();
-        for (id, is_port) in decls {
+        let mut diags = Vec::new();
+        let mut dropped: Vec<(usize, usize)> = Vec::new();
+        for (id, var) in decls {
             let n = vars.entry(id.name.as_str()).or_default();
-            let redeclared = if is_port {
-                *n > 0
-            } else {
-                *n += 1;
-                *n > 1
+            let redeclared = match var {
+                None => *n > 0,
+                Some(_) => {
+                    *n += 1;
+                    *n > 1
+                }
             };
-            if redeclared {
-                errs.push(crate::diagnostics::Diagnostic::error(
+            if !redeclared {
+                continue;
+            }
+            diags.push(if relax {
+                if let Some(at) = var {
+                    dropped.push(at);
+                }
+                crate::diagnostics::Diagnostic::warning(
                     format!(
-                        "'{}' is already declared in this subroutine (IEEE 1800-2017 §23.2.2.1)",
+                        "'{}' is already declared in this {scope}; the second declaration is \
+                         ignored (IEEE 1800-2023 §3.13, XEZIM_RELAX_DUPLICATE_DECLS)",
                         id.name
                     ),
                     id.span,
-                ));
-            }
+                )
+            } else {
+                crate::diagnostics::Diagnostic::error(
+                    format!(
+                        "'{}' is already declared in this {scope} (IEEE 1800-2023 §3.13)",
+                        id.name
+                    ),
+                    id.span,
+                )
+            });
         }
-        self.diagnostics.extend(errs);
+        self.diagnostics.extend(diags);
+        if dropped.is_empty() {
+            return;
+        }
+        let mut si = 0;
+        items.retain_mut(|it| {
+            let here = si;
+            si += 1;
+            let StatementKind::VarDecl { declarators, .. } = &mut it.kind else {
+                return true;
+            };
+            let mut di = 0;
+            declarators.retain(|_| {
+                di += 1;
+                !dropped.contains(&(here, di - 1))
+            });
+            !declarators.is_empty()
+        });
     }
 
     /// §13.3: the non-ANSI style may declare a port's DIRECTION and its DATA

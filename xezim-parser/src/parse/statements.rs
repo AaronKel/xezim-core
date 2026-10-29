@@ -1265,6 +1265,7 @@ impl Parser {
             self.parse_block_item(&mut stmts);
         }
         self.pop_let_scope();
+        self.check_block_redeclarations(&mut stmts);
         self.expect(TokenKind::KwEnd);
         // §9.3.4: an end label must match the block name (if any).
         match name {
@@ -1305,6 +1306,7 @@ impl Parser {
             self.parse_block_item(&mut stmts);
         }
         self.pop_let_scope();
+        self.check_block_redeclarations(&mut stmts);
         let join_type = match self.current_kind() {
             TokenKind::KwJoin_any => {
                 self.bump();
