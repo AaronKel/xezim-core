@@ -175,6 +175,15 @@ fn one_step_is_a_delay_value() {
     );
     assert_eq!(ast.matches("\"1step\"").count(), 4, "{ast}");
     assert!(!ast.contains("\"step\""), "{ast}");
+    // Every pair of a long run joins, and the tokens between stay in order.
+    let body: String = (0..200).map(|k| format!("#1step a = {k};\n")).collect();
+    let ast = parse_clean(&format!(
+        "module m; int a;\n initial begin\n{body} end\nendmodule\n"
+    ));
+    assert_eq!(ast.matches("\"1step\"").count(), 200, "{ast}");
+    assert!(!ast.contains("\"step\""), "{ast}");
+    let at = |v: &str| ast.find(&format!("value: \"{v}\"")).expect(v);
+    assert!(at("0") < at("199"), "{ast}");
     // Outside a delay the pair stays apart, an error.
     assert!(
         !parse("module m; int x; initial x = 1step; endmodule\n")
