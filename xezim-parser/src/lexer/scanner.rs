@@ -27,6 +27,95 @@ pub struct Lexer<'a> {
 struct KwRegion {
     verilog: bool,
     no_config: bool,
+    /// 1364-1995: the words 1364-2001 added (`generate`, `signed`, ...)
+    /// are names too.
+    v1995: bool,
+}
+
+impl KwRegion {
+    /// The keyword set of a §22.14 version specifier, `None` for an unknown
+    /// one. A `-noconfig` suffix on any version leaves the configuration
+    /// keywords out, as 1364-2001-noconfig does.
+    fn of_version(ver: &str) -> Option<Self> {
+        let (base, no_config) = match ver.strip_suffix("-noconfig") {
+            Some(b) => (b, true),
+            None => (ver, false),
+        };
+        KEYWORD_VERSIONS.contains(&base).then(|| KwRegion {
+            verilog: base.starts_with("1364"),
+            // Config keywords arrived in 1364-2001.
+            no_config: no_config || base == "1364-1995",
+            v1995: base == "1364-1995",
+        })
+    }
+}
+
+/// The §22.14 version specifiers.
+pub const KEYWORD_VERSIONS: &[&str] = &[
+    "1364-1995",
+    "1364-2001",
+    "1364-2005",
+    "1800-2005",
+    "1800-2009",
+    "1800-2012",
+    "1800-2017",
+    "1800-2023",
+];
+
+/// The keyword set outside every `begin_keywords` region (#608): set by
+/// `set_default_keywords` / `set_no_config_keywords`, else from
+/// `XEZIM_KEYWORDS` / `XEZIM_NO_CONFIG_KEYWORDS=1`, else the full set.
+static DEFAULT_KEYWORDS: std::sync::Mutex<Option<KwRegion>> = std::sync::Mutex::new(None);
+
+fn default_region() -> KwRegion {
+    if let Some(r) = *DEFAULT_KEYWORDS.lock().unwrap_or_else(|e| e.into_inner()) {
+        return r;
+    }
+    static ENV: std::sync::OnceLock<KwRegion> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| {
+        let mut r = std::env::var("XEZIM_KEYWORDS")
+            .ok()
+            .and_then(|v| KwRegion::of_version(v.trim()))
+            .unwrap_or_default();
+        r.no_config |= std::env::var("XEZIM_NO_CONFIG_KEYWORDS").ok().as_deref() == Some("1");
+        r
+    })
+}
+
+/// §22.14 leaves the keyword set outside `begin_keywords` regions to the
+/// implementation: choose it by version specifier (`1364-1995`, ...,
+/// `1800-2023`, each also with `-noconfig`). An unknown one is an error that
+/// lists the valid ones.
+pub fn set_default_keywords(version: &str) -> Result<(), String> {
+    let r = KwRegion::of_version(version).ok_or_else(|| {
+        format!(
+            "unknown keyword set '{version}'; one of {} (each also with -noconfig) \
+             (IEEE 1800-2023 §22.14)",
+            KEYWORD_VERSIONS.join(", ")
+        )
+    })?;
+    let mut d = DEFAULT_KEYWORDS.lock().unwrap_or_else(|e| e.into_inner());
+    let keep = d.is_some_and(|d| d.no_config);
+    *d = Some(KwRegion {
+        no_config: r.no_config || keep,
+        ..r
+    });
+    Ok(())
+}
+
+/// Outside `begin_keywords` regions, read the ten configuration keywords
+/// (`instance`, `cell`, `use`, ...) as names (#608).
+pub fn set_no_config_keywords(on: bool) {
+    let mut d = DEFAULT_KEYWORDS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut r = d.unwrap_or_default();
+    r.no_config = on;
+    *d = Some(r);
+}
+
+/// The default keyword set, for cache keys: version flags as bits.
+pub fn default_keywords_key() -> u8 {
+    let r = default_region();
+    r.verilog as u8 | (r.no_config as u8) << 1 | (r.v1995 as u8) << 2
 }
 
 impl<'a> Lexer<'a> {
@@ -690,12 +779,12 @@ impl<'a> Lexer<'a> {
                 if self.pos < self.input.len() {
                     self.pos += 1;
                 } // closing quote
-                self.kw_stack.push(KwRegion {
-                    verilog: ver.starts_with("1364"),
-                    // Config keywords arrived in 1364-2001, and the
-                    // "-noconfig" set leaves them out (§22.14).
-                    no_config: ver == "1364-1995" || ver.ends_with("-noconfig"),
-                });
+                self.kw_stack
+                    .push(KwRegion::of_version(&ver).unwrap_or(KwRegion {
+                        verilog: ver.starts_with("1364"),
+                        no_config: ver.ends_with("-noconfig"),
+                        v1995: false,
+                    }));
             } else {
                 // Malformed (no version) — keep the stack balanced anyway.
                 self.pos = save;
@@ -753,9 +842,10 @@ impl<'a> Lexer<'a> {
         // §22.14: inside a `begin_keywords "1364-*"` region, a SystemVerilog-
         // only keyword is a legal identifier (e.g. `reg logic;` declares a reg
         // named `logic` in Verilog-2001).
-        let region = self.kw_stack.last().copied().unwrap_or_default();
+        let region = self.kw_stack.last().copied().unwrap_or_else(default_region);
         if (region.verilog && is_sv_only_keyword(&text))
             || (region.no_config && is_config_keyword(&text))
+            || (region.v1995 && is_1364_2001_keyword(&text))
         {
             kind = TokenKind::Identifier;
         }
@@ -999,6 +1089,25 @@ fn is_config_keyword(s: &str) -> bool {
             | "liblist"
             | "library"
             | "use"
+    )
+}
+
+/// §22.14 Table 22-2: a keyword 1364-2001 added over 1364-1995, other than
+/// the configuration keywords.
+fn is_1364_2001_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "automatic"
+            | "endgenerate"
+            | "generate"
+            | "genvar"
+            | "localparam"
+            | "noshowcancelled"
+            | "pulsestyle_ondetect"
+            | "pulsestyle_onevent"
+            | "showcancelled"
+            | "signed"
+            | "unsigned"
     )
 }
 
