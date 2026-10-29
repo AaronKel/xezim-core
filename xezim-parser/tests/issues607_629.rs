@@ -185,7 +185,8 @@ fn one_step_is_a_delay_value() {
 
 /// §22.5.1: a macro usage ends at a `` paste, so `` `JOIN(unit_`TAG, _n) ``
 /// is `unit_alpha_n`, not a use of `TAG_n`; a pasted name that is itself a
-/// macro (`` `x``y `` with `AB` defined) is still pasted whole (#616).
+/// macro (`` `x``y `` with `AB` defined, `` `P``A``B `` with `PAB`) is still
+/// pasted whole (#616).
 #[test]
 fn token_paste_ends_a_macro_usage() {
     let (out, errors, _) = preprocess(
@@ -204,6 +205,21 @@ fn token_paste_ends_a_macro_usage() {
     assert!(errors.is_empty(), "{errors:?}");
     let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(flat.contains("int v = 99;"), "{out}");
+
+    // A paste chain forms its name whole: `P``A``B with PAB defined.
+    let (out, errors, _) = preprocess(
+        "`define P 1\n`define PAB 77\n`define CHAIN(x,y) `P``x``y\n\
+         module m; int v = `CHAIN(A,B);\nendmodule\n",
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("int v = 77;"), "{out}");
+
+    // A 0x01 byte of the source survives an expansion that pasted nothing.
+    let (out, errors, _) =
+        preprocess("`define V 7\nmodule m; int v = `V; string s = \"\u{1}\";\nendmodule\n");
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(out.contains("int v = 7; string s = \"\u{1}\";"), "{out:?}");
 }
 
 /// §8.24, §8.23: an out-of-block method of a nested class names every scope

@@ -20,7 +20,7 @@ pub struct MacroDef {
 }
 
 /// Ends a macro usage at a `` paste and is removed once usages expand
-/// (`apply_token_pasting`). A character no source text holds.
+/// (`apply_token_pasting`). A character source text rarely holds.
 const PASTE_SEPARATOR: char = '\u{1}';
 
 pub struct Preprocessor {
@@ -79,6 +79,9 @@ pub struct Preprocessor {
     /// Undefined macro names seen while expanding the current line; reported
     /// (located at the use) when the line is done.
     undefined_seen: std::cell::RefCell<Vec<String>>,
+    /// Whether `apply_token_pasting` left a `PASTE_SEPARATOR` that
+    /// `expand_macros` must remove; a 0x01 byte of the source is kept.
+    paste_separated: std::cell::Cell<bool>,
     /// Files contributing to the text being produced, for its line map.
     map_files: Vec<MapFile>,
     /// Macro names referenced by the line map, and their indices.
@@ -341,6 +344,7 @@ impl Preprocessor {
             unconnected_pull: None,
             expansion_errors: std::cell::RefCell::new(Vec::new()),
             undefined_seen: std::cell::RefCell::new(Vec::new()),
+            paste_separated: std::cell::Cell::new(false),
             map_files: Vec::new(),
             map_macros: Vec::new(),
             map_columns: Vec::new(),
@@ -2440,7 +2444,7 @@ impl Preprocessor {
             }
             result = next;
         }
-        if result.contains(PASTE_SEPARATOR) {
+        if self.paste_separated.replace(false) {
             result.retain(|c| c != PASTE_SEPARATOR);
         }
         result
@@ -2495,18 +2499,13 @@ impl Preprocessor {
                 if ident_len > 0 {
                     let head = &result[..result.len() - ident_len];
                     let name = &result[result.len() - ident_len..];
-                    // ...unless the pasted name is itself a macro: `` `x``y ``
-                    // with `AB` defined is `AB`.
-                    let next: String = text[i..]
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
-                        .collect();
                     if head.ends_with('`')
                         && !head.ends_with("``")
                         && self.defines.contains_key(name)
-                        && !self.defines.contains_key(&format!("{name}{next}"))
+                        && !self.paste_forms_macro(name, &text[i..])
                     {
                         result.push(PASTE_SEPARATOR);
+                        self.paste_separated.set(true);
                     }
                 }
                 continue;
@@ -2521,6 +2520,31 @@ impl Preprocessor {
             i += ch.len_utf8();
         }
         result
+    }
+
+    /// Whether the names a paste chain joins onto `name` form a macro, so the
+    /// usage is pasted whole: `` `x``y `` with `AB` defined is `AB`, and
+    /// `` `P``A``B `` with `PAB` defined is `PAB` (§22.5.1). `rest` is the
+    /// text after the first ``.
+    fn paste_forms_macro(&self, name: &str, mut rest: &str) -> bool {
+        let mut joined = name.to_string();
+        loop {
+            let seg = rest
+                .bytes()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$')
+                .count();
+            if seg == 0 {
+                return false;
+            }
+            joined.push_str(&rest[..seg]);
+            if self.defines.contains_key(&joined) {
+                return true;
+            }
+            match rest[seg..].strip_prefix("``") {
+                Some(r) => rest = r,
+                None => return false,
+            }
+        }
     }
 
     /// Whether `text` holds a `` `define `` of `name`.
