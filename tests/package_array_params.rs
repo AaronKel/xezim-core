@@ -345,3 +345,31 @@ endmodule
     assert!(design.signals.contains_key("u_on.gen_merged.flag"));
     assert!(!design.signals.contains_key("u_off.gen_merged.flag"));
 }
+
+/// §23.10.2: an array parameter default or override that names another
+/// array parameter takes that parameter's elements.
+#[test]
+fn array_parameter_named_by_another_array_parameter() {
+    let design = elaborate(
+        r#"
+package p; parameter logic [33:0] A[2]='{34'h1, 34'h2}; endpackage
+module leaf #(parameter logic [33:0] R[2]=p::A); endmodule
+module mid #(parameter logic [33:0] R[2]='{34'h7, 34'h7});
+ localparam logic [33:0] L[2]='{34'h3, 34'h4};
+ leaf #(.R(R)) u_header(); leaf #(.R(L)) u_body();
+endmodule
+module top; leaf u_default(); mid #(.R('{34'h5, 34'h6})) u_mid(); endmodule
+"#,
+    );
+    let elems = |name: &str| {
+        [0, 1].map(|i| {
+            design
+                .parameters
+                .get(&format!("{name}[{i}]"))
+                .and_then(|v| v.to_u64())
+        })
+    };
+    assert_eq!(elems("u_default.R"), [Some(1), Some(2)]);
+    assert_eq!(elems("u_mid.u_header.R"), [Some(5), Some(6)]);
+    assert_eq!(elems("u_mid.u_body.R"), [Some(3), Some(4)]);
+}

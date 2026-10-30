@@ -72,6 +72,17 @@ pub(super) fn elements(
     );
     let items =
         init.and_then(|e| pattern_items(e, &outer, dims.len() > 1, struct_elem, init_params));
+    // An initializer that names another unpacked-array parameter (`= pkg::A`)
+    // evaluates to that array packed (see `packed`), so slice it like an
+    // override.
+    let referenced;
+    let override_val = match (override_val, &items, init) {
+        (None, None, Some(e)) => {
+            referenced = eval_const_expr_val(e, init_params);
+            Some(&referenced)
+        }
+        (v, _, _) => v,
+    };
     let elem_w = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
     // §6.20.2 / §23.10: `localparam t OFF[N] = pkg::OffloadInstr` (and the
     // same expression as an instance override) is a whole-array copy, not a
@@ -255,6 +266,13 @@ fn pattern_items(
         .collect()
 }
 
+/// The whole array as one value, the element at the left bound leftmost: the
+/// layout an override carries, so a bare reference to the array (`.R(R)`,
+/// `= pkg::A`) hands its elements on.
+pub(super) fn packed(values: &[(String, Value)]) -> Value {
+    Value::concat_refs(values.iter().map(|(_, v)| v))
+}
+
 pub(super) fn register(
     elab: &mut ElaboratedModule,
     prefix: &str,
@@ -300,6 +318,8 @@ pub(super) fn register(
             .or_insert(fields);
     }
     register_shape(elab, &full_name, &shape, width);
+    let whole = packed(&values);
+    params_insert_traced(&mut elab.parameters, line!(), full_name.clone(), whole);
     // §6.20.2: aggregate parameter elements use whole Value storage.
     // An unpacked variable type would route their member reads to separate
     // field signals, which this constant representation does not allocate.
