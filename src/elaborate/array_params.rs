@@ -92,6 +92,7 @@ pub(super) fn elements(
     );
     let items =
         init.and_then(|e| pattern_items(e, &outer, dims.len() > 1, struct_elem, init_params));
+    let elem_w = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
     // An initializer that names another unpacked-array parameter (`= pkg::A`)
     // evaluates to that array packed (see `packed`), so slice it like an
     // override.
@@ -103,26 +104,20 @@ pub(super) fn elements(
         }
         (v, _, _) => v,
     };
-    let elem_w = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
-    // §6.20.2 / §23.10: `localparam t OFF[N] = pkg::OffloadInstr` (and the
-    // same expression as an instance override) is a whole-array copy, not a
-    // pattern. Without this the initializer is refused and every element
-    // stays at the type's default — x for a `logic` struct — so a predecoder
-    // table of instruction masks never matches.
-    if override_val.is_none() && items.is_none() && dims.len() == 1 {
-        if let Some(init) = init
-            && let Some(copied) =
-                referenced_array_elements(name, &outer, init, init_params, elab)
-        {
-            return Some(copied);
-        }
-    }
     let row_count = dims[1..].iter().try_fold(1usize, |n, d| {
         n.checked_mul(const_dim_indices(std::slice::from_ref(d), params)?.len())
     })?;
     let row_w = row_count.checked_mul(elem_w as usize)?;
     if let Some(v) = override_val {
         if (v.width as usize) < row_w.checked_mul(outer.len())? {
+            // A legacy environment may carry only individual array elements.
+            if dims.len() == 1
+                && let Some(init) = init
+                && let Some(copied) =
+                    referenced_array_elements(name, &outer, init, init_params, elab)
+            {
+                return Some(copied);
+            }
             return None;
         }
     } else if items.as_ref()?.len() != outer.len() {
@@ -150,7 +145,14 @@ pub(super) fn elements(
             continue;
         }
         let mut value = if let Some(v) = packed {
-            v
+            // §6.20.2: the whole-array transport stores real elements as
+            // IEEE 754 bits. Restore their type after slicing, without a
+            // numeric integer-to-real conversion.
+            if is_type_real_resolved(data_type, &elab.typedef_types) {
+                Value::from_f64(f64::from_bits(v.raw_bits().0))
+            } else {
+                v
+            }
         } else {
             let item = item?;
             pack_struct_const_value(

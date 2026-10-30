@@ -24239,15 +24239,22 @@ fn register_pkg_param_elem(
     if !pkg.is_empty() {
         keys.push(format!("{pkg}.{name}"));
     }
-    if let Some(ew) = packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs) {
-        for k in &keys {
-            elab.packed_signal_elem_widths.insert(k.clone(), ew);
-            tls_register_elem_w(k, ew);
-        }
-    }
-    if let Some(fdims) = packed_full_dims_of(data_type, &elab.parameters) {
-        for k in keys {
-            elab.packed_full_dims.insert(k, fdims.clone());
+    let msb0 = packed_outer_elem(data_type, &elab.parameters, &elab.typedef_types)
+        .is_some_and(|(_, msb0)| msb0);
+    for key in keys {
+        register_packed_param_index(elab, &key, data_type, None);
+        if let Some(&ew) = elab.packed_signal_elem_widths.get(&key) {
+            tls_register_elem_w(&key, ew);
+            // §7.4.5: the left bound of an ascending packed range is the
+            // most significant element, in constant expressions as at runtime.
+            PACKED_ELEM_MSB0_TLS.with(|c| {
+                let mut set = c.borrow_mut();
+                if msb0 {
+                    set.insert(key.clone());
+                } else {
+                    set.remove(&key);
+                }
+            });
         }
     }
 }
@@ -26927,21 +26934,6 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             }
             if let Some(elem) = const_packed_array_elem(base, &base_val, idx, params) {
                 return elem;
-            }
-            // `pkg::P[i]` parses as a member access on the package name.
-            if let ExprKind::MemberAccess { expr, member } = &base.kind
-                && let ExprKind::Ident(pkg) = &expr.kind
-                && let [seg] = pkg.path.as_slice()
-                && let Some(elem_w) = PACKED_ELEM_W_TLS.with(|c| {
-                    c.borrow()
-                        .get(&format!("{}.{}", seg.name.name, member.name))
-                        .copied()
-                })
-            {
-                let lo = (idx as u32).saturating_mul(elem_w);
-                if lo + elem_w <= base_val.width {
-                    return base_val.range_select((lo + elem_w - 1) as usize, lo as usize);
-                }
             }
             let i = idx as usize;
             if (i as u32) < base_val.width {
