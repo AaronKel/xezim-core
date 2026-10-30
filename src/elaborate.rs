@@ -12729,9 +12729,18 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
             }
         }
         for key in keys {
-            let Some(cls) = elab.classes.get_mut(&key).map(std::sync::Arc::make_mut) else {
+            let Some(mut linked) = elab.classes.get(&key).cloned() else {
                 continue;
             };
+            // §8.24 / §26.3: imported and package-qualified spellings name
+            // the same class. Preserve that identity when attaching an extern
+            // body: mutating only one Arc entry leaves the other spelling's
+            // prototype unlinked (including constructors reached via aliases).
+            let aliases: Vec<String> = elab.classes.iter()
+                .filter(|(_, cls)| std::sync::Arc::ptr_eq(cls, &linked))
+                .map(|(name, _)| name.clone())
+                .collect();
+            let cls = std::sync::Arc::make_mut(&mut linked);
             let methods = std::sync::Arc::make_mut(&mut cls.methods);
             if let Some(existing) = methods.get_mut(&method_name) {
                 existing.kind = kind.clone();
@@ -12744,6 +12753,9 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
                         span,
                     },
                 );
+            }
+            for alias in aliases {
+                elab.classes.insert(alias, linked.clone());
             }
         }
     };
