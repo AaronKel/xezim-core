@@ -1188,6 +1188,13 @@ pub struct ElaboratedClass {
     /// `foreach` binds a SIGNED index with its true width.
     #[serde(default)]
     pub static_assoc_index_props: HashMap<String, (u32, bool)>,
+    /// §8.25: the KEY type of an instance assoc member whose packed range
+    /// depends on a class parameter (`logic [7:0] m[a_t]` with
+    /// `typedef logic [AW-1:0] a_t;`). `assoc_index_props` holds the width at
+    /// the DEFAULT parameters; construction re-sizes the key from this type
+    /// for the specialization the object actually has.
+    #[serde(default)]
+    pub assoc_key_decl_types: HashMap<String, DataType>,
     /// Fixed-size `static` array members (`static int S[3]`, `static bit
     /// m[2:0]`): (name, lo, hi, element width). §8.9 gives every instance of
     /// the class ONE shared copy, so — exactly like `static_collections` —
@@ -2003,6 +2010,61 @@ fn class_binds_values(c: &ClassDeclaration) -> bool {
         })
 }
 
+/// The target of the class-local typedef chain `t` names (`mem_addr_t` in
+/// `logic [7:0] m[mem_addr_t]`), at most `n` aliases deep, so its width follows
+/// this class's parameters (§6.18, §8.25); `t` itself for any other type.
+fn class_local_typedef_target<'a>(c: &'a ClassDeclaration, t: &'a DataType, n: u8) -> &'a DataType {
+    if let DataType::TypeReference {
+        name,
+        dimensions,
+        type_args,
+        ..
+    } = t
+        && n > 0
+        && dimensions.is_empty()
+        && type_args.is_empty()
+        && !name.has_scope()
+    {
+        for item in &c.items {
+            if let ClassItem::Typedef(td) = item
+                && td.name.name == name.name.name
+                && td.dimensions.is_empty()
+            {
+                return class_local_typedef_target(c, &td.data_type, n - 1);
+            }
+        }
+    }
+    t
+}
+
+fn expr_names_any(e: &Expression, names: &HashSet<String>) -> bool {
+    let mut hit = false;
+    for_each_sub_expr(e, &mut |x| {
+        hit |= matches!(&x.kind, ExprKind::Ident(h)
+            if h.path.len() == 1 && names.contains(&h.path[0].name.name));
+    });
+    hit
+}
+
+/// Whether a range depends on a header parameter, also through a constant
+/// function (`$clog2(N)`) or a class-body localparam (§8.25, §6.20.1).
+fn range_refs_class_header_param(c: &ClassDeclaration, l: &Expression, r: &Expression) -> bool {
+    let mut params = HashSet::default();
+    c.params.iter().for_each(|p| decl_param_names(p, &mut params));
+    for item in &c.items {
+        if let ClassItem::Parameter(pd) = item
+            && let ParameterKind::Data { assignments, .. } = &pd.kind
+        {
+            for a in assignments {
+                if a.init.as_ref().is_some_and(|e| expr_names_any(e, &params)) {
+                    params.insert(a.name.name.clone());
+                }
+            }
+        }
+    }
+    expr_names_any(l, &params) || expr_names_any(r, &params)
+}
+
 fn elaborate_class_in_scope(
     c: &ClassDeclaration,
     scope_params: Option<&HashMap<String, Value>>,
@@ -2084,6 +2146,7 @@ fn elaborate_class_in_scope(
     let mut assoc_properties: HashMap<String, bool> = HashMap::default();
     let mut assoc_key_types: HashMap<String, String> = HashMap::default();
     let mut assoc_index_props: HashMap<String, (u32, bool)> = HashMap::default();
+    let mut assoc_key_decl_types: HashMap<String, DataType> = HashMap::default();
     let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
     let mut queue_property_names = HashSet::default();
     let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
@@ -2279,8 +2342,9 @@ fn elaborate_class_in_scope(
                                         // A typedef'd key (`k12_t`) resolves through the
                                         // installed typedef table; without it the
                                         // index width fell back to 32 bits.
+                                        let kt = class_local_typedef_target(c, kdt, u8::MAX);
                                         let kw = typedefs_snapshot(|td| {
-                                            resolve_type_width(kdt, class_params, td)
+                                            resolve_type_width(kt, class_params, td)
                                         });
                                         if kw > 0 {
                                             static_assoc_index_props.insert(
@@ -2439,14 +2503,25 @@ fn elaborate_class_in_scope(
                                     // A typedef'd key (`k12_t`) resolves through the
                                     // installed typedef table; without it the
                                     // index width fell back to 32 bits.
+                                    let kt = class_local_typedef_target(c, kdt, u8::MAX);
                                     let kw = typedefs_snapshot(|td| {
-                                        resolve_type_width(kdt, class_params, td)
+                                        resolve_type_width(kt, class_params, td)
                                     });
                                     if kw > 0 {
                                         assoc_index_props.insert(
                                             decl.name.name.clone(),
                                             (kw, is_type_signed(kdt)),
                                         );
+                                    }
+                                    if let DataType::IntegerVector { dimensions, .. }
+                                    | DataType::Implicit { dimensions, .. } = kt
+                                        && dimensions.iter().any(|d| {
+                                            matches!(d, PackedDimension::Range { left, right, .. }
+                                                if range_refs_class_header_param(c, left, right))
+                                        })
+                                    {
+                                        assoc_key_decl_types
+                                            .insert(decl.name.name.clone(), kt.clone());
                                     }
                                 }
                             }
@@ -3133,6 +3208,7 @@ fn elaborate_class_in_scope(
         assoc_properties,
         assoc_key_types,
         assoc_index_props,
+        assoc_key_decl_types,
         queue_properties,
         queue_property_names,
         property_inits,
