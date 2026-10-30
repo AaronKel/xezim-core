@@ -21436,8 +21436,7 @@ pub fn const_eval_i64_with_params(
                     // `logic [VLD_W-1:0]` then declared a degenerate vector and
                     // half the bits silently vanished.
                     ExprKind::TypeLiteral(dt) => {
-                        let td = TYPEDEFS_TLS.with(|t| t.borrow().clone());
-                        Some(resolve_type_width(dt, params, td.as_ref()) as i64)
+                        typedefs_snapshot(|td| Some(resolve_type_width(dt, params, td) as i64))
                     }
                     // §20.6.2 over a TYPEDEF with packed dimensions —
                     // `$bits(pkg::t [0:0][1:0])`. A scoped type name is not a
@@ -22933,31 +22932,34 @@ fn decl_shape_query(
         unpacked: shape.unpacked.len(),
         whole: None,
     };
-    let td = TYPEDEFS_TLS.with(|t| t.borrow().clone());
-    let elem_w = resolve_type_width(&shape.data_type, params, td.as_ref()) as i64;
-    let inner = TYPEDEF_SHAPES_TLS.with(|c| {
-        let c = c.borrow();
-        match &shape.data_type {
-            // A type parameter is known by the instance's width alone.
-            DataType::TypeReference {
-                name: tn,
-                dimensions,
-                ..
-            } if dimensions.is_empty() && shape.by_type_param => {
-                type_query_dims_by_name(&tn.name.name, params, td.as_ref(), None, None)
+    let (elem_w, inner) = typedefs_snapshot(|td| {
+        let elem_w = resolve_type_width(&shape.data_type, params, td) as i64;
+        let inner = TYPEDEF_SHAPES_TLS.with(|c| {
+            let c = c.borrow();
+            match &shape.data_type {
+                // A type parameter is known by the instance's width alone.
+                DataType::TypeReference {
+                    name: tn,
+                    dimensions,
+                    ..
+                } if dimensions.is_empty() && shape.by_type_param => {
+                    type_query_dims_by_name(&tn.name.name, params, td, None, None)
+                }
+                // A typedef'd element type contributes its own unpacked dimensions
+                // (`typedef int arr_t [3:0][1:5]; arr_t ta;`) and its packed shape.
+                DataType::TypeReference {
+                    name: tn,
+                    dimensions,
+                    ..
+                } if dimensions.is_empty() => {
+                    type_query_dims_by_name(&tn.name.name, params, td, Some(&c.0), Some(&c.1))
+                }
+                dt => Some(type_query_dims_of(dt, params, td, Some(&c.0))),
             }
-            // A typedef'd element type contributes its own unpacked dimensions
-            // (`typedef int arr_t [3:0][1:5]; arr_t ta;`) and its packed shape.
-            DataType::TypeReference {
-                name: tn,
-                dimensions,
-                ..
-            } if dimensions.is_empty() => {
-                type_query_dims_by_name(&tn.name.name, params, td.as_ref(), Some(&c.0), Some(&c.1))
-            }
-            dt => Some(type_query_dims_of(dt, params, td.as_ref(), Some(&c.0))),
-        }
-    })?;
+        });
+        (elem_w, inner)
+    });
+    let inner = inner?;
     // `elem_w` is one element of the typedef's own unpacked dimensions too,
     // so every unpacked dimension multiplies it.
     q.dims.extend(inner.dims);
@@ -23071,9 +23073,9 @@ fn type_literal_query(
     args: &[Expression],
     params: Option<&HashMap<String, Value>>,
 ) -> Option<i64> {
-    let td = TYPEDEFS_TLS.with(|t| t.borrow().clone());
-    let q = TYPEDEF_SHAPES_TLS
-        .with(|c| type_query_dims_of(dt, params, td.as_ref(), Some(&c.borrow().0)));
+    let q = typedefs_snapshot(|td| {
+        TYPEDEF_SHAPES_TLS.with(|c| type_query_dims_of(dt, params, td, Some(&c.borrow().0)))
+    });
     let dim = match args.get(1) {
         Some(d) => const_eval_i64_with_params(d, params)?,
         None => 1,
@@ -23530,8 +23532,7 @@ fn const_cast_bits(e: &Expression, params: &HashMap<String, Value>) -> Option<u3
         }
         "$__xz_type_cast" | "$__xz_named_cast" => match &args[0].kind {
             ExprKind::TypeLiteral(dt) => {
-                let td = TYPEDEFS_TLS.with(|t| t.borrow().clone());
-                resolve_type_width(dt, Some(params), td.as_ref())
+                typedefs_snapshot(|td| resolve_type_width(dt, Some(params), td))
             }
             // `N'(e)` with a constant `N` lowers to a named cast too.
             ExprKind::Ident(h) if h.path.len() == 1 => {
@@ -23659,8 +23660,7 @@ fn const_self_width(e: &Expression, params: &HashMap<String, Value>) -> Option<u
                 let f = f.borrow();
                 f.as_ref()?.get(name).map(|fd| fd.return_type.clone())
             })?;
-            let td = TYPEDEFS_TLS.with(|t| t.borrow().clone());
-            Some(resolve_type_width(&rt, Some(params), td.as_ref())).filter(|&w| w > 0)
+            typedefs_snapshot(|td| Some(resolve_type_width(&rt, Some(params), td))).filter(|&w| w > 0)
         }
         ExprKind::Ident(_)
         | ExprKind::MemberAccess { .. }
@@ -26387,8 +26387,7 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 // default made the enclosing localparam 0 — and
                 // `logic [W-1:0]` then declared a degenerate vector.
                 ExprKind::TypeLiteral(dt) => {
-                    let td = TYPEDEFS_TLS.with(|t| t.borrow().clone());
-                    resolve_type_width(dt, Some(params), td.as_ref())
+                    typedefs_snapshot(|td| resolve_type_width(dt, Some(params), td))
                 }
                 // §20.6.2 over a TYPEDEF carrying packed dimensions —
                 // `$bits(pkg::t [0:0][1:0])`. A scoped type name is not a
@@ -36388,7 +36387,10 @@ fn inline_module_items(
                     } else {
                         Vec::new()
                     };
-                    let mut local_tds = elab.typedefs.as_map().clone();
+                    // §6.18 / §23.9: install only this instance's width
+                    // overlay. The logged table updates the TLS snapshot by
+                    // replay, avoiding a design-wide copy per instance.
+                    let mut saved_tds: HashMap<String, Option<u32>> = HashMap::default();
                     for p_decl in sub_mod.params_and_body_types() {
                         if let ParameterKind::Type { assignments } = &p_decl.kind {
                             for a in assignments {
@@ -36396,12 +36398,12 @@ fn inline_module_items(
                                     continue;
                                 }
                                 if let Some(def_dt) = &a.init {
-                                    let w = resolve_type_width(
-                                        def_dt,
-                                        Some(&sub_local_params),
-                                        Some(&local_tds),
-                                    );
-                                    local_tds.insert(a.name.name.clone(), w);
+                                    let w =
+                                        resolve_type_width(def_dt, Some(&sub_local_params), Some(&elab.typedefs));
+                                    saved_tds
+                                        .entry(a.name.name.clone())
+                                        .or_insert_with(|| elab.typedefs.get(&a.name.name).copied());
+                                    elab.typedefs.insert(a.name.name.clone(), w);
                                 }
                             }
                         }
@@ -36412,16 +36414,30 @@ fn inline_module_items(
                                 let w = resolve_type_width(
                                     &td.data_type,
                                     Some(&sub_local_params),
-                                    Some(&local_tds),
+                                    Some(&elab.typedefs),
                                 );
-                                local_tds.insert(td.name.name.clone(), w);
+                                saved_tds
+                                    .entry(td.name.name.clone())
+                                    .or_insert_with(|| elab.typedefs.get(&td.name.name).copied());
+                                elab.typedefs.insert(td.name.name.clone(), w);
                             }
                         }
                     }
-                    type_trace_tls_refresh("submodule_local", &local_tds);
-                    TYPEDEFS_TLS.with(|c| *c.borrow_mut() = Some(local_tds));
-                    TYPEDEFS_TLS_MIRROR.with(|m| m.set(None));
-
+                    type_trace_tls_refresh("submodule_local", &elab.typedefs);
+                    sync_typedefs_tls(&elab.typedefs);
+                    // Leave the snapshot's local widths active during folding,
+                    // while restoring the design's table exactly as before.
+                    // These undo writes are replayed by its next sync.
+                    for (name, old) in saved_tds {
+                        match old {
+                            Some(width) => {
+                                elab.typedefs.insert(name, width);
+                            }
+                            None => {
+                                elab.typedefs.remove(&name);
+                            }
+                        }
+                    }
                     if !body_declares {
                         break;
                     }
