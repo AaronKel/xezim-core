@@ -27468,6 +27468,7 @@ fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
             f(condition);
             for_each_stmt_expr(stmt, f);
         }
+        K::Assertion(a) => f(&a.expr),
         K::Return(Some(e)) => f(e),
         K::VarDecl { declarators, .. } => {
             for d in declarators {
@@ -30750,6 +30751,15 @@ fn collect_scoped_instance_heads(
         match item {
             ModuleItem::AlwaysConstruct(ac) => for_each_stmt_expr(&ac.stmt, &mut visit),
             ModuleItem::InitialConstruct(ic) => for_each_stmt_expr(&ic.stmt, &mut visit),
+            ModuleItem::AssertionItem(a) => {
+                visit(&a.expr);
+                if let Some(s) = &a.action {
+                    for_each_stmt_expr(s, &mut visit);
+                }
+                if let Some(s) = &a.else_action {
+                    for_each_stmt_expr(s, &mut visit);
+                }
+            }
             ModuleItem::FinalConstruct(fc) => for_each_stmt_expr(&fc.stmt, &mut visit),
             ModuleItem::ContinuousAssign(ca) => {
                 for (l, r) in &ca.assignments {
@@ -44817,17 +44827,25 @@ fn rewrite_expr_impl(
                 // leave every other actual on the plain machinery
                 // (`whole_net_ident_name` is root-tolerant, so port_aliases
                 // and interface path collapsing still see these).
-                // Gate on the mapped LEAF differing from the key being
-                // substituted: a generate-scope RENAME map (`vec` →
-                // `gen_arbiter.vec`) flows through this same function, its
-                // values are not yet instance-prefixed, and rooting them
-                // freezes the un-prefixed name (every genfor CA write
-                // vanished). A rename always has leaf == key; a genuine
-                // port-actual collision (`v_node` → `out_val`) never does.
+                // Gate on the mapped LEAF differing from the key's leaf: a
+                // generate-scope RENAME map (`vec` → `gen_arbiter.vec`, and
+                // from a nested scope `g.u` → `g.inner.u`) flows through this
+                // same function, its values are not yet instance-prefixed,
+                // and rooting them freezes the un-prefixed name (every genfor
+                // CA write vanished). A rename keeps the leaf; a genuine
+                // port-actual collision (`v_node` → `out_val`) changes it.
+                // A dotted key is a nested rename only when the mapped name
+                // also keeps its first segment; an escaped port name such as
+                // `\foo.bar ` bound to the parent's `bar` keeps only the leaf.
                 let collides = whole_net_ident_name(mapped).is_some_and(|an| {
                     let leaf = an.rsplit('.').next().unwrap_or(an.as_str());
-                    leaf != name.as_str()
-                        && (local_names.contains(leaf) || port_map.contains_key(leaf))
+                    let key_leaf = match name.split_once('.') {
+                        Some((head, _)) if an.split('.').next() == Some(head) => {
+                            name.rsplit('.').next().unwrap_or(name.as_str())
+                        }
+                        _ => name.as_str(),
+                    };
+                    leaf != key_leaf && (local_names.contains(leaf) || port_map.contains_key(leaf))
                 });
                 if !has_tail {
                     let mut m = mapped.clone();
