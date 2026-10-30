@@ -373,3 +373,20 @@ module top; leaf u_default(); mid #(.R('{34'h5, 34'h6})) u_mid(); endmodule
     assert_eq!(elems("u_mid.u_header.R"), [Some(5), Some(6)]);
     assert_eq!(elems("u_mid.u_body.R"), [Some(3), Some(4)]);
 }
+
+/// §26.3: a name imported from a package sizes an instance's array parameter.
+#[test]
+fn instance_array_parameter_dimension_names_an_imported_parameter() {
+    let design = elaborate(
+        r#"
+package p; parameter int N=2; endpackage
+module hdr import p::*; #(parameter int A[N]='{3,5}); endmodule
+module body; import p::*; localparam int B[N]='{7,9}; endmodule
+module top; hdr u_default(); hdr #(.A('{11,13})) u_override(); body u_body(); endmodule
+"#,
+    );
+    let elem = |name: &str| design.parameters.get(name).and_then(|v| v.to_i64());
+    assert_eq!(elem("u_default.A[1]"), Some(5));
+    assert_eq!(elem("u_override.A[1]"), Some(13));
+    assert_eq!(elem("u_body.B[1]"), Some(9));
+}
