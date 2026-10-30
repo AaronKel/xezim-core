@@ -72,6 +72,7 @@ pub mod bits2;
 pub mod elaborate;
 pub mod packed_value;
 mod body_type_params;
+mod unit_subroutine_usage;
 pub mod pkg_scope;
 pub mod sdf;
 pub mod stdout_sink;
@@ -2206,15 +2207,62 @@ fn parse_and_elaborate(
     // overridden default too.
     let mut param_override_hits = apply_param_overrides(&mut definitions, None)?;
 
-    // §13.4.3/§6.24.1: the `$unit` functions are injected into every module
-    // below; constant folding needs to tell such a copy from a function the
-    // module declares itself.
+    // §13.4.3/§6.24.1: constant folding distinguishes a retained `$unit`
+    // function from a function the module declares itself.
     elaborate::set_unit_function_sites(
         top_level_functions
             .iter()
             .map(|f| (f.name.name.name.clone(), f.span.start, f.span.end))
             .collect(),
     );
+
+    let mut unit_phase_t = std::time::Instant::now();
+    // §3.12.1 / §8.24: a compilation-unit body is one declaration, not
+    // part of every module. Retain all bodies in a known hierarchy root for
+    // diagnostics and out-of-block method linking; other definitions need
+    // only the bodies they reference, including transitive dependencies.
+    // An ambiguous root keeps the conservative eager behavior.
+    let carrier_eligible = |def: &SourceDefinition| {
+        matches!(
+            def,
+            SourceDefinition::Module(_)
+                | SourceDefinition::Program(_)
+                | SourceDefinition::Interface(_)
+        )
+    };
+    let unit_carrier = if top_level_functions.is_empty() && top_level_tasks.is_empty() {
+        None
+    } else if let Some(name) = top_module_name {
+        definitions
+            .get(name)
+            .and_then(|d| carrier_eligible(d).then(|| name.to_string()))
+    } else {
+        let mut instantiated = std::collections::HashSet::new();
+        for d in definitions.values() {
+            collect_instantiated_modules(d.items(), &mut instantiated);
+        }
+        for bind in &top_level_binds {
+            instantiated.insert(bind.instantiation.module_name.name.clone());
+        }
+        let mut roots = definitions.iter().filter(|(name, d)| {
+            !instantiated.contains(name.as_str())
+                && !matches!(d, SourceDefinition::Typedef(_) | SourceDefinition::Udp(_))
+        });
+        roots.next().and_then(|(name, d)| {
+            (roots.next().is_none() && carrier_eligible(d)).then(|| name.clone())
+        })
+    };
+    let unit_usage = unit_subroutine_usage::Usage::new(&top_level_functions, &top_level_tasks);
+    let common_unit_refs = unit_usage.references(&(
+        &top_level_nettypes,
+        &top_level_params,
+        &top_level_vars,
+        &top_level_nets,
+        &top_level_covergroups,
+        &top_level_assertion_decls,
+        &top_level_dpi_imports,
+        &top_level_dpi_exports,
+    ));
 
     // §23.11: retain module/generate bind declarations in their lexical
     // scopes. Targets are resolved after the ordinary hierarchy is elaborated.
@@ -2229,7 +2277,8 @@ fn parse_and_elaborate(
         || !top_level_dpi_imports.is_empty()
         || !top_level_dpi_exports.is_empty()
     {
-        for def in definitions.values_mut() {
+        for (def_name, def) in definitions.iter_mut() {
+            let retain_all = unit_carrier.as_ref().is_none_or(|name| name == def_name);
             // §3.12.1 / §13.4.3: programs and interfaces share compilation-
             // unit declarations with modules, including constant functions.
             if let Some((ports, params, items)) = match def {
@@ -2247,6 +2296,13 @@ fn parse_and_elaborate(
                 }
                 _ => None,
             } {
+                let needed_unit_subs = if retain_all {
+                    None
+                } else {
+                    let mut refs = unit_usage.references(&(ports, params, &*items));
+                    refs.extend(common_unit_refs.iter().cloned());
+                    Some(unit_usage.close(refs))
+                };
                 // What this module declares ITSELF, captured before anything is
                 // injected — a name in here shadows the $unit declaration of
                 // the same name (§3.12.1), see the variable injection below.
@@ -2312,6 +2368,11 @@ fn parse_and_elaborate(
                     )
                 };
                 for f in top_level_functions.iter().rev() {
+                    if needed_unit_subs.as_ref().is_some_and(|needed| {
+                        f.name.has_scope() || !needed.contains(&f.name.name.name)
+                    }) {
+                        continue;
+                    }
                     let mut f = f.clone();
                     if let Some(items) = subst_body(&f.items, &f.ports) {
                         f.items = items;
@@ -2319,6 +2380,11 @@ fn parse_and_elaborate(
                     items.insert(0, ast::decl::ModuleItem::FunctionDeclaration(f));
                 }
                 for t in top_level_tasks.iter().rev() {
+                    if needed_unit_subs.as_ref().is_some_and(|needed| {
+                        t.name.has_scope() || !needed.contains(&t.name.name.name)
+                    }) {
+                        continue;
+                    }
                     let mut t = t.clone();
                     if let Some(items) = subst_body(&t.items, &t.ports) {
                         t.items = items;
@@ -2463,6 +2529,7 @@ fn parse_and_elaborate(
             }
         }
     }
+    elab_phase("compilation-unit declarations", &mut unit_phase_t);
     // Capture the definitions that came from the explicitly-provided source
     // files BEFORE pulling in `-y` / `-v` library modules. Library
     // modules satisfy instantiations but must NEVER be candidates for the
