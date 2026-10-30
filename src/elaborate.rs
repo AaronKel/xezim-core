@@ -44079,9 +44079,13 @@ fn make_udp_int_expr(v: i64) -> Expression {
 
 /// `name[idx]` as an expression.
 fn make_index_expr(name: &str, idx: i64) -> Expression {
+    index_expr(make_ident_expr(name), idx)
+}
+
+fn index_expr(base: Expression, idx: i64) -> Expression {
     Expression::new(
         ExprKind::Index {
-            expr: Box::new(make_ident_expr(name)),
+            expr: Box::new(base),
             index: Box::new(make_udp_int_expr(idx)),
         },
         Span::dummy(),
@@ -44128,14 +44132,19 @@ pub fn whole_array_assign_parts_dir(
     let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind) else {
         return None;
     };
-    if lh.path.len() != 1 || rh.path.len() != 1 {
-        return None;
-    }
-    if !lh.path[0].selects.is_empty() || !rh.path[0].selects.is_empty() {
-        return None;
-    }
-    let ln = &lh.path[0].name.name;
-    let rn = &rh.path[0].name.name;
+    // A hierarchical side (`ifc.arr`, `u.arr`) is registered under its
+    // dotted name.
+    let dotted = |h: &HierarchicalIdentifier| {
+        h.path.iter().all(|s| s.selects.is_empty()).then(|| {
+            h.path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+    };
+    let ln = &dotted(lh)?;
+    let rn = &dotted(rh)?;
     let &(llo, lhi, _) = arrays.get(ln)?;
     let &(rlo, rhi, _) = arrays.get(rn)?;
     // Same element COUNT is what matters; the index ranges may differ.
@@ -44153,8 +44162,8 @@ pub fn whole_array_assign_parts_dir(
         (0..=n)
             .map(|k| ContinuousAssignment {
                 origin: None,
-                lhs: make_index_expr(ln, if ld { lhi - k } else { llo + k }),
-                rhs: make_index_expr(rn, if rd { rhi - k } else { rlo + k }),
+                lhs: index_expr(lhs.clone(), if ld { lhi - k } else { llo + k }),
+                rhs: index_expr(rhs.clone(), if rd { rhi - k } else { rlo + k }),
                 delay,
                 rhs_parent_scoped: false,
                 delay_fall: None,
