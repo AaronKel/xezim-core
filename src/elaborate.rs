@@ -34312,12 +34312,20 @@ fn inline_module_items(
     }
     if let Some(binds) = elab.resolved_binds.get(prefix.trim_end_matches('.')) {
         let prepared = Rc::make_mut(&mut prepared_source);
-        prepared.effective_items.extend(
-            binds
-                .iter()
-                .rev()
-                .map(|b| ModuleItem::ModuleInstantiation(b.instantiation.clone())),
-        );
+        let bound: Vec<ModuleItem> = binds
+            .iter()
+            .rev()
+            .map(|b| ModuleItem::ModuleInstantiation(b.instantiation.clone()))
+            .collect();
+        // §23.11/§6.10: an undeclared name in a bound instance's connection
+        // is an implicit net of this (the target) scope, as it is for an
+        // instance written here, never an object of the bind's scope.
+        let mut cands = Vec::new();
+        collect_port_connection_net_candidates(&bound, &mut cands);
+        if !cands.is_empty() {
+            Rc::make_mut(&mut prepared.local_names).extend(cands);
+        }
+        prepared.effective_items.extend(bound);
     }
     // §23.10: names of THIS module's own sub-instances. A port connection
     // naming a SIBLING instance (`h_leaf lf(li.mp);` where `li` is the same
@@ -34583,6 +34591,15 @@ fn inline_module_items(
                     };
                     let mut cands: Vec<String> = Vec::new();
                     collect_port_connection_net_candidates(sub_mod.items(), &mut cands);
+                    // §23.11: a bound instance is as if present at the end of
+                    // this instance, so its connections name nets here too.
+                    if let Some(binds) = elab.resolved_binds.get(inst_prefix.trim_end_matches('.')) {
+                        let bound: Vec<ModuleItem> = binds
+                            .iter()
+                            .map(|b| ModuleItem::ModuleInstantiation(b.instantiation.clone()))
+                            .collect();
+                        collect_port_connection_net_candidates(&bound, &mut cands);
+                    }
                     cands.sort();
                     cands.dedup();
                     for name in cands {
