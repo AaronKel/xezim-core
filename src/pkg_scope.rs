@@ -915,11 +915,24 @@ fn collect(descs: &[Description]) -> Option<Info> {
                 other.insert(cg.name.name.clone());
             }
             Description::PackageItem(pi) => package_item_values(pi, &mut other_values),
-            Description::Module(m) => module_level_types(&m.items, &mut other, &mut other_members),
-            Description::Interface(m) => {
-                module_level_types(&m.items, &mut other, &mut other_members)
+            Description::DPIImport(di) => {
+                other_values.insert(match &di.proto {
+                    DPIProto::Function(f) => f.name.name.name.clone(),
+                    DPIProto::Task(t) => t.name.name.name.clone(),
+                });
             }
-            Description::Program(m) => module_level_types(&m.items, &mut other, &mut other_members),
+            Description::Module(m) => {
+                module_level_types(&m.items, &mut other, &mut other_members);
+                module_dpi_names(&m.items, &mut other_values);
+            }
+            Description::Interface(m) => {
+                module_level_types(&m.items, &mut other, &mut other_members);
+                module_dpi_names(&m.items, &mut other_values);
+            }
+            Description::Program(m) => {
+                module_level_types(&m.items, &mut other, &mut other_members);
+                module_dpi_names(&m.items, &mut other_values);
+            }
             _ => {}
         }
     }
@@ -1074,6 +1087,29 @@ fn module_level_types(
     }
 }
 
+/// Module DPI declarations also shadow imported package subroutines.
+fn module_dpi_names(items: &[ModuleItem], out: &mut HashSet<String>) {
+    for item in items {
+        match item {
+            ModuleItem::DPIImport(di) => {
+                out.insert(match &di.proto {
+                    DPIProto::Function(f) => f.name.name.name.clone(),
+                    DPIProto::Task(t) => t.name.name.name.clone(),
+                });
+            }
+            ModuleItem::GenerateRegion(g) => module_dpi_names(&g.items, out),
+            ModuleItem::GenerateIf(g) => {
+                for (_, items) in &g.branches { module_dpi_names(items, out); }
+            }
+            ModuleItem::GenerateFor(g) => module_dpi_names(&g.items, out),
+            ModuleItem::GenerateCase(g) => {
+                for arm in &g.arms { module_dpi_names(&arm.items, out); }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The member names an enum type declares (`enum {A, B}`); empty for any
 /// other type. A ranged member (`A[2]`) declares generated names, left out.
 fn enum_members(dt: &DataType, out: &mut HashSet<String>) {
@@ -1103,6 +1139,12 @@ fn unit_frame(descs: &[Description]) -> Frame {
             // adds it then (`Rw::description`).
             Description::ImportDecl(_) | Description::PackageItem(PackageItem::Import(_)) => {}
             Description::PackageItem(pi) => package_item_values(pi, &mut f.values),
+            Description::DPIImport(di) => {
+                f.values.insert(match &di.proto {
+                    DPIProto::Function(fd) => fd.name.name.name.clone(),
+                    DPIProto::Task(td) => td.name.name.name.clone(),
+                });
+            }
             _ => {}
         }
     }
@@ -1136,6 +1178,12 @@ fn package_item_values(pi: &PackageItem, out: &mut HashSet<String>) {
         }
         PackageItem::Task(t) if t.name.scopes.is_empty() => {
             out.insert(t.name.name.name.clone());
+        }
+        PackageItem::DPIImport(di) => {
+            out.insert(match &di.proto {
+                DPIProto::Function(f) => f.name.name.name.clone(),
+                DPIProto::Task(t) => t.name.name.name.clone(),
+            });
         }
         PackageItem::Let(l) => {
             out.insert(l.name.name.clone());
@@ -3119,6 +3167,12 @@ fn module_item_names(items: &[ModuleItem], f: &mut Frame) {
             }
             ModuleItem::TaskDeclaration(td) => {
                 f.values.insert(td.name.name.name.clone());
+            }
+            ModuleItem::DPIImport(di) => {
+                f.values.insert(match &di.proto {
+                    DPIProto::Function(fd) => fd.name.name.name.clone(),
+                    DPIProto::Task(td) => td.name.name.name.clone(),
+                });
             }
             ModuleItem::LetDeclaration(l) => {
                 f.values.insert(l.name.name.clone());

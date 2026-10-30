@@ -4344,41 +4344,46 @@ fn register_dpi_import(
     pkg: Option<&str>,
 ) -> Result<(), String> {
     let sv_name = dpi_proto_sv_name(&di.proto);
-    match pkg {
-        Some(p) => {
-            elab.dpi_import_pkg
-                .entry(sv_name.clone())
-                .or_insert_with(|| p.to_string());
-        }
-        None => {
-            elab.dpi_import_in_design.insert(sv_name.clone());
-        }
-    }
+    // §26.3 / §35.5.4: the SV declaration belongs to its package; the
+    // optional C identifier is a separate linkage name.
+    let key = pkg.map_or_else(|| sv_name.clone(), |p| format!("{p}::{sv_name}"));
     let c_name = di.c_name.clone().unwrap_or_else(|| sv_name.clone());
-    // LRM §35.5.2: the same foreign function may be imported more than once,
-    // as long as the declarations are consistent (same C binding and import
-    // property). This is common in real libraries — UVM re-imports helpers
-    // such as `uvm_hdl_check_path` from headers pulled into more than one
-    // scope. Accept a consistent re-import as a no-op; only a genuine
-    // mismatch (different c_identifier or context/pure property) is illegal.
-    if let Some(existing) = elab.dpi_imports.get(&sv_name) {
+    // A design declaration shadows the compatibility alias of a package
+    // declaration. The package's qualified entry remains available.
+    if pkg.is_none()
+        && !elab.dpi_import_in_design.contains(&sv_name)
+        && elab.dpi_import_pkg.remove(&sv_name).is_some()
+    {
+        elab.dpi_imports.remove(&sv_name);
+    }
+    if let Some(existing) = elab.dpi_imports.get(&key) {
         if existing.c_name == c_name && existing.property == di.property {
             return Ok(());
         }
         return Err(format!(
             "Conflicting DPI import declaration '{}': already imported as \
              (c=\"{}\", {:?}), redeclared as (c=\"{}\", {:?})",
-            sv_name, existing.c_name, existing.property, c_name, di.property
+            key, existing.c_name, existing.property, c_name, di.property
         ));
     }
-    elab.dpi_imports.insert(
-        sv_name,
-        DpiImportSpec {
-            c_name,
-            property: di.property,
-            proto: di.proto.clone(),
-        },
-    );
+    let spec = DpiImportSpec {
+        c_name,
+        property: di.property,
+        proto: di.proto.clone(),
+    };
+    elab.dpi_imports.insert(key.clone(), spec.clone());
+    match pkg {
+        Some(p) => {
+            elab.dpi_import_pkg.insert(key, p.to_string());
+            if !elab.dpi_imports.contains_key(&sv_name) {
+                elab.dpi_imports.insert(sv_name.clone(), spec);
+                elab.dpi_import_pkg.insert(sv_name, p.to_string());
+            }
+        }
+        None => {
+            elab.dpi_import_in_design.insert(sv_name);
+        }
+    }
     Ok(())
 }
 
@@ -12847,83 +12852,161 @@ fn validate_enum_assignments(elab: &ElaboratedModule) -> Result<(), String> {
             _ => None,
         }
     }
+    // §23.9: resolve the nearest declaration before consulting module signals.
+    // None is a local declaration whose type is not a named enum.
+    type Scope = HashMap<String, Option<String>>;
+    fn bind(scope: &mut Scope, name: &str, dt: &DataType, elab: &ElaboratedModule) {
+        let enum_name = match dt {
+            DataType::TypeReference { name, .. } => {
+                let full = name.qualified();
+                if elab.enum_members.contains_key(&full) {
+                    Some(full)
+                } else {
+                    elab.enum_members
+                        .contains_key(&name.name.name)
+                        .then(|| name.name.name.clone())
+                }
+            }
+            _ => None,
+        };
+        scope.insert(name.to_string(), enum_name);
+    }
+    fn declarations(stmts: &[Statement], elab: &ElaboratedModule) -> Scope {
+        let mut scope = Scope::default();
+        for stmt in stmts {
+            if let StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } = &stmt.kind
+            {
+                for decl in declarators {
+                    bind(&mut scope, &decl.name.name, data_type, elab);
+                }
+            }
+        }
+        scope
+    }
     fn check_assign(
         lvalue: &Expression,
         rvalue: &Expression,
         elab: &ElaboratedModule,
+        scopes: &[Scope],
     ) -> Result<(), String> {
         if let ExprKind::Ident(h) = &lvalue.kind {
             if h.path.len() == 1 {
                 let name = &h.path[0].name.name;
-                if let Some(sig) = elab.signals.get(name) {
-                    if let Some(tname) = &sig.type_name {
-                        if let Some(members) = elab.enum_members.get(tname) {
-                            if let Some(v) = try_const_u64(rvalue, elab) {
-                                if !members.iter().any(|(_, mv)| *mv == v) {
-                                    return Err(format!(
-                                        "Assignment of {} to enum '{}' variable '{}' is not a declared member (IEEE 1800-2017 §6.19.3)",
-                                        v, tname, name
-                                    ));
-                                }
-                            }
-                        }
-                    }
+                let tname = match scopes.iter().rev().find_map(|scope| scope.get(name)) {
+                    Some(local) => local.as_deref(),
+                    None => elab
+                        .signals
+                        .get(name)
+                        .and_then(|sig| sig.type_name.as_deref()),
+                };
+                if let Some(tname) = tname
+                    && let Some(members) = elab.enum_members.get(tname)
+                    && let Some(v) = try_const_u64(rvalue, elab)
+                    && !members.iter().any(|(_, mv)| *mv == v)
+                {
+                    return Err(format!(
+                        "Assignment of {} to enum '{}' variable '{}' is not a declared member (IEEE 1800-2017 §6.19.3)",
+                        v, tname, name
+                    ));
                 }
             }
         }
         Ok(())
     }
-    fn walk_stmt(s: &Statement, elab: &ElaboratedModule) -> Result<(), String> {
+    fn walk_stmt(
+        s: &Statement,
+        elab: &ElaboratedModule,
+        scopes: &mut Vec<Scope>,
+    ) -> Result<(), String> {
         match &s.kind {
             StatementKind::BlockingAssign { lvalue, rvalue }
             | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
-                check_assign(lvalue, rvalue, elab)?;
+                check_assign(lvalue, rvalue, elab, scopes)?;
             }
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                scopes.push(declarations(stmts, elab));
                 for s in stmts {
-                    walk_stmt(s, elab)?;
+                    walk_stmt(s, elab, scopes)?;
                 }
+                scopes.pop();
             }
             StatementKind::If {
                 then_stmt,
                 else_stmt,
                 ..
             } => {
-                walk_stmt(then_stmt, elab)?;
+                walk_stmt(then_stmt, elab, scopes)?;
                 if let Some(e) = else_stmt {
-                    walk_stmt(e, elab)?;
+                    walk_stmt(e, elab, scopes)?;
                 }
             }
-            StatementKind::For { body, .. }
-            | StatementKind::While { body, .. }
+            StatementKind::For { init, body, .. } => {
+                let mut scope = Scope::default();
+                for init in init {
+                    if let crate::ast::stmt::ForInit::VarDecl {
+                        name, data_type, ..
+                    } = init
+                    {
+                        bind(&mut scope, &name.name, data_type, elab);
+                    }
+                }
+                scopes.push(scope);
+                walk_stmt(body, elab, scopes)?;
+                scopes.pop();
+            }
+            StatementKind::Foreach { vars, body, .. } => {
+                let scope = vars
+                    .iter()
+                    .flatten()
+                    .map(|v| (v.name.clone(), None))
+                    .collect();
+                scopes.push(scope);
+                walk_stmt(body, elab, scopes)?;
+                scopes.pop();
+            }
+            StatementKind::While { body, .. }
             | StatementKind::DoWhile { body, .. }
             | StatementKind::Forever { body }
-            | StatementKind::Repeat { body, .. }
-            | StatementKind::Foreach { body, .. } => walk_stmt(body, elab)?,
+            | StatementKind::Repeat { body, .. } => walk_stmt(body, elab, scopes)?,
             StatementKind::Case { items, .. } => {
                 for it in items {
-                    walk_stmt(&it.stmt, elab)?;
+                    walk_stmt(&it.stmt, elab, scopes)?;
                 }
             }
-            StatementKind::TimingControl { stmt, .. } => walk_stmt(stmt, elab)?,
+            StatementKind::TimingControl { stmt, .. } => walk_stmt(stmt, elab, scopes)?,
             _ => {}
         }
         Ok(())
     }
     for ib in &elab.initial_blocks {
-        walk_stmt(&ib.stmt, elab)?;
+        walk_stmt(&ib.stmt, elab, &mut Vec::new())?;
     }
     for ab in &elab.always_blocks {
-        walk_stmt(&ab.stmt, elab)?;
+        walk_stmt(&ab.stmt, elab, &mut Vec::new())?;
     }
     for f in elab.functions.values() {
+        let mut scope = declarations(&f.items, elab);
+        bind(&mut scope, &f.name.name.name, &f.return_type, elab);
+        for port in &f.ports {
+            bind(&mut scope, &port.name.name, &port.data_type, elab);
+        }
+        let mut scopes = vec![scope];
         for s in &f.items {
-            walk_stmt(s, elab)?;
+            walk_stmt(s, elab, &mut scopes)?;
         }
     }
     for t in elab.tasks.values() {
+        let mut scope = declarations(&t.items, elab);
+        for port in &t.ports {
+            bind(&mut scope, &port.name.name, &port.data_type, elab);
+        }
+        let mut scopes = vec![scope];
         for s in &t.items {
-            walk_stmt(s, elab)?;
+            walk_stmt(s, elab, &mut scopes)?;
         }
     }
     Ok(())
