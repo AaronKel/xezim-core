@@ -464,6 +464,22 @@ pub struct ModuleTimescaleCli {
     pub force: Option<(i32, i32)>,
 }
 
+/// Timescale for a package or `$unit` subroutine with no `timescale
+/// directive and no in-scope `timeunit`. A directive-less module uses the
+/// global `--module-timescale` / `-timescale`, else 1ns/1ns. Packages
+/// follow that, not the global tick: counting their delays in the finest
+/// precision turns a nanosecond timeout into picoseconds as soon as any
+/// module is `1ps`.
+fn untimed_scope_secs(recorded: Option<(f64, f64)>, cli_global: Option<(i32, i32)>) -> (f64, f64) {
+    if let Some(ts) = recorded {
+        return ts;
+    }
+    if let Some((u, p)) = cli_global {
+        return (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p));
+    }
+    (1e-9, 1e-9)
+}
+
 /// Library-search configuration from the CLI (`-v <file>`, `-y <dir>`,
 /// `+libext+<ext>`),
 /// consumed by `resolve_library_modules`. Commercial semantics: a `-v` file's
@@ -1863,6 +1879,9 @@ fn parse_and_elaborate(
         } else {
             None
         };
+        // Under a compilation-unit `timeunit` the bodies below are already
+        // rewritten to global ticks; the second delay pass must keep them.
+        let cu_scaled = cu_scope_ts.map(|_| (tick_s, tick_s));
         let decl_name = match &desc {
             ast::Description::Module(m) => Some(&m.name.name),
             ast::Description::Interface(i) => Some(&i.name.name),
@@ -1971,10 +1990,12 @@ fn parse_and_elaborate(
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_class_time_semantics(&mut c, u, p, tick_s);
                 } else {
-                    let (unit_s, prec_s) = module_timescales
-                        .get("$unit")
-                        .copied()
-                        .unwrap_or((tick_s, tick_s));
+                    let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
+                        untimed_scope_secs(
+                            module_timescales.get("$unit").copied().or(cu_scaled),
+                            cli.global,
+                        )
+                    });
                     elaborate::rewrite_class_delays_pub(&mut c, unit_s, prec_s, tick_s);
                 }
                 let name = c.name.name.clone();
@@ -2021,12 +2042,17 @@ fn parse_and_elaborate(
                 // Packages are not in `eff_ts` (that walk covers instantiable
                 // elements); the preprocessor records the directive in effect
                 // at the package, else the compilation unit's first one.
+                // With neither, use the CLI timescale or 1ns/1ns, not the
+                // global tick.
                 let (mut unit_s, mut prec_s) = forced_secs.unwrap_or_else(|| {
-                    module_timescales
-                        .get(&name)
-                        .or_else(|| module_timescales.get("$unit"))
-                        .copied()
-                        .unwrap_or((tick_s, tick_s))
+                    untimed_scope_secs(
+                        module_timescales
+                            .get(&name)
+                            .or_else(|| module_timescales.get("$unit"))
+                            .copied()
+                            .or(cu_scaled),
+                        cli.global,
+                    )
                 });
                 // A `timeunit`/`timeprecision` declared IN the package wins
                 // over the directive (LRM §3.14.2.2), but not over
@@ -2114,10 +2140,12 @@ fn parse_and_elaborate(
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_scope_time_semantics(&mut f.items, u, p, tick_s);
                 } else {
-                    let (unit_s, prec_s) = module_timescales
-                        .get("$unit")
-                        .copied()
-                        .unwrap_or((tick_s, tick_s));
+                    let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
+                        untimed_scope_secs(
+                            module_timescales.get("$unit").copied().or(cu_scaled),
+                            cli.global,
+                        )
+                    });
                     for st in f.items.iter_mut() {
                         elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
                     }
@@ -2128,10 +2156,12 @@ fn parse_and_elaborate(
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_scope_time_semantics(&mut t.items, u, p, tick_s);
                 } else {
-                    let (unit_s, prec_s) = module_timescales
-                        .get("$unit")
-                        .copied()
-                        .unwrap_or((tick_s, tick_s));
+                    let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
+                        untimed_scope_secs(
+                            module_timescales.get("$unit").copied().or(cu_scaled),
+                            cli.global,
+                        )
+                    });
                     for st in t.items.iter_mut() {
                         elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
                     }
