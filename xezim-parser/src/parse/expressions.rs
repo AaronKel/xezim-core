@@ -1946,7 +1946,9 @@ impl Parser {
                     self.span_from(start),
                 )
             }
-            TokenKind::KwS_always => {
+            // §16.12.11: `always p` shares the `s_always` node. An always
+            // block is parsed at item level and never reaches this arm.
+            TokenKind::KwS_always | TokenKind::KwAlways => {
                 let start = self.current().span.start;
                 self.bump();
                 let operand = self.parse_expr_bp(3);
