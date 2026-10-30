@@ -72,3 +72,42 @@ endmodule
         ],
     );
 }
+
+/// §7.4.5: a synthesized negative row index remains a signed expression.
+#[test]
+fn negative_row_index_is_preserved() {
+    let design = elaborate(
+        r#"
+module top;
+  logic [7:0] src [-1:0][4:2];
+  wire [7:0] dst [10:12];
+  assign dst = src[-1];
+endmodule
+"#,
+    );
+    let assign = &design.continuous_assigns[0];
+    let parts = xezim_core::elaborate::whole_array_row_assign_parts(
+        &assign.lhs,
+        &assign.rhs,
+        assign.delay,
+        &design.arrays,
+        &design.arrays_2d,
+        &design.parameters,
+        Some(&design.descending_arrays),
+        Some(&design.unpacked_decl_dims),
+    )
+    .expect("row expands");
+    for part in parts {
+        let ExprKind::Index { expr, .. } = &part.rhs.kind else {
+            panic!("column select")
+        };
+        let ExprKind::Index { index, .. } = &expr.kind else {
+            panic!("row select")
+        };
+        assert_eq!(
+            xezim_core::elaborate::const_eval_i64_with_params(index, Some(&design.parameters)),
+            Some(-1)
+        );
+        assert!(matches!(index.kind, ExprKind::Unary { .. }));
+    }
+}

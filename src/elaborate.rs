@@ -44025,17 +44025,30 @@ fn lower_udp_instances(
 
 /// A plain decimal integer-literal expression (for synthesized bit-selects).
 fn make_udp_int_expr(v: i64) -> Expression {
-    use crate::ast::expr::{NumberBase, NumberLiteral};
-    Expression::new(
+    use crate::ast::expr::{NumberBase, NumberLiteral, UnaryOp};
+    // A leading minus belongs to a unary expression, never to a numeric
+    // token (§5.7.1). Preserve it when synthesizing negative unpacked indices.
+    let number = Expression::new(
         ExprKind::Number(NumberLiteral::Integer {
-            size: None,
+            size: (v < 0).then_some(64),
             signed: true,
             base: NumberBase::Decimal,
-            value: v.to_string(),
+            value: v.unsigned_abs().to_string(),
             cached_val: std::cell::Cell::new(None),
         }),
         Span::dummy(),
-    )
+    );
+    if v < 0 {
+        Expression::new(
+            ExprKind::Unary {
+                op: UnaryOp::Minus,
+                operand: Box::new(number),
+            },
+            Span::dummy(),
+        )
+    } else {
+        number
+    }
 }
 
 /// `name[idx]` as an expression.
@@ -44043,16 +44056,7 @@ fn make_index_expr(name: &str, idx: i64) -> Expression {
     Expression::new(
         ExprKind::Index {
             expr: Box::new(make_ident_expr(name)),
-            index: Box::new(Expression::new(
-                ExprKind::Number(NumberLiteral::Integer {
-                    size: None,
-                    signed: true,
-                    base: crate::ast::expr::NumberBase::Decimal,
-                    value: idx.to_string(),
-                    cached_val: std::cell::Cell::new(None),
-                }),
-                Span::dummy(),
-            )),
+            index: Box::new(make_udp_int_expr(idx)),
         },
         Span::dummy(),
     )
@@ -44358,16 +44362,7 @@ fn make_multi_index_expr(name: &str, idx: &[i64]) -> Expression {
         e = Expression::new(
             ExprKind::Index {
                 expr: Box::new(e),
-                index: Box::new(Expression::new(
-                    ExprKind::Number(NumberLiteral::Integer {
-                        size: None,
-                        signed: true,
-                        base: crate::ast::expr::NumberBase::Decimal,
-                        value: i.to_string(),
-                        cached_val: std::cell::Cell::new(None),
-                    }),
-                    Span::dummy(),
-                )),
+                index: Box::new(make_udp_int_expr(i)),
             },
             Span::dummy(),
         );
