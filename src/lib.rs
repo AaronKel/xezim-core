@@ -3265,6 +3265,110 @@ pub fn bind_spec_base(name: &str) -> &str {
     name
 }
 
+/// §23.11: the constant scope in which the index expressions of bind target
+/// paths are evaluated. It is built the first time an index has to be
+/// evaluated, once for module-scope directives and once for `$unit` ones,
+/// instead of a copy of the design-wide parameter table per directive. The
+/// declarations of a directive's own and enclosing scopes are laid over it
+/// (found by a range scan of the sorted dotted keys) while that directive's
+/// indices are evaluated, and taken off again by `leave`; the scope each
+/// evaluation sees is the one formerly built per directive.
+struct BindConstants<'a> {
+    parameters: &'a crate::hasher::HashMap<String, Value>,
+    top: &'a str,
+    unit_params: &'a crate::hasher::HashMap<String, Value>,
+    dotted: Option<Vec<&'a str>>,
+    module: Option<crate::hasher::HashMap<String, Value>>,
+    unit: Option<crate::hasher::HashMap<String, Value>>,
+    entered: Option<bool>,
+    undo: Vec<(&'a str, Option<Value>)>,
+}
+
+impl<'a> BindConstants<'a> {
+    /// The scope of a directive whose enclosing scopes are `ancestors`
+    /// (nearest first); laid over the shared base on the first call.
+    fn scope(
+        &mut self,
+        unit_scope: bool,
+        ancestors: &[&str],
+    ) -> &crate::hasher::HashMap<String, Value> {
+        let (parameters, top, unit_params) = (self.parameters, self.top, self.unit_params);
+        let slot = if unit_scope {
+            &mut self.unit
+        } else {
+            &mut self.module
+        };
+        let constants = slot.get_or_insert_with(|| {
+            let mut constants = parameters.clone();
+            if unit_scope {
+                // §3.12.1/§23.11: $unit declarations cannot inherit a top's
+                // same-named localparam when selecting their bind targets.
+                constants.retain(|name, _| name.contains('.') || name.contains("::"));
+                constants.extend(
+                    unit_params
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                );
+            }
+            // Qualified constants remain available; nearer lexical
+            // declarations replace bare names from enclosing scopes, never
+            // from the target.
+            for (key, value) in parameters {
+                constants.insert(format!("{top}.{key}"), value.clone());
+            }
+            constants
+        });
+        if self.entered.is_none() {
+            self.entered = Some(unit_scope);
+            let dotted = self.dotted.get_or_insert_with(|| {
+                let mut keys: Vec<&str> = parameters
+                    .keys()
+                    .filter(|key| key.contains('.'))
+                    .map(String::as_str)
+                    .collect();
+                keys.sort_unstable();
+                keys
+            });
+            for parent in ancestors.iter().rev() {
+                let prefix = format!("{parent}.");
+                let start = dotted.partition_point(|key| *key < prefix.as_str());
+                for &key in dotted[start..]
+                    .iter()
+                    .take_while(|key| key.starts_with(&prefix))
+                {
+                    let local = &key[prefix.len()..];
+                    let previous = constants.insert(local.to_string(), parameters[key].clone());
+                    self.undo.push((local, previous));
+                }
+            }
+        }
+        constants
+    }
+
+    /// Take the scope laid over by `scope` off the base again.
+    fn leave(&mut self) {
+        let Some(unit_scope) = self.entered.take() else {
+            return;
+        };
+        let constants = if unit_scope {
+            self.unit.as_mut()
+        } else {
+            self.module.as_mut()
+        }
+        .expect("entered scope has a base");
+        for (local, previous) in self.undo.drain(..).rev() {
+            match previous {
+                Some(value) => {
+                    constants.insert(local.to_string(), value);
+                }
+                None => {
+                    constants.remove(local);
+                }
+            }
+        }
+    }
+}
+
 /// §23.11: select targets using effective hierarchy and lexical constants.
 fn resolve_instance_binds(
     elab: &mut elaborate::ElaboratedModule,
@@ -3281,44 +3385,37 @@ fn resolve_instance_binds(
     if sites.is_empty() {
         return Ok(false);
     }
-    let mut hosts = vec![(String::new(), elab.name.clone())];
-    hosts.extend(
-        elab.instances
-            .iter()
-            .map(|i| (i.path.clone(), i.def_name.clone())),
-    );
+    // A target names an instance by path or a module by name: index both
+    // once, so selecting a target is a lookup rather than a scan.
+    let mut host_paths = crate::hasher::HashSet::default();
+    let mut hosts_of = crate::hasher::HashMap::<&str, Vec<&str>>::default();
+    host_paths.insert("");
+    hosts_of.entry(elab.name.as_str()).or_default().push("");
+    for i in &elab.instances {
+        host_paths.insert(i.path.as_str());
+        hosts_of
+            .entry(i.def_name.as_str())
+            .or_default()
+            .push(i.path.as_str());
+    }
+    let mut constants = BindConstants {
+        parameters: &elab.parameters,
+        top: &elab.name,
+        unit_params,
+        dotted: None,
+        module: None,
+        unit: None,
+        entered: None,
+        undo: Vec::new(),
+    };
     let mut changed = false;
     let mut unresolved = Vec::new();
     for (scope, b, unit_scope) in sites {
-        let mut constants = elab.parameters.clone();
-        if unit_scope {
-            // §3.12.1/§23.11: $unit declarations cannot inherit a top's
-            // same-named localparam when selecting their bind targets.
-            constants.retain(|name, _| name.contains('.') || name.contains("::"));
-            constants.extend(
-                unit_params
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone())),
-            );
-        }
-        // Qualified constants remain available; nearer lexical declarations
-        // replace bare names from enclosing scopes, never from the target.
-        for (key, value) in &elab.parameters {
-            constants.insert(format!("{}.{}", elab.name, key), value.clone());
-        }
         let mut ancestors = vec![scope.as_str()];
         let mut ancestor = scope.as_str();
         while let Some((parent, _)) = ancestor.rsplit_once('.') {
             ancestors.push(parent);
             ancestor = parent;
-        }
-        for parent in ancestors.iter().rev() {
-            let prefix = format!("{parent}.");
-            for (key, value) in &elab.parameters {
-                if let Some(local) = key.strip_prefix(&prefix) {
-                    constants.insert(local.to_string(), value.clone());
-                }
-            }
         }
         let mut targets = Vec::new();
         if b.target_path.is_empty() {
@@ -3330,15 +3427,16 @@ fn resolve_instance_binds(
                 .filter(|parent| !parent.is_empty())
                 .map(|parent| format!("{parent}.{}", b.target_module.name))
                 .chain(std::iter::once(b.target_module.name.clone()))
-                .find(|candidate| hosts.iter().any(|(host, _)| host == candidate));
+                .find(|candidate| host_paths.contains(candidate.as_str()));
             if let Some(instance) = instance {
                 targets.push(instance);
             } else {
                 targets.extend(
-                    hosts
-                        .iter()
-                        .filter(|(_, def)| *def == b.target_module.name)
-                        .map(|(p, _)| p.clone()),
+                    hosts_of
+                        .get(b.target_module.name.as_str())
+                        .into_iter()
+                        .flatten()
+                        .map(|p| p.to_string()),
                 );
             }
         } else {
@@ -3350,7 +3448,8 @@ fn resolve_instance_binds(
                     }
                     joined.push_str(&segment.name.name);
                     for select in &segment.selects {
-                        let value = elaborate::const_eval_i64_with_params(select, Some(&constants))
+                        let constants = constants.scope(unit_scope, &ancestors);
+                        let value = elaborate::const_eval_i64_with_params(select, Some(constants))
                             .ok_or_else(|| {
                                 format!(
                                     "nonconstant bind target index in '{}' (§23.11)",
@@ -3382,11 +3481,12 @@ fn resolve_instance_binds(
                 }
                 if let Some(target) = candidates
                     .into_iter()
-                    .find(|p| hosts.iter().any(|(host, _)| host == p))
+                    .find(|p| host_paths.contains(p.as_str()))
                 {
                     targets.push(target);
                 }
             }
+            constants.leave();
         }
         if targets.is_empty() && !b.target_path.is_empty() {
             unresolved.push(
