@@ -20912,6 +20912,13 @@ fn const_eval_user_call(
     }
     let mut argv = Vec::with_capacity(args.len());
     for a in args {
+        // A pattern actual of a packed-struct formal (#680), as in a constant.
+        if let Some(v) =
+            const_fn_struct_pattern_actual(fd.ports.get(argv.len()), a, &shell.parameters, &shell)
+        {
+            argv.push(v);
+            continue;
+        }
         let folded = substitute_const_fn_calls(a, &shell.parameters, &shell, 0)?;
         if expr_has_call(&folded) || !is_const_expr(&folded, &shell.parameters) {
             return None;
@@ -35718,8 +35725,10 @@ fn inline_module_items(
                                                     // §7.2.1: later body constants can select a
                                                     // field of this parameter while their own
                                                     // initializers are being folded.
+                                                    let inlined =
+                                                        inline_instance_typedefs(data_type);
                                                     if let Some(fields) = flatten_struct_fields(
-                                                        data_type,
+                                                        inlined.as_ref().unwrap_or(data_type),
                                                         local_map,
                                                         &elab_ro.typedefs,
                                                         &elab_ro.typedef_types,
@@ -36900,8 +36909,11 @@ fn inline_module_items(
                         assignments,
                     } = &p_decl.kind
                     {
+                        // The instance's own types first (#680): the table
+                        // has the first instance's only once it settles.
+                        let inlined = inline_body_typedefs(data_type, &local_types);
                         if let Some(fields) = flatten_struct_fields(
-                            data_type,
+                            inlined.as_ref().unwrap_or(data_type),
                             &sub_merged_params,
                             &elab.typedefs,
                             &elab.typedef_types,
@@ -40686,6 +40698,29 @@ fn make_syscall(name: &str, args: Vec<Expression>, span: Span) -> Expression {
 /// (`LOG_X - 6` → 4294967290) and whole buses collapsed to 1 bit.
 /// §13.3 / §10.7: an integral formal provides the assignment context for
 /// its actual expression, before the function body sees its converted value.
+/// A pattern actual (`pick('{b: 7, a: 5})`) of a packed-struct formal,
+/// packed by the formal's type (the instance's own types first). `None` for
+/// any other actual or formal.
+fn const_fn_struct_pattern_actual(
+    port: Option<&crate::ast::decl::FunctionPort>,
+    expr: &Expression,
+    params: &HashMap<String, Value>,
+    elab: &ElaboratedModule,
+) -> Option<Value> {
+    if !matches!(expr.kind, ExprKind::AssignmentPattern(_)) {
+        return None;
+    }
+    let port = port.filter(|p| p.dimensions.is_empty())?;
+    let inlined = inline_instance_typedefs(&port.data_type);
+    pack_struct_const_value(
+        inlined.as_ref().unwrap_or(&port.data_type),
+        expr,
+        params,
+        &elab.typedefs,
+        &elab.typedef_types,
+    )
+}
+
 fn const_function_actual(
     port: Option<&crate::ast::decl::FunctionPort>,
     expr: &Expression,
@@ -40707,6 +40742,95 @@ fn const_function_actual(
     value
 }
 
+/// §6.18, §7.2.1: `dt` with each unqualified reference to a type the
+/// instance declares in its body (`local`) replaced by that type's
+/// declaration, through typedefs of typedefs and struct members. Those
+/// types reach the design-wide `typedef_types` only once the instance's
+/// constants are settled, and that table keeps the last same-named
+/// declaration of any module, so a layout built from it while the first
+/// instance folds its constants found no struct (#680). A reference with
+/// packed dimensions is inlined for a struct (the dimensions go to it) and a
+/// packed vector (outer dimensions first). `None` when nothing is replaced.
+fn inline_body_typedefs(dt: &DataType, local: &HashMap<String, DataType>) -> Option<DataType> {
+    fn go(dt: &DataType, local: &HashMap<String, DataType>, depth: u32) -> Option<DataType> {
+        if depth > 16 {
+            return None;
+        }
+        match dt {
+            DataType::TypeReference {
+                name,
+                dimensions,
+                type_args,
+                ..
+            } if name.scopes.is_empty() && type_args.is_empty() => {
+                let decl = local.get(&name.name.name)?;
+                let decl = go(decl, local, depth + 1).unwrap_or_else(|| decl.clone());
+                if dimensions.is_empty() {
+                    return Some(decl);
+                }
+                match decl {
+                    DataType::Struct(mut su) if su.packed => {
+                        let mut dims = dimensions.clone();
+                        dims.extend(su.dimensions);
+                        su.dimensions = dims;
+                        Some(DataType::Struct(su))
+                    }
+                    DataType::IntegerVector {
+                        kind,
+                        signing,
+                        dimensions: inner,
+                        span,
+                    } => {
+                        let mut dims = dimensions.clone();
+                        dims.extend(inner);
+                        Some(DataType::IntegerVector {
+                            kind,
+                            signing,
+                            dimensions: dims,
+                            span,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            DataType::Struct(su) => {
+                let mut changed = false;
+                let members = su
+                    .members
+                    .iter()
+                    .map(|m| match go(&m.data_type, local, depth + 1) {
+                        Some(t) => {
+                            changed = true;
+                            crate::ast::types::StructMember {
+                                data_type: t,
+                                ..m.clone()
+                            }
+                        }
+                        None => m.clone(),
+                    })
+                    .collect();
+                changed.then(|| {
+                    DataType::Struct(crate::ast::types::StructUnionType {
+                        members,
+                        ..su.clone()
+                    })
+                })
+            }
+            _ => None,
+        }
+    }
+    if local.is_empty() {
+        return None;
+    }
+    go(dt, local, 0)
+}
+
+/// `inline_body_typedefs` against the running instance's own types
+/// (`CONST_FN_LOCAL_TYPES`), installed while its constants are folded.
+fn inline_instance_typedefs(dt: &DataType) -> Option<DataType> {
+    CONST_FN_LOCAL_TYPES.with(|c| inline_body_typedefs(dt, c.borrow().as_ref()?))
+}
+
 /// Packed-struct layouts bound into `STRUCT_FIELDS_TLS` for one constant
 /// function call (see `eval_const_user_function`). Dropping it restores each
 /// name's previous layout, so a caller's — or an outer recursion level's —
@@ -40724,6 +40848,8 @@ impl ConstFnStructLayouts {
         params: &HashMap<String, Value>,
         elab: &ElaboratedModule,
     ) {
+        let inlined = inline_instance_typedefs(dt);
+        let dt = inlined.as_ref().unwrap_or(dt);
         let Some(fields) = flatten_struct_fields(dt, params, &elab.typedefs, &elab.typedef_types)
         else {
             return;
@@ -40767,6 +40893,8 @@ impl ConstFnPackedElems {
         params: &HashMap<String, Value>,
         elab: &ElaboratedModule,
     ) {
+        let inlined = inline_instance_typedefs(dt);
+        let dt = inlined.as_ref().unwrap_or(dt);
         let qualified = qualify_const_fn_typedef(dt, elab);
         let dt = qualified.as_ref().unwrap_or(dt);
         let Some((ew, msb0)) = packed_outer_elem(dt, params, &elab.typedef_types) else {
@@ -41849,6 +41977,15 @@ fn substitute_const_fn_calls(
                 // cast to its declared type first, the same way the function
                 // body does, and then judge the converted expression.
                 let a = resolve_const_fn_cast_targets(a, elab);
+                // §10.9.2, §13.5: a pattern actual of a packed-struct formal
+                // is packed by the formal's members, by name or position
+                // (#680); the support check below admits no pattern.
+                if let Some(v) =
+                    const_fn_struct_pattern_actual(fd.ports.get(argv.len()), &a, params, elab)
+                {
+                    argv.push(v);
+                    continue;
+                }
                 if !const_fn_expr_supported(&a) {
                     return None;
                 }
