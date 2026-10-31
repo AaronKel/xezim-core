@@ -1617,6 +1617,9 @@ fn parse_and_elaborate(
     ),
     String,
 > {
+    // Every elaboration starts from the same state, whatever the thread
+    // elaborated before (§23.11 binds elaborate a design twice).
+    elaborate::reset_const_eval_snapshots();
     // Array defaults are needed through the final bind/parameter passes,
     // including elaboration of the compilation-unit and top scopes.
     let _array_param_scope = elaborate::array_params::scope();

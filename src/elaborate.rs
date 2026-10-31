@@ -22031,6 +22031,16 @@ thread_local! {
         = const { std::cell::RefCell::new(None) };
 }
 
+/// Clear the package/$unit parameter and typedef snapshots the constant
+/// evaluator falls back to, at the start of an elaboration: they are
+/// thread-locals installed part-way through, so an elaboration read the
+/// previous one's until it installed its own (#739).
+pub(crate) fn reset_const_eval_snapshots() {
+    PARAM_FALLBACK_TLS.with(|c| c.borrow_mut().clear());
+    TYPEDEF_TYPES_TLS.with(|c| *c.borrow_mut() = None);
+    TYPEDEF_WIDTHS_TLS.with(|c| *c.borrow_mut() = None);
+}
+
 /// Install the global package/$unit parameter snapshot consulted by const-eval
 /// `Ident` lookups that miss the scoped map. Idempotent overwrite.
 fn set_param_fallback(params: &HashMap<String, Value>) {
