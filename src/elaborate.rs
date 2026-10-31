@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 pub(crate) mod array_params;
+mod const_function_scope;
 mod interface_arrays;
 pub mod interface_ports;
 mod module_class_scope;
@@ -40955,12 +40956,7 @@ fn eval_const_user_function(
         return None;
     }
     let fname = fd.name.name.name.clone();
-    let mut locals: HashMap<String, Value> = elab.parameters.clone();
-    locals.extend(
-        caller_params
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone())),
-    );
+    let mut locals = const_function_scope::initial_locals(fd, caller_params, elab);
     for (i, port) in fd.ports.iter().enumerate() {
         let mut v = arg_vals.get(i).cloned().unwrap_or_else(|| Value::zero(32));
         // §13.3: the actual CONVERTS to the formal's declared type — a REAL
@@ -41839,6 +41835,29 @@ fn resolve_const_fn_cast_targets(e: &Expression, elab: &ElaboratedModule) -> Exp
     }
 }
 
+/// The name a constant-function call `func(...)` resolves by, and the
+/// package-qualified key it prefers (`pkg::f`, see `substitute_const_fn_calls`).
+fn const_fn_call_name(func: &Expression) -> Option<(String, Option<String>)> {
+    match &func.kind {
+        ExprKind::Ident(h) => {
+            let leaf = h.path.last().map(|s| s.name.name.clone())?;
+            let sk = (h.path.len() >= 2)
+                .then(|| format!("{}::{}", h.path[h.path.len() - 2].name.name, leaf));
+            Some((leaf, sk))
+        }
+        ExprKind::MemberAccess { expr: base, member } => {
+            let sk = match &base.kind {
+                ExprKind::Ident(bh) if bh.path.len() == 1 => {
+                    Some(format!("{}::{}", bh.path[0].name.name, member.name))
+                }
+                _ => None,
+            };
+            Some((member.name.clone(), sk))
+        }
+        _ => None,
+    }
+}
+
 /// Rewrite `expr`, replacing each call to a KNOWN simple user function with the
 /// literal it evaluates to (arguments const-evaluated against `params`).
 /// Returns None when a call can't be resolved — callers then fall back to
@@ -41861,21 +41880,7 @@ fn substitute_const_fn_calls(
             // top-module path sees a flat 2-segment Ident) — both forms
             // resolve, preferring the package-qualified registration.
             let (fname, scoped_key) = match &func.kind {
-                ExprKind::Ident(h) => {
-                    let leaf = h.path.last().map(|s| s.name.name.clone())?;
-                    let sk = (h.path.len() >= 2)
-                        .then(|| format!("{}::{}", h.path[h.path.len() - 2].name.name, leaf));
-                    (leaf, sk)
-                }
-                ExprKind::MemberAccess { expr: base, member } => {
-                    let sk = match &base.kind {
-                        ExprKind::Ident(bh) if bh.path.len() == 1 => {
-                            Some(format!("{}::{}", bh.path[0].name.name, member.name))
-                        }
-                        _ => None,
-                    };
-                    (member.name.clone(), sk)
-                }
+                ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => const_fn_call_name(func)?,
                 other => {
                     param_trace(
                         "const-fn:unsupported-func-shape",
