@@ -6156,17 +6156,51 @@ impl Parser {
                 break;
             }
         }
+        // §18.5.10: `constraint_primary` ends in an optional `( )`, which
+        // orders an array's size: `solve sel before arr.size();`. It is the
+        // call `arr.size()` the constraints themselves read.
+        let call =
+            self.at(TokenKind::LParen) && self.peek_kind() == TokenKind::RParen && path.len() > 1;
+        if call {
+            self.bump();
+            self.bump();
+        }
         let span = self.span_from(start);
-        let e = Expression::new(
-            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                root: None,
-                path,
+        let ident = |path: Vec<crate::ast::expr::HierPathSegment>, span: crate::ast::Span| {
+            Expression::new(
+                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                    root: None,
+                    path,
+                    span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                }),
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
-            }),
-            span,
-        );
+            )
+        };
+        let e = if call {
+            let method = path.pop().expect("a path of two segments or more").name;
+            let receiver_span = crate::ast::Span {
+                start,
+                end: method.span.start.saturating_sub(1).max(start),
+            };
+            let func = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(ident(path, receiver_span)),
+                    member: method,
+                },
+                span,
+            );
+            Expression::new(
+                ExprKind::Call {
+                    func: Box::new(func),
+                    args: Vec::new(),
+                },
+                span,
+            )
+        } else {
+            ident(path, span)
+        };
         (root, e)
     }
 
