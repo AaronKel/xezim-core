@@ -21,6 +21,7 @@ mod module_class_scope;
 pub(crate) mod constructor_forwarding;
 pub(crate) mod relaxed_static;
 mod param_prefix_index;
+mod param_scope;
 
 struct ScopeGuardLite<F: FnMut()>(F);
 impl<F: FnMut()> Drop for ScopeGuardLite<F> {
@@ -30582,16 +30583,22 @@ fn inline_instantiations_inner(
     let mut cache = HashMap::default();
     let mut root_defparams = absolute_defparams(&module_name, definitions, &top_params);
     root_defparams.extend(upward_defparams(&module_name, definitions));
+    // §23.10/§26.3: the snapshot is held once; each scope takes from it only
+    // the entries its definition can name (#740).
+    let param_scope =
+        param_scope::ParamScope::new(&top_params, definitions, &elab.resolved_binds, &elab.lets);
+    let top_scope = param_scope.top_scope(top_def, definitions);
     inline_module_items(
         elab,
         top_def,
         "",
         definitions,
         &mut HashMap::default(),
-        &top_params,
+        &top_scope,
         &mut cache,
         &HashMap::default(),
         &root_defparams,
+        &param_scope,
     )?;
     if elab_trace_enabled() {
         eprintln!("[xezim][elab] finished inline top={}", module_name);
@@ -34458,6 +34465,9 @@ fn inline_module_items(
     // `(path_segments, value)` where the value was already evaluated in the
     // scope that declared the defparam. Path[0] is a child instance name.
     pending_defparams: &[(Vec<String>, Value)],
+    // §23.10/§26.3: the package, `$unit` and top parameters, from which a
+    // child's scope takes the entries its definition can name.
+    param_scope: &param_scope::ParamScope,
 ) -> Result<(), String> {
     // Bind this module's imported type names BEFORE its body is prepared or
     // resolved. The top-module path re-runs its imports
@@ -36822,6 +36832,9 @@ fn inline_module_items(
                     }
                     m
                 };
+                // `local_params` holds the parent's scope and the table
+                // entries it names; add those this child names (#740).
+                param_scope.extend_scope(sub_mod, definitions, &mut sub_merged_params);
 
                 // §7.2.1: struct-typed header and generated body parameters —
                 // register the field layout under the SCOPED name so runtime
@@ -40097,6 +40110,7 @@ fn inline_module_items(
                     cache,
                     &rewrite_port_map,
                     &sub_defparams,
+                    param_scope,
                 )?;
                 iprof_since("recursion", __te);
 
