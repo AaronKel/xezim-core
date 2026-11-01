@@ -2398,7 +2398,7 @@ fn elaborate_class_in_scope(
                     }
                     // A typedef'd key (`k12_t`) resolves through the class's
                     // own typedefs and the installed typedef table.
-                    if let Some(shape) = CollShape::of(&effective_dims, |kdt| {
+                    if let Some(shape) = CollShape::of(&effective_dims, None, |kdt| {
                         let kt = kdt.map(|k| class_local_typedef_target(c, k, u8::MAX));
                         typedefs_snapshot(|td| coll_key_kind(kt, unpacked_params, td, None))
                     }) {
@@ -19918,8 +19918,11 @@ pub enum KeyKind {
 /// The kind of one unpacked dimension of a collection (§7.4).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Dim {
-    /// `[N]` / `[L:R]` (§7.4.2).
-    Fixed,
+    /// `[N]` / `[L:R]` (§7.4.2), with its inclusive `(lo, hi)` index bounds
+    /// when they fold at elaboration (`[3:1]` is `(1, 3)`); `None` when a
+    /// bound depends on a class parameter, so a specialization's own size
+    /// is never checked against the default one.
+    Fixed(Option<(i64, i64)>),
     /// `[]` (§7.5).
     Dyn,
     /// `[$]` / `[$:N]` (§7.10).
@@ -19942,9 +19945,11 @@ impl CollShape {
     /// a collection of collections — two or more dimensions, one of them
     /// dynamic, queue or associative — else `None`: a one-dimensional
     /// collection has no rows, and an all-fixed array is laid out by its
-    /// bounds. `key_kind` resolves each associative dimension's index type.
+    /// bounds. `params` folds fixed bounds (`None` folds literals only);
+    /// `key_kind` resolves each associative dimension's index type.
     pub fn of(
         dims: &[UnpackedDimension],
+        params: Option<&HashMap<String, Value>>,
         key_kind: impl Fn(Option<&DataType>) -> KeyKind,
     ) -> Option<CollShape> {
         let fixed = |d: &UnpackedDimension| {
@@ -19960,7 +19965,7 @@ impl CollShape {
             .iter()
             .map(|d| match d {
                 UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. } => {
-                    Dim::Fixed
+                    Dim::Fixed(const_unpacked_bounds(std::slice::from_ref(d), params))
                 }
                 UnpackedDimension::Unsized(_) => Dim::Dyn,
                 UnpackedDimension::Queue { .. } => Dim::Queue,
@@ -20008,13 +20013,9 @@ fn record_coll_shape(
     dims: &[UnpackedDimension],
     params: Option<&HashMap<String, Value>>,
 ) {
-    let shape = CollShape::of(dims, |kdt| {
-        coll_key_kind(
-            kdt,
-            Some(params.unwrap_or(&elab.parameters)),
-            Some(&elab.typedefs),
-            Some(&elab.typedef_types),
-        )
+    let params = Some(params.unwrap_or(&elab.parameters));
+    let shape = CollShape::of(dims, params, |kdt| {
+        coll_key_kind(kdt, params, Some(&elab.typedefs), Some(&elab.typedef_types))
     });
     if let Some(shape) = shape {
         elab.coll_shapes.insert(name.to_string(), shape);

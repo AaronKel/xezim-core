@@ -31,6 +31,7 @@ module top;
   int x [string][int][$];
   int d [][string][$];
   int v [2][string][$];
+  int vr [3:1][$];
   byte w [*];
   byte wq [*][$];
   int q [$];
@@ -46,7 +47,12 @@ module top;
     int pm [int][$];
     static int ps [string][];
     int pf [4];
+    int pv [2][$];
   endclass
+  class D #(int K = 2);
+    int pk [K-1:0][$];
+  endclass
+  D #(4) dh;
   C h;
   child c();
 endmodule
@@ -74,7 +80,10 @@ fn every_scope_records_each_dimension() {
     assert_eq!(dims(s, "m"), Some(vec![int32(), Dim::Queue]));
     assert_eq!(dims(s, "x"), Some(vec![string(), int32(), Dim::Queue]));
     assert_eq!(dims(s, "d"), Some(vec![Dim::Dyn, string(), Dim::Queue]));
-    assert_eq!(dims(s, "v"), Some(vec![Dim::Fixed, string(), Dim::Queue]));
+    // §7.4.2: a fixed dimension carries its index bounds, ascending.
+    let fixed = |lo, hi| Dim::Fixed(Some((lo, hi)));
+    assert_eq!(dims(s, "v"), Some(vec![fixed(0, 1), string(), Dim::Queue]));
+    assert_eq!(dims(s, "vr"), Some(vec![fixed(1, 3), Dim::Queue]));
     // A one-dimensional collection has no rows, and an all-fixed array is
     // laid out by its bounds: neither is a collection of collections.
     for name in ["w", "q", "f", "f2", "s"] {
@@ -109,6 +118,11 @@ fn every_scope_records_each_dimension() {
     assert_eq!(dims(c, "pm"), Some(vec![int32(), Dim::Queue]));
     assert_eq!(dims(c, "ps"), Some(vec![string(), Dim::Dyn]));
     assert_eq!(dims(c, "pf"), None);
+    assert_eq!(dims(c, "pv"), Some(vec![fixed(0, 1), Dim::Queue]));
+    // §8.25: a bound set by a class parameter is left unchecked, since each
+    // specialization sizes it with its own value.
+    let dk = &d.classes["D"].prop_coll_shapes;
+    assert_eq!(dims(dk, "pk"), Some(vec![Dim::Fixed(None), Dim::Queue]));
     // A class typedef'd key resolves to its width.
     let k12 = Dim::Assoc(KeyKind::Integral {
         width: 12,
@@ -116,5 +130,5 @@ fn every_scope_records_each_dimension() {
     });
     assert_eq!(dims(c, "pk"), Some(vec![k12, Dim::Queue]));
     // `[N]` with `N` a parameter is a fixed dimension at package scope too.
-    assert_eq!(dims(s, "pn"), Some(vec![Dim::Fixed, Dim::Queue]));
+    assert_eq!(dims(s, "pn"), Some(vec![fixed(0, 2), Dim::Queue]));
 }
